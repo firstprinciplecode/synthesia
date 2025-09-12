@@ -6,12 +6,15 @@ yarn-error.log*
 
 # Environment files (CRITICAL - never commit these!)
 .env
-.env.*
+.env*
 !.env.example
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
+env-template.txt
+env.template
+env.template.txt
 
 # Sensitive files
 *.key
@@ -59,3 +62,4 @@ out/
 # Temporary files
 tmp/
 temp/
+backups/
