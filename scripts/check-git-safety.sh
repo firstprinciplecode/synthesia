@@ -53,24 +53,42 @@ if [ -n "$staged_files" ]; then
     
     # Check if any staged files contain sensitive patterns
     sensitive_patterns=(
-        "sk-"
-        "pk_"
-        "pcsk_"
-        "AIza"
-        "xai-"
-        "Bearer"
-        "token"
-        "secret"
-        "key"
+        "sk-proj-[a-zA-Z0-9]"
+        "sk-ant-[a-zA-Z0-9]"
+        "pk_live_[a-zA-Z0-9]"
+        "pk_test_[a-zA-Z0-9]"
+        "pcsk_[a-zA-Z0-9]"
+        "AIzaSy[a-zA-Z0-9]"
+        "xai-[a-zA-Z0-9]"
+        "Bearer [a-zA-Z0-9]"
     )
     
+    # Check for actual secrets (not just words in comments)
     for file in $staged_files; do
+        file_content=$(git show ":$file" 2>/dev/null)
+        
+        # Check for actual API keys/tokens (not just the word "token")
         for pattern in "${sensitive_patterns[@]}"; do
-            if git show ":$file" | grep -q "$pattern" 2>/dev/null; then
+            if echo "$file_content" | grep -q "$pattern" 2>/dev/null; then
                 echo "❌ DANGER: $file contains sensitive pattern '$pattern'"
                 exit 1
             fi
         done
+        
+        # Check for actual secrets (look for = followed by value, not just the word)
+        if echo "$file_content" | grep -E "^\s*[A-Z_]+_(SECRET|KEY|TOKEN|PASSWORD)\s*=\s*[^[:space:]]" >/dev/null 2>&1; then
+            echo "❌ DANGER: $file contains what appears to be actual secret values"
+            exit 1
+        fi
+        
+        # Check for long random strings that look like API keys
+        # Skip known safe files/lines (e.g., yarn packageManager hash in package.json)
+        if [ "$(basename "$file")" != "package.json" ]; then
+            if echo "$file_content" | grep -E "[a-zA-Z0-9]{32,}" >/dev/null 2>&1; then
+                echo "❌ DANGER: $file contains long random strings that might be API keys"
+                exit 1
+            fi
+        fi
     done
     echo "✅ No sensitive patterns found in staged files"
 else
