@@ -9,11 +9,13 @@ export function ChatFooterBar({
   onSendMessage,
   disabled,
   availableProviders,
+  availableModels,
 }: {
   rightOpen: boolean;
   onSendMessage: (text: string, options?: any) => void;
   disabled?: boolean;
   availableProviders: string[];
+  availableModels?: Array<{ name: string; provider: string; maxTokens: number }>;
 }) {
   const { state } = useSidebar();
   
@@ -32,6 +34,7 @@ export function ChatFooterBar({
           onSendMessage={onSendMessage}
           disabled={!!disabled}
           availableProviders={availableProviders}
+          availableModels={availableModels}
         />
       </div>
     </div>

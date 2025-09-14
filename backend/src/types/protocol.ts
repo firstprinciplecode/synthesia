@@ -1,6 +1,7 @@
-export type JSONRPCRequest = { jsonrpc: '2.0'; id: string; method: string; params?: any };
-export type JSONRPCResponse = { jsonrpc: '2.0'; id: string; result?: any; error?: { code: number; message: string; data?: any } };
-export type JSONRPCNotification = { jsonrpc: '2.0'; method: string; params?: any };
+// Loosen jsonrpc literal type to reduce friction when constructing objects
+export type JSONRPCRequest = { jsonrpc: string; id: string; method: string; params?: any };
+export type JSONRPCResponse = { jsonrpc: string; id: string; result?: any; error?: { code: number; message: string; data?: any } };
+export type JSONRPCNotification = { jsonrpc: string; method: string; params?: any };
 
 export enum ErrorCodes {
   PARSE_ERROR = -32700,
@@ -8,12 +9,31 @@ export enum ErrorCodes {
   METHOD_NOT_FOUND = -32601,
   INVALID_PARAMS = -32602,
   INTERNAL_ERROR = -32603,
+  // Custom application codes
+  FORBIDDEN = -32000,
+  LLM_ERROR = -32001,
 }
 
 export type JSONRPCError = { code: ErrorCodes; message: string; data?: any };
 
-export type MessageCreateRequest = { roomId: string; content: string; options?: any };
-export type MessageDeltaNotification = { roomId: string; messageId: string; delta: string; authorId?: string; authorType?: string };
-export type RunStatusNotification = { runId: string; status: 'running' | 'succeeded' | 'failed'; startedAt?: string; completedAt?: string };
+// Specializations aligned to JSON-RPC envelope shapes used in server
+export type MessageCreateRequest = JSONRPCRequest & {
+  method: 'message.create';
+  params: {
+    roomId: string;
+    message: any;
+    runOptions?: any;
+  };
+};
+
+export type MessageDeltaNotification = JSONRPCNotification & {
+  method: 'message.delta';
+  params: { roomId: string; messageId: string; delta: string; authorId?: string; authorType?: string };
+};
+
+export type RunStatusNotification = JSONRPCNotification & {
+  method: 'run.status';
+  params: { runId: string; status: 'running' | 'completed' | 'succeeded' | 'failed'; startedAt?: string; completedAt?: string };
+};
 
 

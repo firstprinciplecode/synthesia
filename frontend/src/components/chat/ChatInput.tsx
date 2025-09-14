@@ -28,17 +28,19 @@ interface ChatInputProps {
   }) => void;
   disabled?: boolean;
   availableProviders?: string[];
+  availableModels?: Array<{ name: string; provider: string; maxTokens: number }>;
 }
 
+// Fallback static options if backend list is unavailable
 const MODEL_OPTIONS = {
-  openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-5', 'gpt-5-mini'],
+  openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4.1', 'gpt-4.1-mini'],
   anthropic: ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229', 'claude-3-5-sonnet-latest', 'claude-3-5-haiku-latest'],
   google: ['gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-1.5-pro-latest', 'gemini-1.5-flash-8b'],
   xai: ['grok-beta', 'grok-2'],
   deepseek: ['deepseek-chat', 'deepseek-reasoner'],
 };
 
-export function ChatInput({ onSendMessage, disabled, availableProviders = [] }: ChatInputProps) {
+export function ChatInput({ onSendMessage, disabled, availableProviders = [], availableModels = [] }: ChatInputProps) {
   const [message, setMessage] = useState('');
   const [selectedProvider, setSelectedProvider] = useState('openai');
   const [selectedModel, setSelectedModel] = useState('gpt-4o');
@@ -153,7 +155,9 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [] }: 
     setMentionQuery('');
   };
 
-  const availableModels = MODEL_OPTIONS[selectedProvider as keyof typeof MODEL_OPTIONS] || [];
+  const providerModels = availableModels
+    .filter(m => m.provider === selectedProvider)
+    .map(m => m.name);
 
   return (
     <div className="w-full">
@@ -167,7 +171,7 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [] }: 
               onKeyDown={handleKeyDown}
               placeholder={terminalMode ? "Enter terminal command..." : "Ask anything"}
               rows={1}
-              className="min-h-[40px] resize-none pr-20 pl-20 py-2 rounded-xl border border-border focus:border-ring focus:ring-0 text-[15px] leading-6 bg-background"
+              className="min-h-[40px] resize-none pr-20 pl-20 py-2 rounded-xl border border-border focus:border-ring focus:ring-0 text-[15px] leading-6 bg-background animate-glow"
               disabled={disabled}
             />
 
@@ -230,10 +234,9 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [] }: 
                           value={selectedProvider} 
                           onValueChange={(value) => {
                             setSelectedProvider(value);
-                            const models = MODEL_OPTIONS[value as keyof typeof MODEL_OPTIONS];
-                            if (models && models.length > 0) {
-                              setSelectedModel(models[0]);
-                            }
+                            const dynamic = availableModels.filter(m => m.provider === value).map(m => m.name);
+                            const models = dynamic.length > 0 ? dynamic : (MODEL_OPTIONS[value as keyof typeof MODEL_OPTIONS] || []);
+                            if (models && models.length > 0) setSelectedModel(models[0]);
                           }}
                         >
                           <SelectTrigger>
@@ -256,10 +259,8 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [] }: 
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
-                            {availableModels.map((model) => (
-                              <SelectItem key={model} value={model}>
-                                {model}
-                              </SelectItem>
+                            {(providerModels.length > 0 ? providerModels : MODEL_OPTIONS[selectedProvider as keyof typeof MODEL_OPTIONS] || []).map((model) => (
+                              <SelectItem key={model} value={model}>{model}</SelectItem>
                             ))}
                           </SelectContent>
                         </Select>

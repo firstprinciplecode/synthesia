@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -54,6 +54,59 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isUser, isTerminal, isStreaming, message.content]);
+
+  // Buffered streaming display like Perplexity
+  const [displayContent, setDisplayContent] = useState(message.content || '');
+  const [lastRenderedLen, setLastRenderedLen] = useState((message.content || '').length);
+  const [fadeActive, setFadeActive] = useState(false);
+  const latestContentRef = useRef(message.content || '');
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // When message id changes, reset display content
+  useEffect(() => {
+    setDisplayContent(message.content || '');
+    latestContentRef.current = message.content || '';
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [message.id]);
+
+  // Buffer incoming content and flush at a controlled cadence
+  useEffect(() => {
+    latestContentRef.current = message.content || '';
+
+    if (!isTerminal && !isUser && isStreaming) {
+      // If no timer running, start a short cadence flush
+      if (!flushTimerRef.current) {
+        const flush = () => {
+          setDisplayContent((prev) => {
+            const next = latestContentRef.current;
+            if (next !== prev) {
+              setFadeActive(true);
+              setTimeout(() => setFadeActive(false), 220);
+              return next;
+            }
+            return prev;
+          });
+          flushTimerRef.current = setTimeout(flush, 140); // ~7 fps perception
+        };
+        flush();
+      }
+    } else {
+      // Stream ended or not applicable → final flush and clear
+      if (flushTimerRef.current) {
+        clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
+      setDisplayContent(latestContentRef.current);
+      setFadeActive(false);
+    }
+
+    return () => {
+      if (flushTimerRef.current && (!isStreaming || isTerminal || isUser)) {
+        clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
+    };
+  }, [isStreaming, isTerminal, isUser, message.content]);
   
   const renderWithMentions = (text: string) => {
     const parts = text.split(/(\B@[a-zA-Z0-9_:\/\.\-]+)/g);
@@ -134,14 +187,17 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
           <span className="text-xs text-muted-foreground">
             {message.timestamp.toLocaleTimeString()}
           </span>
-          {isStreaming && (!message.content || message.content.trim().length === 0) && (
+          {isStreaming && (!displayContent || displayContent.trim().length === 0) && (
             <TypingDots width={24} height={8} />
           )}
         </div>
         
-        <div className="text-sm leading-relaxed text-foreground transition-opacity duration-200">
+        <div
+          key={isStreaming ? `${message.id}-${(displayContent || '').length}` : undefined}
+          className={`text-sm leading-relaxed text-foreground transition-opacity duration-200 ${isStreaming ? 'streaming-reveal' : ''}`}
+        >
           {isUser ? (
-            <p className="whitespace-pre-wrap m-0">{renderWithMentions(message.content)}</p>
+            <p className="whitespace-pre-wrap m-0">{renderWithMentions(displayContent)}</p>
           ) : isTerminal ? (
             <div className="font-mono">
               {message.terminalResult ? (
@@ -159,7 +215,8 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
             <div>
               {/* grid + lightbox render */}
               {(() => {
-                const raw = boldMentionsInMarkdown(message.content) || '';
+                const raw = boldMentionsInMarkdown(displayContent) || '';
+                const isInlineCards = /^(X search for|Google News for)/m.test(raw);
                 const lines = raw.split('\n');
                 const imgRegex = /!\[([^\]]*)\]\(([^\)]+)\)/;
                 type ImgItem = { src: string; alt: string; caption?: string };
@@ -183,7 +240,12 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
 
                 return (
                   <>
-                    {imgs.length > 0 && (
+                    {isInlineCards ? (
+                      <div className="mt-0">
+                        <JsonMarkdownRenderer content={raw} />
+                      </div>
+                    ) : (
+                      imgs.length > 0 && (
                       <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2">
                         {imgs.map((it, i) => (
                           <div key={i} className="group cursor-zoom-in" onClick={() => setSelected(it)}>
@@ -199,10 +261,26 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
                           </div>
                         ))}
                       </div>
+                      )
                     )}
-                    {nonImageText && (
-                      <div className="mt-0">
-                        <JsonMarkdownRenderer content={nonImageText} />
+                    {!isInlineCards && nonImageText && (
+                      <div className="mt-0 streaming-reveal">
+                        <span className="stream-chunk">
+                          <JsonMarkdownRenderer content={nonImageText.slice(0, lastRenderedLen)} />
+                        </span>
+                        {nonImageText.length > lastRenderedLen && (
+                          <span className="stream-chunk new">
+                            <JsonMarkdownRenderer content={nonImageText.slice(lastRenderedLen)} />
+                          </span>
+                        )}
+                        {isStreaming && lastRenderedLen !== nonImageText.length && (
+                          <span style={{ display: 'none' }}
+                            aria-hidden
+                            ref={(el) => {
+                              if (el) setLastRenderedLen(nonImageText.length)
+                            }}
+                          />
+                        )}
                       </div>
                     )}
                     {selected && (

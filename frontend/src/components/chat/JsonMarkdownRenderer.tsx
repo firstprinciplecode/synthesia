@@ -11,10 +11,29 @@ interface JsonMarkdownRendererProps {
 }
 
 export function JsonMarkdownRenderer({ content, className }: JsonMarkdownRendererProps) {
+  const isGoogleNews = /(^|\n)\s*Google News for\s*"/i.test(content);
+  const isXSearch = /(^|\n)\s*X search for\s*"/i.test(content);
   // Preprocess content to fix malformed markdown links
   const preprocessContent = (text: string) => {
-    // Fix malformed links: [Title] (https://url.com) -> [Title](https://url.com)
-    return text.replace(/\]\s*\(/g, '](');
+    // 1) Fix malformed links split across lines:
+    //    [Label]\n(URL) -> [Label](URL)
+    text = text.replace(/\]\s*\n\s*\((https?:[^)]+)\)/g, '](#$1#)');
+    // 2) Also fix inline spaces: [Label] (URL) -> [Label](URL)
+    text = text.replace(/\]\s*\(/g, '](');
+    // 3) Restore protected URLs
+    text = text.replace(/\(#(https?:[^)]+)#\)/g, '($1)');
+
+    // 4) Fix images split across lines:
+    //    ![alt]\n(URL) -> ![alt](URL)
+    text = text.replace(/!\[([^\]]*)\]\s*\n\s*\((https?:[^)]+)\)/g, '![$1](#$2#)');
+    // 5) Handle fallback '[image]\n(URL)' -> '![image](URL)'
+    text = text.replace(/\[image\]\s*\n\s*\((https?:[^)]+)\)/gi, '![image](#$1#)');
+    // 6) Restore protected image URLs
+    text = text.replace(/!\[([^\]]*)\]\(#(https?:[^)]+)#\)/g, '![$1]($2)');
+    // 7) If a stray '!' ended up on the previous line before an image or [View], drop it
+    //    '... UTC !\n![image](url)' or '... UTC !\n[View](url)' -> '... UTC\n...'
+    text = text.replace(/!\s*\n\s*(?=(?:!\[|\[))/g, '\n');
+    return text;
   };
 
   // Allow data:audio links to render inline while keeping others safe
@@ -35,7 +54,13 @@ export function JsonMarkdownRenderer({ content, className }: JsonMarkdownRendere
       <img
         {...props}
         alt={props.alt || ''}
-        className={`mt-2 max-w-full rounded-md border ${props.className || ''}`}
+        className={`mt-2 ${
+          isGoogleNews
+            ? 'float-left mr-3 w-20 h-20 object-cover' // Google News: 80x80
+            : isXSearch
+            ? 'float-left mr-3 w-10 h-10 object-cover' // X avatar: 40x40
+            : 'max-w-full'
+        } ${isXSearch ? 'rounded-full' : 'rounded-md'} border ${props.className || ''}`}
       />
     ),
     a: (props: any) => {
@@ -50,8 +75,14 @@ export function JsonMarkdownRenderer({ content, className }: JsonMarkdownRendere
       }
       return <a {...props} target="_blank" rel="noreferrer" className="underline hover:no-underline" />
     },
+    hr: (props: any) => (
+      <hr {...props} className={`clear-both my-4 border-border/60 ${props.className || ''}`} />
+    ),
+    p: (props: any) => (
+      <p {...props} className={`${props.className || ''}`} />
+    ),
   } as any;
-  // Function to detect and extract JSON blocks
+  // Function to detect and extract JSON blocks (fenced only)
   const processContent = (text: string) => {
     // Preprocess the text to fix malformed markdown links
     const processedText = preprocessContent(text);
@@ -88,50 +119,12 @@ export function JsonMarkdownRenderer({ content, className }: JsonMarkdownRendere
       lastIndex = match.index + match[0].length;
     }
 
-    // Add remaining text
+    // Add remaining text (no naive inline JSON detection to avoid breaking markdown)
     if (lastIndex < processedText.length) {
-      const remainingText = processedText.slice(lastIndex);
-      
-      // Also check for standalone JSON objects/arrays in the remaining text
-      const standaloneJsonRegex = /(\{[\s\S]*?\}|\[[\s\S]*?\])/g;
-      let jsonMatch;
-      let textIndex = 0;
-      
-      while ((jsonMatch = standaloneJsonRegex.exec(remainingText)) !== null) {
-        // Add text before JSON
-        if (jsonMatch.index > textIndex) {
-          parts.push({
-            type: 'text',
-            content: remainingText.slice(textIndex, jsonMatch.index)
-          });
-        }
-        
-        // Try to parse JSON
-        try {
-          const jsonData = JSON.parse(jsonMatch[1]);
-          parts.push({
-            type: 'json',
-            content: jsonMatch[1],
-            data: jsonData
-          });
-        } catch (e) {
-          // If parsing fails, treat as regular text
-          parts.push({
-            type: 'text',
-            content: jsonMatch[0]
-          });
-        }
-        
-        textIndex = jsonMatch.index + jsonMatch[0].length;
-      }
-      
-      // Add any remaining text
-      if (textIndex < remainingText.length) {
-        parts.push({
-          type: 'text',
-          content: remainingText.slice(textIndex)
-        });
-      }
+      parts.push({
+        type: 'text',
+        content: processedText.slice(lastIndex)
+      });
     }
 
     return parts.length > 0 ? parts : [{ type: 'text', content: processedText }];
@@ -155,7 +148,7 @@ export function JsonMarkdownRenderer({ content, className }: JsonMarkdownRendere
           );
         } else {
           return (
-            <div key={index} className="prose prose-sm max-w-none">
+            <div key={index} className={`prose prose-sm max-w-none ${isGoogleNews || isXSearch ? 'overflow-hidden' : ''}`}>
               <ReactMarkdown 
                 remarkPlugins={[remarkGfm]}
                 components={markdownComponents}

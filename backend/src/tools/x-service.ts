@@ -220,7 +220,11 @@ class XService {
     const url = new URL(`${API_BASE}/tweets/search/recent`);
     url.searchParams.set('query', query);
     url.searchParams.set('max_results', String(Math.min(Math.max(maxResults, 10), 100)));
-    url.searchParams.set('tweet.fields', 'created_at,author_id,public_metrics,lang');
+    // Request rich fields + expansions so we can reconstruct full context
+    url.searchParams.set('tweet.fields', 'created_at,author_id,public_metrics,lang,entities,referenced_tweets,attachments');
+    url.searchParams.set('expansions', 'author_id,referenced_tweets.id,referenced_tweets.id.author_id,attachments.media_keys,entities.mentions.username');
+    url.searchParams.set('user.fields', 'name,username,profile_image_url,verified');
+    url.searchParams.set('media.fields', 'media_key,type,url,preview_image_url,width,height');
     const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${tokens.access_token}` } });
     if (!res.ok) throw new Error(`search failed ${res.status}: ${await res.text()}`);
     return await res.json();

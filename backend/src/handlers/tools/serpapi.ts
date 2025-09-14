@@ -1,0 +1,161 @@
+import { JSONRPCRequest, ErrorCodes } from '../../types/protocol.js';
+import { WebSocketBus } from '../../websocket/bus.js';
+import { ToolRunner } from '../../tools/tool-runner.js';
+import { serpapiService } from '../../tools/serpapi-service.js';
+import { formatSerpListAsMarkdown, formatGoogleNewsMarkdown } from '../../formatters/serpapi.js';
+
+export type SerpHandlersContext = {
+  bus: WebSocketBus;
+  toolRunner: ToolRunner;
+  getRoomForConnection: (connectionId: string) => string | undefined;
+};
+
+export async function handleSerpSearch(ctx: SerpHandlersContext, connectionId: string, request: JSONRPCRequest) {
+  const { roomId, query, num, agentId } = request.params as any;
+  if (!query) {
+    ctx.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'query is required');
+    return;
+  }
+  const room = roomId || ctx.getRoomForConnection(connectionId) || 'default-room';
+  const runId = crypto.randomUUID();
+  const toolCallId = crypto.randomUUID();
+  ctx.bus.broadcastToolCall(room, runId, toolCallId, 'serpapi', 'search', { query, num });
+  const { items } = await serpapiService.searchGoogle(query, { num });
+  const md = serpapiService.formatAsMarkdown(items, query);
+  const msg = {
+    id: crypto.randomUUID(),
+    role: 'assistant' as const,
+    content: md,
+    timestamp: new Date(),
+    conversationId: room,
+    agentId: connectionId,
+  };
+  ctx.bus.broadcastToRoom(room, {
+    jsonrpc: '2.0',
+    method: 'agent.analysis',
+    params: {
+      roomId: room,
+      content: md,
+      model: 'tool.serpapi',
+      timestamp: new Date().toISOString(),
+      authorId: (agentId || connectionId || 'agent') as any,
+      authorType: 'agent',
+    },
+  });
+  ctx.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+  ctx.bus.sendResponse(connectionId, request.id!, { ok: true });
+}
+
+export async function handleSerpImages(ctx: SerpHandlersContext, connectionId: string, request: JSONRPCRequest) {
+  const { roomId, query, num, agentId } = request.params as any;
+  if (!query) {
+    ctx.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'query is required');
+    return;
+  }
+  const room = roomId || ctx.getRoomForConnection(connectionId) || 'default-room';
+  const runId = crypto.randomUUID();
+  const toolCallId = crypto.randomUUID();
+  ctx.bus.broadcastToolCall(room, runId, toolCallId, 'serpapi', 'images', { query, num });
+  const { items } = await serpapiService.searchGoogleImages(query, { num });
+  const md = serpapiService.formatImagesAsMarkdown(items, query);
+  ctx.bus.broadcastToRoom(room, {
+    jsonrpc: '2.0',
+    method: 'agent.analysis',
+    params: {
+      roomId: room,
+      content: md,
+      model: 'tool.serpapi',
+      timestamp: new Date().toISOString(),
+      authorId: (agentId || connectionId || 'agent') as any,
+      authorType: 'agent',
+    },
+  });
+  ctx.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+  ctx.bus.sendResponse(connectionId, request.id!, { ok: true });
+}
+
+export async function handleSerpRun(ctx: SerpHandlersContext, connectionId: string, request: JSONRPCRequest) {
+  const params = (request.params || {}) as any;
+  const engine = String(params.engine || '').trim();
+  const query = String(params.query || '').trim();
+  const attributedAgentId = String(params.agentId || '').trim();
+
+  // Map deprecated/unsupported engines to first-party tools
+  const engineNormalized = engine.replace(/^( ["'] )(.*)\1$/, '$2');
+  const engineUse = engineNormalized === 'yahoo_finance' ? 'google_finance' : engineNormalized;
+  if (engineUse === 'twitter') {
+    const roomId = ctx.getRoomForConnection(connectionId) || 'default-room';
+    const runId = crypto.randomUUID();
+    const toolCallId = crypto.randomUUID();
+    ctx.bus.broadcastToolCall(roomId, runId, toolCallId, 'x', 'search', { query });
+    try {
+      const result = await serpapiService.run(engineUse, query, params.extra || undefined);
+      ctx.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+      ctx.bus.sendResponse(connectionId, request.id!, { ok: true, result, used: 'x.search' });
+    } catch (e: any) {
+      ctx.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: false, error: e?.message || String(e) });
+      ctx.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X search failed');
+    }
+    return;
+  }
+
+  // If engine is 'url' (or quoted) or the query itself looks like a URL, delegate to web scraper instead
+  const engineIsUrl = engineUse === 'url';
+  const queryLooksLikeUrl = /^https?:\/\//i.test(query);
+  if (engineIsUrl || queryLooksLikeUrl) {
+    const url = queryLooksLikeUrl ? query : engineUse;
+    const runId = crypto.randomUUID();
+    const toolCallId = crypto.randomUUID();
+    const roomId = ctx.getRoomForConnection(connectionId) || 'default-room';
+    ctx.bus.broadcastToolCall(roomId, runId, toolCallId, 'web', 'scrape', { url });
+    const scrapeResult = await (await import('../../tools/web-scraper-service.js')).webScraperService.scrape(url);
+    const preview = (scrapeResult.text || '').replace(/\s+/g, ' ').trim();
+    const summary = `${scrapeResult.title ? `**${scrapeResult.title}**\n\n` : ''}- URL: ${scrapeResult.url}\n- Links: ${scrapeResult.links?.length || 0}, Images: ${scrapeResult.images?.length || 0}\n\n${preview.slice(0, 800)}`;
+    ctx.bus.broadcastToRoom(roomId, {
+      jsonrpc: '2.0',
+      method: 'message.received',
+      params: {
+        roomId: roomId,
+        messageId: crypto.randomUUID(),
+        authorId: 'agent',
+        authorType: 'assistant',
+        message: summary,
+      },
+    });
+    ctx.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+    ctx.bus.sendResponse(connectionId, request.id!, { ok: true, result: scrapeResult, used: 'web.scrape' });
+    return;
+  }
+
+  // Fallback to regular SerpAPI handler
+  const result = await serpapiService.run(engineUse, query, params.extra || undefined);
+  const roomId = ctx.getRoomForConnection(connectionId) || 'default-room';
+  const runId = crypto.randomUUID();
+  const toolCallId = crypto.randomUUID();
+  ctx.bus.broadcastToolCall(roomId, runId, toolCallId, 'serpapi', 'run', { engine: engineUse, query, extra: params.extra });
+  let messageMd = result.markdown || '';
+  // If this is google_news and raw payload contains news_results, build rich cards with image + link
+  try {
+    const raw = (result as any).raw || {};
+    if (engineUse === 'google_news' && Array.isArray(raw.news_results) && raw.news_results.length) {
+      messageMd = formatGoogleNewsMarkdown(raw.news_results, `Google News for "${query}"`);
+    }
+  } catch {}
+  if (!messageMd) messageMd = `SERPAPI ${engineUse} for "${query}": (no markdown available)`;
+
+  ctx.bus.broadcastToRoom(roomId, {
+    jsonrpc: '2.0',
+    method: 'message.received',
+    params: {
+      roomId: roomId,
+      messageId: crypto.randomUUID(),
+      authorId: attributedAgentId || connectionId || 'agent',
+      authorType: 'agent',
+      message: messageMd,
+    },
+  });
+  ctx.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+  ctx.bus.sendResponse(connectionId, request.id!, { ok: true, result });
+}
+
+

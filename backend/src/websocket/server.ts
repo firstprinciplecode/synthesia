@@ -25,6 +25,12 @@ import { ToolRegistry } from '../tools/tool-registry.js';
 import { ToolRunner } from '../tools/tool-runner.js';
 import { Tool } from '../tools/tool-contract.js';
 import { xService } from '../tools/x-service.js';
+import { WebSocketBus } from './bus.js';
+import { RoomRegistry } from './room-registry.js';
+import { handleXSearch, handleXLists, handleXListTweets, handleXTweet, handleXDm } from '../handlers/tools/x.js';
+import { handleSerpSearch, handleSerpImages, handleSerpRun } from '../handlers/tools/serpapi.js';
+import { AgentOrchestrator } from '../agents/agent-orchestrator.js';
+import { buildUserProfileContext } from '../agents/context-builder.js';
 
 export class WebSocketServer {
   private llmRouter: LLMRouter;
@@ -41,9 +47,15 @@ export class WebSocketServer {
   private roomSpeaking: Set<string> = new Set();
   private roomQueue: Map<string, string[]> = new Map();
   private roomCooldownUntil: Map<string, Map<string, number>> = new Map();
+  private bus: WebSocketBus;
+  private roomsRegistry: RoomRegistry;
+  private orchestrator: AgentOrchestrator;
 
   constructor() {
     this.llmRouter = new LLMRouter();
+    this.bus = new WebSocketBus(this.connections, this.rooms);
+    this.roomsRegistry = new RoomRegistry(this.rooms, this.connectionUserId, this.roomAgents);
+    this.orchestrator = new AgentOrchestrator({ llmRouter: this.llmRouter });
     // Register tools
     this.toolRegistry.register(new Tool({
       name: 'web',
@@ -162,9 +174,9 @@ export class WebSocketServer {
       },
     }));
     this.toolRunner = new ToolRunner(this.toolRegistry, {
-      onCall: (roomId, runId, toolCallId, tool, func, args) => this.broadcastToolCall(roomId, runId, toolCallId, tool, func, args),
-      onResult: (roomId, runId, toolCallId, result) => this.broadcastToolResult(roomId, runId, toolCallId, { ok: true }),
-      onError: (roomId, runId, toolCallId, error) => this.broadcastToolResult(roomId, runId, toolCallId, { ok: false, error: String(error?.message || error) }),
+      onCall: (roomId, runId, toolCallId, tool, func, args) => this.bus.broadcastToolCall(roomId, runId, toolCallId, tool, func, args),
+      onResult: (roomId, runId, toolCallId, result) => this.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true }),
+      onError: (roomId, runId, toolCallId, error) => this.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: false, error: String(error?.message || error) }),
     });
   }
 
@@ -208,7 +220,7 @@ export class WebSocketServer {
       
       // Validate JSON-RPC format
       if (!this.isValidJSONRPC(message)) {
-        this.sendError(connectionId, null, ErrorCodes.INVALID_REQUEST, 'Invalid JSON-RPC request');
+        this.bus.sendError(connectionId, null, ErrorCodes.INVALID_REQUEST, 'Invalid JSON-RPC request');
         return;
       }
 
@@ -249,13 +261,13 @@ export class WebSocketServer {
           break;
 
         case 'tool.serpapi.search':
-          await this.handleSerpApiSearch(connectionId, request);
+          await handleSerpSearch(this.buildSerpCtx(), connectionId, request);
           break;
         case 'tool.serpapi.images':
-          await this.handleSerpApiImages(connectionId, request);
+          await handleSerpImages(this.buildSerpCtx(), connectionId, request);
           break;
         case 'tool.serpapi.run':
-          await this.handleSerpApiRun(connectionId, request);
+          await handleSerpRun(this.buildSerpCtx(), connectionId, request);
           break;
         case 'tool.elevenlabs.tts':
           await this.handleElevenLabsTTS(connectionId, request);
@@ -267,27 +279,27 @@ export class WebSocketServer {
           await this.handleWebScrapePick(connectionId, request);
           break;
         case 'tool.x.tweet':
-          await this.handleXTweet(connectionId, request);
+          await handleXTweet(this.buildXCtx(), connectionId, request);
           break;
         case 'tool.x.dm':
-          await this.handleXDm(connectionId, request);
+          await handleXDm(this.buildXCtx(), connectionId, request);
           break;
         case 'tool.x.search':
-          await this.handleXSearch(connectionId, request);
+          await handleXSearch(this.buildXCtx(), connectionId, request);
           break;
         case 'tool.x.lists':
-          await this.handleXLists(connectionId, request);
+          await handleXLists(this.buildXCtx(), connectionId, request);
           break;
         case 'tool.x.listTweets':
-          await this.handleXListTweets(connectionId, request);
+          await handleXListTweets(this.buildXCtx(), connectionId, request);
           break;
           
         default:
-          this.sendError(connectionId, request.id, ErrorCodes.METHOD_NOT_FOUND, `Method not found: ${request.method}`);
+          this.bus.sendError(connectionId, request.id, ErrorCodes.METHOD_NOT_FOUND, `Method not found: ${request.method}`);
       }
     } catch (error) {
       console.error('Error handling WebSocket message:', error);
-      this.sendError(connectionId, null, ErrorCodes.PARSE_ERROR, 'Parse error');
+      this.bus.sendError(connectionId, null, ErrorCodes.PARSE_ERROR, 'Parse error');
     }
   }
 
@@ -355,7 +367,7 @@ export class WebSocketServer {
       const { command, agentId, roomId } = request.params;
       
       if (!command) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'Command is required');
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'Command is required');
         return;
       }
 
@@ -392,7 +404,7 @@ export class WebSocketServer {
       });
       
       // Send terminal result to room
-      this.broadcastToRoom(roomId || 'default-room', {
+      this.bus.broadcastToRoom(roomId || 'default-room', {
         jsonrpc: '2.0',
         method: 'terminal.result',
         params: {
@@ -407,7 +419,7 @@ export class WebSocketServer {
       });
 
       // Send response to requester
-      this.sendResponse(connectionId, request.id, {
+      this.bus.sendResponse(connectionId, request.id, {
         command: result.command,
         stdout: result.stdout,
         stderr: result.stderr,
@@ -416,7 +428,7 @@ export class WebSocketServer {
 
     } catch (error) {
       console.error('Error in handleTerminalExecute:', error);
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `Terminal error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `Terminal error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -425,7 +437,7 @@ export class WebSocketServer {
       const { command, roomId, reason } = request.params;
       
       if (!command) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'Command is required');
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'Command is required');
         return;
       }
 
@@ -462,7 +474,7 @@ export class WebSocketServer {
       });
       
       // Send agent execution result to room
-      this.broadcastToRoom(roomId || 'default-room', {
+      this.bus.broadcastToRoom(roomId || 'default-room', {
         jsonrpc: '2.0',
         method: 'agent.executed',
         params: {
@@ -478,7 +490,7 @@ export class WebSocketServer {
       });
 
       // Send response to requester
-      this.sendResponse(connectionId, request.id, {
+      this.bus.sendResponse(connectionId, request.id, {
         command: result.command,
         stdout: result.stdout,
         stderr: result.stderr,
@@ -531,7 +543,7 @@ export class WebSocketServer {
         });
 
         // Broadcast analysis as assistant message
-        this.broadcastToRoom(roomId || 'default-room', {
+        this.bus.broadcastToRoom(roomId || 'default-room', {
           jsonrpc: '2.0',
           method: 'agent.analysis',
           params: {
@@ -547,7 +559,7 @@ export class WebSocketServer {
 
     } catch (error) {
       console.error('Error in handleAgentExecute:', error);
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `Agent execution error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `Agent execution error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -557,12 +569,12 @@ export class WebSocketServer {
       
       // Validate user is in room (simplified for MVP)
       if (!this.isUserInRoom(connectionId, roomId)) {
-        this.sendError(connectionId, request.id, ErrorCodes.FORBIDDEN, 'Not authorized for this room');
+        this.bus.sendError(connectionId, request.id, ErrorCodes.FORBIDDEN, 'Not authorized for this room');
         return;
       }
 
       // Echo the user message to the room
-      this.broadcastToRoom(roomId, {
+      this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
         method: 'message.received',
         params: {
@@ -579,7 +591,7 @@ export class WebSocketServer {
       const messageId = randomUUID();
       
       // Send run started notification
-      this.broadcastToRoom(roomId, {
+      this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
         method: 'run.status',
         params: {
@@ -591,19 +603,23 @@ export class WebSocketServer {
 
       // If this was a request (has id), ACK so client resolves; for notifications, skip
       if ((request as any).id) {
-        this.sendResponse(connectionId, (request as any).id, {
+        this.bus.sendResponse(connectionId, (request as any).id, {
           runId,
           messageId,
           status: 'running',
         });
       }
 
-      // Get model and provider
-      const model = (runOptions?.model || 'gpt-4o') as SupportedModel;
+      // Get model and provider (gate gpt-5 via env flag)
+      let model = (runOptions?.model || 'gpt-4o') as SupportedModel;
+      const enableGpt5 = String(process.env.ENABLE_GPT5 || '').toLowerCase() === 'true';
+      if (!enableGpt5 && String(model).startsWith('gpt-5')) {
+        model = 'gpt-4o' as SupportedModel;
+      }
       const modelConfig = ModelConfigs[model];
       
       if (!modelConfig) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, `Unsupported model: ${model}`);
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, `Unsupported model: ${model}`);
         return;
       }
 
@@ -631,16 +647,7 @@ export class WebSocketServer {
       
       // Build context from user profile and memories
       let memoryContext = '';
-      if (userProfile) {
-        memoryContext += `\nUser Profile:\n- Name: ${userProfile.name || 'User'}\n- Email: ${userProfile.email || 'Not provided'}`;
-        if (userProfile.phone) memoryContext += `\n- Phone: ${userProfile.phone}`;
-        if (userProfile.location) memoryContext += `\n- Location: ${userProfile.location}`;
-        if (userProfile.company) memoryContext += `\n- Company: ${userProfile.company}`;
-        if (userProfile.website) memoryContext += `\n- Website: ${userProfile.website}`;
-        if (userProfile.bio) memoryContext += `\n- Bio: ${userProfile.bio}`;
-        memoryContext += '\n';
-      }
-      
+      memoryContext += buildUserProfileContext(userProfile);
       if (relevantMemories.length > 0) {
         memoryContext += `\nRelevant Context from Previous Conversations:\n`;
         relevantMemories.forEach(memory => {
@@ -798,171 +805,152 @@ ${personaBlock}${memoryContext}`,
       // For single-agent rooms (isAgentRoom = true), run primary agent logic
       // This prevents double responses when an agent is both the primary agent and in participants
 
-      // Stream LLM response (primary agent = roomId)
+      // Stream LLM response via orchestrator (primary agent = roomId)
       this.roomSpeaking.add(roomId);
-      let fullResponse = '';
-      
-      for await (const chunk of this.llmRouter.stream(
-        modelConfig.provider,
-        messages,
-        {
-          model,
-          temperature: runOptions?.temperature || 0.7,
-          maxTokens: runOptions?.budget?.maxTokens || 4000,
-          stream: true,
-        }
-      )) {
-        if (chunk.delta) {
-          fullResponse += chunk.delta;
-          
-          // Send delta to room
-          this.broadcastToRoom(roomId, {
+      const { fullResponse } = await this.orchestrator.streamPrimaryAgentResponse({
+        roomId,
+        activeUserId,
+        connectionId,
+        agentRecord: isAgentRoom ? (await db.select().from(agents).where(eq(agents.id as any, roomId as any)))[0] : null,
+        userProfile,
+        userMessage,
+        runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
+        onDelta: (delta: string) => {
+          this.bus.broadcastToRoom(roomId, {
             jsonrpc: '2.0',
             method: 'message.delta',
-            params: {
-              roomId,
-              messageId,
-              delta: chunk.delta,
-              authorId: roomId,
-              authorType: 'agent',
-            },
+            params: { roomId, messageId, delta, authorId: roomId, authorType: 'agent' },
           } as MessageDeltaNotification);
-        }
+        },
+      });
 
-        if (chunk.finishReason) {
-          // Send completion notification
-          this.broadcastToRoom(roomId, {
-            jsonrpc: '2.0',
-            method: 'message.complete',
-            params: {
-              runId,
-              messageId,
-              finalMessage: {
-                role: 'assistant',
-                content: [{ type: 'text', text: fullResponse }],
-              },
-              usage: chunk.usage,
-              authorId: roomId,
-              authorType: 'agent',
-            },
-          });
-
-          // Primary finished speaking
-          this.roomSpeaking.delete(roomId);
-
-          // Participation routing (enqueue other invited agents if relevant)
-          try {
-            const candidates = await this.routeParticipation(roomId, userMessage);
-            // Filter by cooldown and cap
-            const now = Date.now();
-            const cool = this.roomCooldownUntil.get(roomId) || new Map<string, number>();
-            const speakNext = candidates.filter(aid => (cool.get(aid) || 0) <= now).slice(0, 5);
-            if (speakNext.length > 0) {
-            // Skip announcing queued participants after primary response
-              // Enqueue and start processing
-              this.roomQueue.set(roomId, speakNext);
-              this.processRoomQueue(roomId, userMessage, activeUserId).catch((e) => console.error('processRoomQueue failed', e));
-            }
-          } catch (e) {
-            console.error('participation routing failed', e);
-          }
-
-          // Store messages in memory
-          const userMemoryMessage = {
-            id: messageId,
-            role: 'user' as const,
-            content: userMessage,
-            timestamp: new Date(),
-            conversationId: roomId,
-            agentId: roomId as any,
-            metadata: { userId: activeUserId },
-          };
-
-          const assistantMemoryMessage = {
-            id: messageId + '-assistant',
-            role: 'assistant' as const,
-            content: fullResponse,
-            timestamp: new Date(),
-            conversationId: roomId,
-            agentId: roomId as any,
-            metadata: { userId: activeUserId },
-          };
-
-          // Check for auto-executable commands if autoExecuteTools is enabled
-          if (autoExecuteTools) {
-            const autoExecutableCommands = this.extractAutoExecutableCommands(fullResponse);
-            for (const command of autoExecutableCommands) {
-              try {
-                console.log(`[auto-execute] Running command: ${command}`);
-                const result = await terminalService.executeCommand(command, connectionId);
-                
-                // Send terminal result to room
-                this.broadcastToRoom(roomId, {
-                  jsonrpc: '2.0',
-                  method: 'terminal.result',
-                  params: {
-                    messageId: randomUUID(),
-                    command: result.command,
-                    stdout: result.stdout,
-                    stderr: result.stderr,
-                    exitCode: result.exitCode,
-                    timestamp: new Date().toISOString(),
-                  },
-                });
-              } catch (error) {
-                console.error(`[auto-execute] Error executing command "${command}":`, error);
-              }
-            }
-          }
-
-          // Add to short-term memory
-          memoryService.addToShortTerm(activeUserId, userMemoryMessage);
-          memoryService.addToShortTerm(activeUserId, assistantMemoryMessage);
-
-          // Add to long-term memory
-          await memoryService.addToLongTerm(userMessage, ({
-            agentId: roomId as any,
-            conversationId: roomId,
-            messageId,
-            role: 'user',
-            timestamp: new Date().toISOString(),
-            messageType: 'conversation',
-            userId: activeUserId,
-          } as any));
-
-          await memoryService.addToLongTerm(fullResponse, ({
-            agentId: roomId as any,
-            conversationId: roomId,
-            messageId: messageId + '-assistant',
+      // Send completion notification
+      this.bus.broadcastToRoom(roomId, {
+        jsonrpc: '2.0',
+        method: 'message.complete',
+        params: {
+          runId,
+          messageId,
+          finalMessage: {
             role: 'assistant',
-            timestamp: new Date().toISOString(),
-            messageType: 'conversation',
-            userId: activeUserId,
-          } as any));
+            content: [{ type: 'text', text: fullResponse }],
+          },
+          authorId: roomId,
+          authorType: 'agent',
+        },
+      });
 
-          // Check if we should perform reflection
-          if (await memoryService.shouldReflect(activeUserId)) {
-            await memoryService.performReflection(activeUserId);
+      // Primary finished speaking
+      this.roomSpeaking.delete(roomId);
+
+      // Participation routing (enqueue other invited agents if relevant)
+      try {
+        const candidates = await this.routeParticipation(roomId, userMessage);
+        // Filter by cooldown and cap
+        const now = Date.now();
+        const cool = this.roomCooldownUntil.get(roomId) || new Map<string, number>();
+        const speakNext = candidates.filter(aid => (cool.get(aid) || 0) <= now).slice(0, 5);
+        if (speakNext.length > 0) {
+          // Enqueue and start processing (no announcement)
+          this.roomQueue.set(roomId, speakNext);
+          this.processRoomQueue(roomId, userMessage, activeUserId).catch((e) => console.error('processRoomQueue failed', e));
+        }
+      } catch (e) {
+        console.error('participation routing failed', e);
+      }
+
+      // Store messages in memory
+      const userMemoryMessage = {
+        id: messageId,
+        role: 'user' as const,
+        content: userMessage,
+        timestamp: new Date(),
+        conversationId: roomId,
+        agentId: roomId as any,
+        metadata: { userId: activeUserId },
+      };
+
+      const assistantMemoryMessage = {
+        id: messageId + '-assistant',
+        role: 'assistant' as const,
+        content: fullResponse,
+        timestamp: new Date(),
+        conversationId: roomId,
+        agentId: roomId as any,
+        metadata: { userId: activeUserId },
+      };
+
+      // Check for auto-executable commands if autoExecuteTools is enabled
+      if (autoExecuteTools) {
+        const autoExecutableCommands = this.extractAutoExecutableCommands(fullResponse);
+        for (const command of autoExecutableCommands) {
+          try {
+            console.log(`[auto-execute] Running command: ${command}`);
+            const result = await terminalService.executeCommand(command, connectionId);
+            
+            // Send terminal result to room
+            this.bus.broadcastToRoom(roomId, {
+              jsonrpc: '2.0',
+              method: 'terminal.result',
+              params: {
+                messageId: randomUUID(),
+                command: result.command,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                exitCode: result.exitCode,
+                timestamp: new Date().toISOString(),
+              },
+            });
+          } catch (error) {
+            console.error(`[auto-execute] Error executing command "${command}":`, error);
           }
-
-          // Send run completed notification
-          this.broadcastToRoom(roomId, {
-            jsonrpc: '2.0',
-            method: 'run.status',
-            params: {
-              runId,
-              status: 'completed',
-              completedAt: new Date().toISOString(),
-            },
-          } as RunStatusNotification);
-          
-          break;
         }
       }
 
+      // Add to short-term memory
+      memoryService.addToShortTerm(activeUserId, userMemoryMessage);
+      memoryService.addToShortTerm(activeUserId, assistantMemoryMessage);
+
+      // Add to long-term memory
+      await memoryService.addToLongTerm(userMessage, ({
+        agentId: roomId as any,
+        conversationId: roomId,
+        messageId,
+        role: 'user',
+        timestamp: new Date().toISOString(),
+        messageType: 'conversation',
+        userId: activeUserId,
+      } as any));
+
+      await memoryService.addToLongTerm(fullResponse, ({
+        agentId: roomId as any,
+        conversationId: roomId,
+        messageId: messageId + '-assistant',
+        role: 'assistant',
+        timestamp: new Date().toISOString(),
+        messageType: 'conversation',
+        userId: activeUserId,
+      } as any));
+
+      // Check if we should perform reflection
+      if (await memoryService.shouldReflect(activeUserId)) {
+        await memoryService.performReflection(activeUserId);
+      }
+
+      // Send run completed notification
+      this.bus.broadcastToRoom(roomId, {
+        jsonrpc: '2.0',
+        method: 'run.status',
+        params: {
+          runId,
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+        },
+      } as RunStatusNotification);
+
     } catch (error) {
       console.error('Error in handleMessageCreate:', error);
-      this.sendError(connectionId, request.id, ErrorCodes.LLM_ERROR, `LLM error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.bus.sendError(connectionId, request.id, ErrorCodes.LLM_ERROR, `LLM error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -976,7 +964,7 @@ ${personaBlock}${memoryContext}`,
       console.log('[serpapi.search] query=', query, 'num=', num);
       const runId = randomUUID();
       const toolCallId = randomUUID();
-      this.broadcastToolCall(roomId || 'default-room', runId, toolCallId, 'serpapi', 'search', { query, num });
+      this.bus.broadcastToolCall(roomId || 'default-room', runId, toolCallId, 'serpapi', 'search', { query, num });
       const { items } = await serpapiService.searchGoogle(query, { num });
       const md = serpapiService.formatAsMarkdown(items, query);
       console.log('[serpapi.search] results=', items.length);
@@ -1001,7 +989,7 @@ ${personaBlock}${memoryContext}`,
       });
 
       // Broadcast
-      this.broadcastToRoom(roomId || 'default-room', {
+      this.bus.broadcastToRoom(roomId || 'default-room', {
         jsonrpc: '2.0',
         method: 'agent.analysis',
         params: {
@@ -1014,12 +1002,12 @@ ${personaBlock}${memoryContext}`,
         },
       });
 
-      this.broadcastToolResult(roomId || 'default-room', runId, toolCallId, { ok: true });
+      this.bus.broadcastToolResult(roomId || 'default-room', runId, toolCallId, { ok: true });
 
-      this.sendResponse(connectionId, request.id!, { ok: true });
+      this.bus.sendResponse(connectionId, request.id!, { ok: true });
     } catch (error) {
       console.error('Error in handleSerpApiSearch:', error);
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `SerpAPI error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `SerpAPI error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -1033,7 +1021,7 @@ ${personaBlock}${memoryContext}`,
       console.log('[serpapi.images] query=', query, 'num=', num);
       const runId = randomUUID();
       const toolCallId = randomUUID();
-      this.broadcastToolCall(roomId || 'default-room', runId, toolCallId, 'serpapi', 'images', { query, num });
+      this.bus.broadcastToolCall(roomId || 'default-room', runId, toolCallId, 'serpapi', 'images', { query, num });
       const { items } = await serpapiService.searchGoogleImages(query, { num });
       const md = serpapiService.formatImagesAsMarkdown(items, query);
       console.log('[serpapi.images] results=', items.length);
@@ -1056,7 +1044,7 @@ ${personaBlock}${memoryContext}`,
         messageType: 'conversation',
       });
 
-      this.broadcastToRoom(roomId || 'default-room', {
+      this.bus.broadcastToRoom(roomId || 'default-room', {
         jsonrpc: '2.0',
         method: 'agent.analysis',
         params: {
@@ -1069,12 +1057,12 @@ ${personaBlock}${memoryContext}`,
         },
       });
 
-      this.broadcastToolResult(roomId || 'default-room', runId, toolCallId, { ok: true });
+      this.bus.broadcastToolResult(roomId || 'default-room', runId, toolCallId, { ok: true });
 
-      this.sendResponse(connectionId, request.id!, { ok: true });
+      this.bus.sendResponse(connectionId, request.id!, { ok: true });
     } catch (error) {
       console.error('Error in handleSerpApiImages:', error);
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `SerpAPI error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `SerpAPI error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -1094,7 +1082,7 @@ ${personaBlock}${memoryContext}`,
         const roomId = this.getRoomForConnection(connectionId) || 'default-room';
         const runId = randomUUID();
         const toolCallId = randomUUID();
-        this.broadcastToolCall(roomId, runId, toolCallId, 'x', 'search', { query });
+        this.bus.broadcastToolCall(roomId, runId, toolCallId, 'x', 'search', { query });
         try {
           // Use the connected user's X account for search
           const result = await xService.searchRecent(this.connectionUserId.get(connectionId) || 'default-user', query, Number(params?.extra?.num || 5));
@@ -1104,7 +1092,7 @@ ${personaBlock}${memoryContext}`,
             return `- ${idx + 1}. ${t.text || '(no text)'}${ts}`;
           });
           const markdown = lines.length ? `X search for "${query}":\n\n${lines.join('\n')}` : `No tweets found for "${query}".`;
-          this.broadcastToRoom(roomId, {
+          this.bus.broadcastToRoom(roomId, {
             jsonrpc: '2.0',
             method: 'message.received',
             params: {
@@ -1115,11 +1103,11 @@ ${personaBlock}${memoryContext}`,
               message: markdown,
             },
           });
-          this.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
-          this.sendResponse(connectionId, request.id, { ok: true, result, used: 'x.search' });
+          this.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+          this.bus.sendResponse(connectionId, request.id, { ok: true, result, used: 'x.search' });
         } catch (e: any) {
-          this.broadcastToolResult(roomId, runId, toolCallId, { ok: false, error: e?.message || String(e) });
-          this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X search failed');
+          this.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: false, error: e?.message || String(e) });
+          this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X search failed');
         }
         return;
       }
@@ -1132,12 +1120,12 @@ ${personaBlock}${memoryContext}`,
         const runId = randomUUID();
         const toolCallId = randomUUID();
         const roomId = this.getRoomForConnection(connectionId) || 'default-room';
-        this.broadcastToolCall(roomId, runId, toolCallId, 'web', 'scrape', { url });
+        this.bus.broadcastToolCall(roomId, runId, toolCallId, 'web', 'scrape', { url });
         console.log('[serpapi.run:url->web.scrape] url=', url);
         const scrapeResult = await webScraperService.scrape(url);
         const preview = (scrapeResult.text || '').replace(/\s+/g, ' ').trim();
         const summary = `${scrapeResult.title ? `**${scrapeResult.title}**\n\n` : ''}- URL: ${scrapeResult.url}\n- Links: ${scrapeResult.links?.length || 0}, Images: ${scrapeResult.images?.length || 0}\n\n${preview.slice(0, 800)}`;
-        this.broadcastToRoom(roomId, {
+        this.bus.broadcastToRoom(roomId, {
           jsonrpc: '2.0',
           method: 'message.received',
           params: {
@@ -1148,8 +1136,8 @@ ${personaBlock}${memoryContext}`,
             message: summary,
           },
         });
-        this.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
-        this.sendResponse(connectionId, request.id, { ok: true, result: scrapeResult, used: 'web.scrape' });
+        this.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+        this.bus.sendResponse(connectionId, request.id, { ok: true, result: scrapeResult, used: 'web.scrape' });
         return;
       }
 
@@ -1158,7 +1146,7 @@ ${personaBlock}${memoryContext}`,
       const roomId = this.getRoomForConnection(connectionId) || 'default-room';
       const runId = randomUUID();
       const toolCallId = randomUUID();
-      this.broadcastToolCall(roomId, runId, toolCallId, 'serpapi', 'run', { engine: engineUse, query, extra: params.extra });
+      this.bus.broadcastToolCall(roomId, runId, toolCallId, 'serpapi', 'run', { engine: engineUse, query, extra: params.extra });
       // Capture last links if present (news or organic)
       try {
         const raw = (result as any).raw || {};
@@ -1170,7 +1158,7 @@ ${personaBlock}${memoryContext}`,
         }
         if (links.length) this.lastLinks.set(connectionId, links);
       } catch {}
-      this.broadcastToRoom(roomId, {
+      this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
         method: 'message.received',
         params: {
@@ -1204,11 +1192,11 @@ ${personaBlock}${memoryContext}`,
       } catch (e) {
         console.error('[serpapi.run] failed to persist results to memory', e);
       }
-      this.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
-      this.sendResponse(connectionId, request.id, { ok: true, result });
+      this.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+      this.bus.sendResponse(connectionId, request.id, { ok: true, result });
     } catch (e: any) {
       console.error('Error in handleSerpApiRun:', e);
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'SerpAPI run failed');
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'SerpAPI run failed');
     }
   }
 
@@ -1216,13 +1204,13 @@ ${personaBlock}${memoryContext}`,
     try {
       const { index } = (request.params || {}) as { index?: number };
       if (!index || index < 1) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'index must be >= 1');
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'index must be >= 1');
         return;
       }
       const links = this.lastLinks.get(connectionId) || [];
       const url = links[index - 1];
       if (!url) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, `No URL for index ${index}`);
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, `No URL for index ${index}`);
         return;
       }
       const runId = randomUUID();
@@ -1233,7 +1221,7 @@ ${personaBlock}${memoryContext}`,
       const preview = (result.text || '').replace(/\s+/g, ' ').trim();
       const summary = `${result.title ? `**${result.title}**\n\n` : ''}- URL: ${result.url}\n- Links: ${result.links?.length || 0}, Images: ${result.images?.length || 0}\n\n${preview.slice(0, 800)}`;
       console.log('[web.scrape.pick] text.length=', (result.text || '').length, 'preview.sample=', preview.slice(0, 120));
-      this.broadcastToRoom(roomId, {
+      this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
         method: 'message.received',
         params: {
@@ -1244,28 +1232,45 @@ ${personaBlock}${memoryContext}`,
           message: summary,
         },
       });
-      this.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
-      this.sendResponse(connectionId, request.id, { ok: true, result, pickedIndex: index });
+      this.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+      this.bus.sendResponse(connectionId, request.id, { ok: true, result, pickedIndex: index });
     } catch (e: any) {
       console.error('[tool.web.scrape.pick] error', e);
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'Scrape pick failed');
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'Scrape pick failed');
     }
+  }
+
+  private buildXCtx() {
+    return {
+      bus: this.bus,
+      toolRunner: this.toolRunner,
+      getRoomForConnection: (connectionId: string) => this.getRoomForConnection(connectionId),
+      getUserRequireApproval: (connectionId: string) => this.getUserRequireApproval(connectionId),
+    };
+  }
+
+  private buildSerpCtx() {
+    return {
+      bus: this.bus,
+      toolRunner: this.toolRunner,
+      getRoomForConnection: (connectionId: string) => this.getRoomForConnection(connectionId),
+    };
   }
 
   private async handleElevenLabsTTS(connectionId: string, request: JSONRPCRequest) {
     try {
       const { text, voiceId = 'Antoni', format = 'mp3' } = (request.params || {}) as any;
       if (!text || typeof text !== 'string') {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'text is required');
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'text is required');
         return;
       }
       const roomId = this.getRoomForConnection(connectionId) || 'default-room';
       const { result } = await this.toolRunner.run('elevenlabs', 'tts', { text, voiceId, format }, { roomId, connectionId });
       const base64 = result.buffer.toString('base64');
-      this.sendResponse(connectionId, request.id!, { contentType: result.contentType, base64 });
+      this.bus.sendResponse(connectionId, request.id!, { contentType: result.contentType, base64 });
     } catch (error) {
       console.error('Error in handleElevenLabsTTS:', error);
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `ElevenLabs error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, `ElevenLabs error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -1273,7 +1278,7 @@ ${personaBlock}${memoryContext}`,
     try {
       const { url, agentId } = (request.params || {}) as { url?: string; agentId?: string };
       if (!url) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'Missing url');
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'Missing url');
         return;
       }
       const roomId = this.getRoomForConnection(connectionId) || 'default-room';
@@ -1292,7 +1297,7 @@ ${personaBlock}${memoryContext}`,
       const markdown = `${summaryTitle}\n\n- URL: ${result.url}\n- Content-Type: ${result.contentType}\n- Links: ${linkCount}, Images: ${imageCount}\n\n${preview || '_No readable article text found_'}\n`;
 
       // Notify room with assistant message
-      this.broadcastToRoom(roomId, {
+      this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
         method: 'message.received',
         params: {
@@ -1304,10 +1309,10 @@ ${personaBlock}${memoryContext}`,
         },
       });
 
-      this.sendResponse(connectionId, request.id, { ok: true, result });
+      this.bus.sendResponse(connectionId, request.id, { ok: true, result });
     } catch (e: any) {
       console.error('[tool.web.scrape] error', e);
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'Scrape failed');
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'Scrape failed');
     }
   }
 
@@ -1328,14 +1333,14 @@ ${personaBlock}${memoryContext}`,
     try {
       const { roomId, text } = (request.params || {}) as any;
       if (!text) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'text is required');
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'text is required');
         return;
       }
       const room = roomId || this.getRoomForConnection(connectionId) || 'default-room';
       const requireApproval = await this.getUserRequireApproval(connectionId);
       if (requireApproval) {
         // Broadcast a suggestion instead of executing directly
-        this.broadcastToRoom(room, {
+        this.bus.broadcastToRoom(room, {
           jsonrpc: '2.0',
           method: 'message.received',
           params: {
@@ -1346,17 +1351,17 @@ ${personaBlock}${memoryContext}`,
             message: `Should I post this on X?\n\n${text}`,
           },
         });
-        this.sendResponse(connectionId, request.id!, { ok: true, awaitingApproval: true });
+        this.bus.sendResponse(connectionId, request.id!, { ok: true, awaitingApproval: true });
         return;
       }
       const runId = randomUUID();
       const toolCallId = randomUUID();
-      this.broadcastToolCall(room, runId, toolCallId, 'x', 'tweet', { text });
+      this.bus.broadcastToolCall(room, runId, toolCallId, 'x', 'tweet', { text });
       const res = await this.toolRunner.run('x', 'tweet', { text }, { roomId: room, connectionId });
-      this.broadcastToolResult(room, runId, toolCallId, { ok: true });
-      this.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
+      this.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+      this.bus.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
     } catch (e: any) {
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X tweet failed');
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X tweet failed');
     }
   }
 
@@ -1364,13 +1369,13 @@ ${personaBlock}${memoryContext}`,
     try {
       const { roomId, recipientId, text } = (request.params || {}) as any;
       if (!recipientId || !text) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'recipientId and text are required');
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'recipientId and text are required');
         return;
       }
       const room = roomId || this.getRoomForConnection(connectionId) || 'default-room';
       const requireApproval = await this.getUserRequireApproval(connectionId);
       if (requireApproval) {
-        this.broadcastToRoom(room, {
+        this.bus.broadcastToRoom(room, {
           jsonrpc: '2.0',
           method: 'message.received',
           params: {
@@ -1381,130 +1386,28 @@ ${personaBlock}${memoryContext}`,
             message: `Should I send this DM on X to ${recipientId}?\n\n${text}`,
           },
         });
-        this.sendResponse(connectionId, request.id!, { ok: true, awaitingApproval: true });
+        this.bus.sendResponse(connectionId, request.id!, { ok: true, awaitingApproval: true });
         return;
       }
       const runId = randomUUID();
       const toolCallId = randomUUID();
-      this.broadcastToolCall(room, runId, toolCallId, 'x', 'dm', { recipientId, text });
+      this.bus.broadcastToolCall(room, runId, toolCallId, 'x', 'dm', { recipientId, text });
       const res = await this.toolRunner.run('x', 'dm', { recipientId, text }, { roomId: room, connectionId });
-      this.broadcastToolResult(room, runId, toolCallId, { ok: true });
-      this.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
+      this.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+      this.bus.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
     } catch (e: any) {
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X DM failed');
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X DM failed');
     }
   }
 
-  private async handleXSearch(connectionId: string, request: JSONRPCRequest) {
-    try {
-      const { roomId, query, max } = (request.params || {}) as any;
-      if (!query) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'query is required');
-        return;
-      }
-      const room = roomId || this.getRoomForConnection(connectionId) || 'default-room';
-      const runId = randomUUID();
-      const toolCallId = randomUUID();
-      this.broadcastToolCall(room, runId, toolCallId, 'x', 'search', { query, max });
-      const res = await this.toolRunner.run('x', 'search', { query, max }, { roomId: room, connectionId });
-      this.broadcastToRoom(room, {
-        jsonrpc: '2.0',
-        method: 'message.received',
-        params: {
-          roomId: room,
-          messageId: randomUUID(),
-          authorId: 'agent',
-          authorType: 'assistant',
-          message: `X search for "${query}":\n\n\`\`\`json\n${JSON.stringify(res.result?.data?.slice?.(0, 5) || res.result?.data || [], null, 2)}\n\`\`\``,
-        },
-      });
-      this.broadcastToolResult(room, runId, toolCallId, { ok: true });
-      this.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
-    } catch (e: any) {
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X search failed');
-    }
-  }
-
-  private async handleXLists(connectionId: string, request: JSONRPCRequest) {
-    try {
-      const { roomId, username } = (request.params || {}) as any;
-      const room = roomId || this.getRoomForConnection(connectionId) || 'default-room';
-      const runId = randomUUID();
-      const toolCallId = randomUUID();
-      const args = username ? { username } : {};
-      this.broadcastToolCall(room, runId, toolCallId, 'x', 'lists', args);
-      const res = await this.toolRunner.run('x', 'lists', args, { roomId: room, connectionId });
-
-      const lists: any[] = Array.isArray(res.result?.data) ? res.result.data : [];
-      let markdown: string;
-      if (!lists.length) {
-        markdown = username ? `No lists found for ${username}.` : 'No lists found.';
-      } else {
-        const safe = (s: any) => String(s ?? '').replace(/\|/g, '\\|');
-        const rows = lists.map((l: any, idx: number) => `| ${idx + 1} | ${safe(l.name || '(unnamed)')} | ${safe(l.id)} |`);
-        const title = username ? `X lists owned by ${username}` : 'X lists (owned)';
-        markdown = `${title}:\n\n| # | Name | ID |\n|---:|---|---|\n${rows.join('\n')}`;
-      }
-
-      this.broadcastToRoom(room, {
-        jsonrpc: '2.0',
-        method: 'message.received',
-        params: {
-          roomId: room,
-          messageId: randomUUID(),
-          authorId: 'agent',
-          authorType: 'assistant',
-          message: markdown,
-        },
-      });
-      this.broadcastToolResult(room, runId, toolCallId, { ok: true });
-      this.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
-    } catch (e: any) {
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X lists failed');
-    }
-  }
-
-  private async handleXListTweets(connectionId: string, request: JSONRPCRequest) {
-    try {
-      const { roomId, listId, max } = (request.params || {}) as any;
-      if (!listId) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'listId is required');
-        return;
-      }
-      const room = roomId || this.getRoomForConnection(connectionId) || 'default-room';
-      const runId = randomUUID();
-      const toolCallId = randomUUID();
-      this.broadcastToolCall(room, runId, toolCallId, 'x', 'listTweets', { listId, max });
-      const res = await this.toolRunner.run('x', 'listTweets', { listId, max }, { roomId: room, connectionId });
-      this.broadcastToRoom(room, {
-        jsonrpc: '2.0',
-        method: 'message.received',
-        params: {
-          roomId: room,
-          messageId: randomUUID(),
-          authorId: 'agent',
-          authorType: 'assistant',
-          message: `X list ${listId} tweets:\n\n\`\`\`json\n${JSON.stringify(res.result?.data || [], null, 2)}\n\`\`\``,
-        },
-      });
-      this.broadcastToolResult(room, runId, toolCallId, { ok: true });
-      this.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
-    } catch (e: any) {
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'X listTweets failed');
-    }
-  }
+  
 
   private async handleRoomJoin(connectionId: string, request: JSONRPCRequest) {
     const { roomId, userId } = request.params as { roomId: string; userId?: string };
     
-    if (!this.rooms.has(roomId)) {
-      this.rooms.set(roomId, new Set());
-    }
+    this.roomsRegistry.addConnection(roomId, connectionId, userId);
     
-    this.rooms.get(roomId)!.add(connectionId);
-    if (userId) this.connectionUserId.set(connectionId, userId);
-    
-    this.sendResponse(connectionId, request.id, { 
+    this.bus.sendResponse(connectionId, request.id, { 
       roomId, 
       status: 'joined',
       participants: Array.from(this.rooms.get(roomId)!),
@@ -1517,12 +1420,9 @@ ${personaBlock}${memoryContext}`,
   private async handleRoomLeave(connectionId: string, request: JSONRPCRequest) {
     const { roomId } = request.params;
     
-    if (this.rooms.has(roomId)) {
-      this.rooms.get(roomId)!.delete(connectionId);
-    }
-    this.connectionUserId.delete(connectionId);
+    this.roomsRegistry.removeConnection(roomId, connectionId);
     
-    this.sendResponse(connectionId, request.id, { 
+    this.bus.sendResponse(connectionId, request.id, { 
       roomId, 
       status: 'left' 
     });
@@ -1534,33 +1434,27 @@ ${personaBlock}${memoryContext}`,
   private async handleRoomInvite(connectionId: string, request: JSONRPCRequest) {
     const { roomId, participant } = request.params as { roomId: string; participant: { type: 'user' | 'agent'; id: string } };
     if (!roomId || !participant || !participant.id) {
-      this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'roomId and participant are required');
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'roomId and participant are required');
       return;
     }
     if (participant.type !== 'agent') {
       // For now only agents are supported
-      this.sendResponse(connectionId, request.id!, { ok: true, ignored: true });
+      this.bus.sendResponse(connectionId, request.id!, { ok: true, ignored: true });
       return;
     }
-    if (!this.roomAgents.has(roomId)) this.roomAgents.set(roomId, new Set());
-    const set = this.roomAgents.get(roomId)!;
-    set.add(participant.id);
-    this.roomAgents.set(roomId, set);
-    this.sendResponse(connectionId, request.id!, { ok: true });
+    this.roomsRegistry.inviteAgent(roomId, participant.id);
+    this.bus.sendResponse(connectionId, request.id!, { ok: true });
     await this.broadcastParticipants(roomId);
   }
 
   private async handleRoomRemove(connectionId: string, request: JSONRPCRequest) {
     const { roomId, participantId, participantType } = request.params as { roomId: string; participantId: string; participantType: 'user' | 'agent' };
     if (!roomId || !participantId) {
-      this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'roomId and participantId are required');
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'roomId and participantId are required');
       return;
     }
-    if (participantType === 'agent' && this.roomAgents.has(roomId)) {
-      const set = this.roomAgents.get(roomId)!;
-      set.delete(participantId);
-    }
-    this.sendResponse(connectionId, request.id!, { ok: true });
+    if (participantType === 'agent') this.roomsRegistry.removeAgent(roomId, participantId);
+    this.bus.sendResponse(connectionId, request.id!, { ok: true });
     await this.broadcastParticipants(roomId);
   }
 
@@ -1568,7 +1462,7 @@ ${personaBlock}${memoryContext}`,
     try {
       const { agentIds, userIds, title, type } = (request.params || {}) as { agentIds: string[]; userIds?: string[]; title?: string; type?: string };
       if (!Array.isArray(agentIds) || agentIds.length === 0) {
-        this.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'agentIds[] is required');
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'agentIds[] is required');
         return;
       }
       // Derive org from first agent
@@ -1590,10 +1484,10 @@ ${personaBlock}${memoryContext}`,
         participants: participants as any,
         isArchived: false as any,
       } as any);
-      this.sendResponse(connectionId, request.id!, { ok: true, roomId: conversationId });
+      this.bus.sendResponse(connectionId, request.id!, { ok: true, roomId: conversationId });
     } catch (e: any) {
       console.error('room.create failed', e);
-      this.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, 'room.create failed');
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, 'room.create failed');
     }
   }
 
@@ -1745,44 +1639,7 @@ ${personaBlock}${memoryContext}`,
         } catch {}
       }
 
-      // Try to fetch agents from conversation participants in DB
-      let agentIds: string[] = [];
-      try {
-        const conv = await db.select().from(DBSchema.conversations).where(eq(DBSchema.conversations.id as any, roomId as any));
-        if (conv.length && Array.isArray((conv[0] as any).participants)) {
-          const participants = (conv[0] as any).participants as any[];
-          console.log(`[broadcastParticipants] Room ${roomId} participants from DB:`, participants);
-          // Handle both formats: ['agent-id'] and [{ type: 'agent', id: 'agent-id' }]
-          agentIds = participants
-            .map((p) => {
-              if (typeof p === 'string') return p; // Simple string format
-              if (p && p.type === 'agent' && typeof p.id === 'string') return p.id; // Object format
-              return null;
-            })
-            .filter((id): id is string => id !== null);
-          console.log(`[broadcastParticipants] Extracted agentIds:`, agentIds);
-        }
-      } catch (e) {
-        console.error(`[broadcastParticipants] Error fetching conversation:`, e);
-      }
-
-      // Fallback to legacy: main agent = roomId + invited
-      if (agentIds.length === 0) {
-        agentIds = [roomId, ...Array.from(this.roomAgents.get(roomId) || [])];
-      }
-
-      const agentProfiles: any[] = [];
-      for (const aid of Array.from(new Set(agentIds))) {
-        try {
-          const rows = await db.select().from(agents).where(eq(agents.id as any, aid as any));
-          if (rows.length > 0) agentProfiles.push(rows[0]);
-        } catch {}
-      }
-
-      const participants = [
-        ...agentProfiles.map((a) => ({ id: a.id, type: 'agent' as const, name: a.name || 'Agent', avatar: a.avatar || null, status: 'online' })),
-        ...userProfiles.map((u) => ({ id: u.id, type: 'user' as const, name: u.name || u.email || 'User', avatar: u.avatar || null, status: 'online' })),
-      ];
+      const participants = await this.roomsRegistry.buildParticipants(roomId);
       
       console.log(`[broadcastParticipants] Final participants for room ${roomId}:`, participants);
 
@@ -1797,7 +1654,7 @@ ${personaBlock}${memoryContext}`,
       };
       
       console.log(`[broadcastParticipants] Broadcasting message:`, broadcastMessage);
-      this.broadcastToRoom(roomId, broadcastMessage);
+      this.bus.broadcastToRoom(roomId, broadcastMessage as any);
     } catch (e) {
       console.error('Failed to broadcast participants:', e);
     }
@@ -1861,11 +1718,7 @@ ${personaBlock}${memoryContext}`,
     // Load Pinecone memory for this agent
     let memoryContext = '';
     try {
-      const memoryResults = await memoryService.searchMemories(userMessage, {
-        agentId: nextAgentId,
-        limit: 5,
-        threshold: 0.7
-      });
+      const memoryResults = await memoryService.searchLongTerm(nextAgentId, userMessage, 5);
       
       if (memoryResults.length > 0) {
         memoryContext = `\n\nRELEVANT MEMORY:\n${memoryResults.map(m => `- ${m.content}`).join('\n')}\n`;
@@ -1953,8 +1806,29 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
           metadata: { userId: activeUserId },
         };
 
-        await memoryService.storeMemory(userMemoryMessage);
-        await memoryService.storeMemory(assistantMemoryMessage);
+        // Short-term memory (per-agent)
+        memoryService.addToShortTerm(nextAgentId, userMemoryMessage as any);
+        memoryService.addToShortTerm(nextAgentId, assistantMemoryMessage as any);
+
+        // Long-term memory (Pinecone), guard if not configured inside service
+        await memoryService.addToLongTerm(userMemoryMessage.content, {
+          agentId: nextAgentId as any,
+          conversationId: roomId,
+          messageId: userMemoryMessage.id,
+          role: 'user',
+          timestamp: new Date().toISOString(),
+          messageType: 'conversation',
+          userId: activeUserId,
+        } as any);
+        await memoryService.addToLongTerm(assistantMemoryMessage.content, {
+          agentId: nextAgentId as any,
+          conversationId: roomId,
+          messageId: assistantMemoryMessage.id,
+          role: 'assistant',
+          timestamp: new Date().toISOString(),
+          messageType: 'conversation',
+          userId: activeUserId,
+        } as any);
       } catch (e) {
         console.error('Failed to store memory for agent:', e);
       }

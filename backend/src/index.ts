@@ -9,7 +9,7 @@ import cors from '@fastify/cors';
 import { WebSocketServer } from './websocket/server.js';
 import { randomUUID } from 'crypto';
 import { db, agents, users, conversations } from './db/index.js';
-import { LLMRouter } from './llm/providers.js';
+import { LLMRouter, ModelConfigs } from './llm/providers.js';
 import { eq, isNull } from 'drizzle-orm';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
@@ -133,6 +133,19 @@ fastify.get('/api/info', async (request, reply) => {
       'room.leave',
     ],
   };
+});
+
+// LLM models endpoint with optional GPT-5 gating
+fastify.get('/api/llm/models', async (request, reply) => {
+  const enableGpt5 = String(process.env.ENABLE_GPT5 || '').toLowerCase() === 'true';
+  const models = Object.entries(ModelConfigs)
+    .filter(([name]) => {
+      if (name.startsWith('gpt-5')) return enableGpt5;
+      return true;
+    })
+    .map(([name, cfg]) => ({ name, provider: cfg.provider, maxTokens: cfg.maxTokens }));
+  const providers = wsServer.getAvailableProviders();
+  return { providers, models };
 });
 
 // === Interest summary + embedding (admin/dev endpoint) ===

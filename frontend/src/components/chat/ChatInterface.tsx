@@ -6,11 +6,18 @@ import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
-import { SuperAgentWebSocket, ChatMessage as ChatMessageType } from '@/lib/websocket';
+import { ChatMessage as ChatMessageType } from '@/lib/websocket';
+import { resolveWsUrl, getHealthUrlFromWs, getHttpBaseFromWs, WSClient, parseInput } from '@/lib/chat';
+import { enrichAssistantIdentity, upsertMessage } from '@/lib/chat';
+import { useChatStore } from '@/stores/chat-store';
+import { useParticipantsStore } from '@/stores/participants-store';
+import { useUIStore } from '@/stores/ui-store';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput } from './ChatInput';
 import { ChatFooterBar } from './ChatFooterBar';
 import { AgentTerminalSuggestion } from './AgentTerminalSuggestion';
+import { MessagesPanel } from './MessagesPanel';
+import { RightPanel } from './RightPanel';
 import { Wifi, WifiOff, MessageSquare, Users, Globe2, Search, Mic, Wrench, Copy, X } from 'lucide-react';
 import { JsonFormatter } from '@/components/ui/json-formatter';
 import { Input } from '@/components/ui/input';
@@ -18,31 +25,7 @@ import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useSidebar } from '@/components/ui/sidebar';
 
-function resolveWsUrl(): string {
-  try {
-    if (typeof window !== 'undefined') {
-      const host = window.location.hostname || '';
-      const isLocal = host === 'localhost' || host === '127.0.0.1' || host.endsWith('.local') || /^192\.168\./.test(host);
-      if (isLocal) return 'ws://localhost:3001/ws';
-    }
-  } catch {}
-  return (
-    process.env.NEXT_PUBLIC_WS_URL ||
-    (process.env.NODE_ENV === 'production' ? 'wss://your-domain.com/ws' : 'ws://localhost:3001/ws')
-  );
-}
-
 const WEBSOCKET_URL = resolveWsUrl();
-
-function getHealthUrlFromWs(wsUrl: string): string {
-  try {
-    const url = new URL(wsUrl);
-    const scheme = url.protocol === 'wss:' ? 'https:' : 'http:';
-    return `${scheme}//${url.host}/health`;
-  } catch {
-    return 'http://localhost:3001/health';
-  }
-}
 
 const DEFAULT_ROOM_ID = 'default-room';
 
@@ -58,6 +41,7 @@ export function ChatInterface({
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [availableProviders, setAvailableProviders] = useState<string[]>([]);
+  const [availableModels, setAvailableModels] = useState<Array<{ name: string; provider: string; maxTokens: number }>>([]);
   const [currentRoom, setCurrentRoom] = useState(currentConversation || DEFAULT_ROOM_ID);
   const [pendingTerminalSuggestions, setPendingTerminalSuggestions] = useState<Map<string, {command: string, reason: string}>>(new Map());
   const [agentMeta, setAgentMeta] = useState<{ name?: string; avatarUrl?: string }>({});
@@ -66,15 +50,17 @@ export function ChatInterface({
   const [executedEleven, setExecutedEleven] = useState<Set<string>>(new Set());
   const [participants, setParticipants] = useState<Array<{ id: string; type: 'user' | 'agent'; name: string; avatar?: string | null; status?: string }>>([]);
   const participantsRef = useRef<Array<{ id: string; type: 'user' | 'agent'; name: string; avatar?: string | null; status?: string }>>([]);
-  const [rightOpen, setRightOpen] = useState(false);
-  const [rightTab, setRightTab] = useState<'participants' | 'tasks'>('participants');
+  const rightOpen = useUIStore(s => s.rightOpen);
+  const rightTab = useUIStore(s => s.rightTab);
+  const setRightOpen = useUIStore(s => s.setRightOpen);
+  const setRightTab = useUIStore(s => s.setRightTab);
   const [toolRuns, setToolRuns] = useState<Map<string, { runId: string; toolCallId: string; tool: string; func: string; args: any; status: 'running' | 'succeeded' | 'failed'; error?: string; startedAt: number; completedAt?: number; durationMs?: number }>>(new Map());
   const [showAddAgent, setShowAddAgent] = useState(false);
   const [allAgents, setAllAgents] = useState<Array<{ id: string; name: string; avatar?: string }>>([]);
   const [agentSearch, setAgentSearch] = useState('');
   
   const { state: sidebarState } = useSidebar();
-  const wsRef = useRef<SuperAgentWebSocket | null>(null);
+  const wsRef = useRef<WSClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
   const seenSuggestionIdsRef = useRef<Set<string>>(new Set());
@@ -138,7 +124,7 @@ export function ChatInterface({
 
   // Global header trigger to toggle participants
   useEffect(() => {
-    const handler = () => setRightOpen(o => !o);
+    const handler = () => setRightOpen(!useUIStore.getState().rightOpen);
     window.addEventListener('toggle-participants', handler as EventListener);
     return () => window.removeEventListener('toggle-participants', handler as EventListener);
   }, []);
@@ -251,10 +237,11 @@ export function ChatInterface({
     
     setIsConnecting(true);
     
-    wsRef.current = new SuperAgentWebSocket(
-      WEBSOCKET_URL,
-      // onMessage
-      (message) => {
+    wsRef.current = new WSClient({
+      wsUrl: WEBSOCKET_URL,
+      getParticipants: () => participantsRef.current,
+      getDefaults: () => ({ name: agentMeta.name, avatarUrl: agentMeta.avatarUrl }),
+      onMessage: (message) => {
         setMessages(prev => {
           // If a terminal result arrives, replace the latest placeholder instead of appending
           if (message.role === 'terminal' && (message as any).terminalResult) {
@@ -284,72 +271,14 @@ export function ChatInterface({
 
           // If an assistant message arrives, try to attach author name/avatar if provided
           if (message.role === 'assistant') {
-            const authorId = (message as any).authorId as string | undefined;
-            const authorType = (message as any).authorType as string | undefined;
-            let messageWithIdentity: any = { ...(message as any) };
-            
-            // Use ref for immediate access to participants data
-            const currentParticipants = participantsRef.current;
-            console.log('Processing assistant message:', { 
-              authorId, 
-              authorType, 
-              participants: currentParticipants.length,
-              participantsList: currentParticipants.map(p => ({ id: p.id, name: p.name, type: p.type })),
-              searchingFor: authorId,
-              foundMatch: currentParticipants.find(p => p.type === 'agent' && p.id === authorId)
-            });
-            
-            if (authorType === 'agent' && authorId) {
-              const p = currentParticipants.find(p => p.type === 'agent' && p.id === authorId);
-              console.log('Found participant:', p);
-              if (p) {
-                messageWithIdentity.agentName = p.name;
-                messageWithIdentity.agentAvatar = p.avatar || undefined;
-                console.log('Applied agent identity:', { agentName: p.name, agentAvatar: p.avatar });
-              } else {
-                console.log('No matching participant found for authorId:', authorId);
-              }
-            } else {
-              console.log('No authorId/authorType provided or not agent type');
-            }
-            
-            // Always fallback to agentMeta if no specific agent found
-            if (!messageWithIdentity.agentName && (agentMeta.name || agentMeta.avatarUrl)) {
-              messageWithIdentity.agentName = agentMeta.name;
-              messageWithIdentity.agentAvatar = agentMeta.avatarUrl;
-            }
+            const messageWithIdentity = enrichAssistantIdentity(message, { participants: participantsRef.current, defaultAgentName: agentMeta.name, defaultAgentAvatar: agentMeta.avatarUrl });
 
             // First try to find exact message by ID
-            const existingIdx = prev.findIndex(m => m.id === message.id);
-            if (existingIdx !== -1) {
-              const updated = [...prev];
-              updated[existingIdx] = { ...messageWithIdentity, streaming: false };
+            const merged = upsertMessage(prev, messageWithIdentity as any);
+            if (merged !== prev) {
               const suggestion = extractTerminalSuggestions(message.content);
-              if (suggestion) {
-                setPendingTerminalSuggestions(prevMap => {
-                  const map = new Map(prevMap);
-                  map.set(message.id, suggestion);
-                  return map;
-                });
-              }
-              return updated;
-            }
-
-            // Otherwise, replace the most recent streaming assistant placeholder
-            const lastAssistantPlaceholderIdx = [...prev].reverse().findIndex(m => m.role === 'assistant' && m.streaming);
-            if (lastAssistantPlaceholderIdx !== -1) {
-              const idx = prev.length - 1 - lastAssistantPlaceholderIdx;
-              const updated = [...prev];
-              updated[idx] = { ...messageWithIdentity, streaming: false };
-              const suggestion = extractTerminalSuggestions(message.content);
-              if (suggestion) {
-                setPendingTerminalSuggestions(prevMap => {
-                  const map = new Map(prevMap);
-                  map.set(message.id, suggestion);
-                  return map;
-                });
-              }
-              return updated;
+              if (suggestion) setPendingTerminalSuggestions(prevMap => { const map = new Map(prevMap); map.set(message.id, suggestion); return map; });
+              return merged;
             }
           }
 
@@ -384,8 +313,7 @@ export function ChatInterface({
         if (t) clearTimeout(t);
         streamTimersRef.current.delete(message.id);
       },
-      // onMessageDelta
-      (messageId, delta, authorId, authorType) => {
+      onMessageDelta: (messageId, delta, authorId, authorType) => {
         // Buffer deltas to smooth rendering
         const current = streamBuffersRef.current.get(messageId) || '';
         streamBuffersRef.current.set(messageId, current + delta);
@@ -480,8 +408,7 @@ export function ChatInterface({
         }, 50);
         streamTimersRef.current.set(messageId, timer);
       },
-      // onConnect
-      async () => {
+      onConnected: async () => {
         setIsConnected(true);
         setIsConnecting(false);
         toast.success('Connected to SuperAgent');
@@ -502,48 +429,31 @@ export function ChatInterface({
             console.error('room.join failed:', err);
           });
           
-          // Get available providers
-          const response = await fetch(getHealthUrlFromWs(WEBSOCKET_URL));
-          const data = await response.json();
-          setAvailableProviders(data.availableProviders || []);
+          // Get available providers and models
+          const base = getHttpBaseFromWs(WEBSOCKET_URL);
+          const [healthRes, modelsRes] = await Promise.all([
+            fetch(getHealthUrlFromWs(WEBSOCKET_URL)),
+            fetch(`${base}/api/llm/models`),
+          ]);
+          const health = await healthRes.json();
+          const modelsPayload = await modelsRes.json();
+          setAvailableProviders(health.availableProviders || modelsPayload.providers || []);
+          setAvailableModels(Array.isArray(modelsPayload.models) ? modelsPayload.models : []);
         } catch (error) {
           console.error('Error joining room or fetching providers:', error);
         }
       },
-      // onDisconnect
-      () => {
+      onDisconnected: () => {
         setIsConnected(false);
         setIsConnecting(false);
         toast.error('Disconnected from SuperAgent');
       },
-      // onError
-      (error) => {
+      onError: (error) => {
         console.error('WebSocket error:', error);
         setIsConnecting(false);
         toast.error('Connection error');
       },
-      undefined,
-      // onAgentAnalysis: append analysis to existing assistant placeholder if present
-      (content, authorId, authorType) => {
-        setMessages(prev => {
-          const lastAssistantIdx = [...prev].reverse().findIndex(m => m.role === 'assistant');
-          if (lastAssistantIdx !== -1) {
-            const idx = prev.length - 1 - lastAssistantIdx;
-            const updated = [...prev];
-            updated[idx] = {
-              ...updated[idx],
-              content: content,
-              streaming: false,
-              agentName: (() => { const p = participantsRef.current.find(p => p.type === 'agent' && p.id === authorId); return p?.name || agentMeta.name; })(),
-              agentAvatar: (() => { const p = participantsRef.current.find(p => p.type === 'agent' && p.id === authorId); return (p?.avatar || undefined) ?? agentMeta.avatarUrl; })(),
-            } as any;
-            return updated;
-          }
-          return prev;
-        });
-      },
-      // onParticipantsUpdate
-      (payload: { roomId: string; participants: Array<{ id: string; type: 'user' | 'agent'; name: string; avatar?: string | null; status?: string }>; updatedAt: string }) => {
+      onParticipants: (payload: { roomId: string; participants: Array<{ id: string; type: 'user' | 'agent'; name: string; avatar?: string | null; status?: string }>; updatedAt: string }) => {
         console.log('Received participants update:', payload);
         console.log('Current room:', currentRoom);
         console.log('Payload room:', payload.roomId);
@@ -563,8 +473,7 @@ export function ChatInterface({
           console.log('Ignoring participants update for different room');
         }
       },
-      // onToolCall
-      (payload: { runId: string; toolCallId: string; tool: string; function: string; args: Record<string, any> }) => {
+      onToolCall: (payload: { runId: string; toolCallId: string; tool: string; function: string; args: Record<string, any> }) => {
         setRightOpen(true);
         setRightTab('tasks');
         setToolRuns(prev => {
@@ -573,8 +482,7 @@ export function ChatInterface({
           return next;
         });
       },
-      // onToolResult
-      (payload: { runId: string; toolCallId: string; result?: any; error?: string }) => {
+      onToolResult: (payload: { runId: string; toolCallId: string; result?: any; error?: string }) => {
         setToolRuns(prev => {
           const next = new Map(prev);
           const existing = next.get(payload.toolCallId);
@@ -587,8 +495,8 @@ export function ChatInterface({
           }
           return next;
         });
-      }
-    );
+      },
+    });
 
     try {
       await wsRef.current.connect();
@@ -679,8 +587,8 @@ export function ChatInterface({
     }
 
     try {
-      // Check if this is a terminal command
-      if (content.startsWith('$')) {
+      const intent = parseInput(content);
+      if (intent.type === 'terminal') {
         // Show immediate terminal placeholder
         // Insert a single terminal placeholder if not present
         setMessages(prev => {
@@ -692,12 +600,58 @@ export function ChatInterface({
             {
               id: tempId,
               role: 'terminal',
-              content: content,
+              content: intent.command,
               timestamp: new Date(),
             } as ChatMessageType,
           ];
         });
-        await wsRef.current.executeTerminalCommand(content, currentRoom);
+        await wsRef.current.executeTerminalCommand(intent.command, currentRoom);
+      } else if (intent.type === 'serpapi') {
+        const nowQuick = new Date();
+        const userEchoQuick = { id: crypto.randomUUID(), role: 'user' as const, content, timestamp: nowQuick, temp: true } as any;
+        const assistantLoaderQuick = { id: crypto.randomUUID(), role: 'assistant' as const, content: '', timestamp: nowQuick, streaming: true, agentName: agentMeta.name, agentAvatar: agentMeta.avatarUrl } as any;
+        setMessages(prev => [...prev, userEchoQuick, assistantLoaderQuick]);
+        const mentioned = participantsRef.current.find(p => p.type === 'agent' && new RegExp(`@${p.name.replace(/[-/\\^$*+?.()|[\]{}]/g, '')}`, 'i').test(content));
+        await wsRef.current.serpapiRun(intent.engine, intent.query, currentRoom, intent.extra, mentioned?.id);
+        return;
+      } else if (intent.type === 'x.search') {
+        const nowQuick = new Date();
+        const userEchoQuick = { id: crypto.randomUUID(), role: 'user' as const, content, timestamp: nowQuick, temp: true } as any;
+        const assistantLoaderQuick = { id: crypto.randomUUID(), role: 'assistant' as const, content: '', timestamp: nowQuick, streaming: true, agentName: agentMeta.name, agentAvatar: agentMeta.avatarUrl } as any;
+        setMessages(prev => [...prev, userEchoQuick, assistantLoaderQuick]);
+        const mentioned = participantsRef.current.find(p => p.type === 'agent' && new RegExp(`@${p.name.replace(/[-/\\^$*+?.()|[\]{}]/g, '')}`, 'i').test(content));
+        await wsRef.current.xSearch(intent.query, currentRoom, 5, mentioned?.id);
+        return;
+      } else if (intent.type === 'x.lists') {
+        const nowQuick = new Date();
+        const userEchoQuick = { id: crypto.randomUUID(), role: 'user' as const, content, timestamp: nowQuick, temp: true } as any;
+        const assistantLoaderQuick = { id: crypto.randomUUID(), role: 'assistant' as const, content: '', timestamp: nowQuick, streaming: true, agentName: agentMeta.name, agentAvatar: agentMeta.avatarUrl } as any;
+        setMessages(prev => [...prev, userEchoQuick, assistantLoaderQuick]);
+        const mentioned = participantsRef.current.find(p => p.type === 'agent' && new RegExp(`@${p.name.replace(/[-/\\^$*+?.()|[\]{}]/g, '')}`, 'i').test(content));
+        await wsRef.current.xLists(intent.handle, currentRoom, mentioned?.id);
+        return;
+      } else if (intent.type === 'tts') {
+        try {
+          const now = new Date();
+          const loaderId = crypto.randomUUID();
+          const MIN_LOADER_MS = 900;
+          const userEcho = { id: crypto.randomUUID(), role: 'user' as const, content, timestamp: now } as any;
+          const assistantLoader = { id: loaderId, role: 'assistant' as const, content: 'Generating narration…', timestamp: now, streaming: true, agentName: agentMeta.name, agentAvatar: agentMeta.avatarUrl } as any;
+          setMessages(prev => ([...prev, userEcho, assistantLoader]));
+          const res = await wsRef.current!.elevenlabsTTS(intent.text, intent.voiceId, intent.format as any);
+          const audioUrl = `data:${res.contentType};base64,${res.base64}`;
+          const finalize = () => setMessages(prev => {
+            const finalMsg = { id: crypto.randomUUID(), role: 'assistant' as const, content: `Generated audio for: "${intent.text}"
+
+[Play audio](${audioUrl})`, timestamp: new Date(), agentName: agentMeta.name, agentAvatar: agentMeta.avatarUrl } as any;
+            const idx = prev.findIndex(m => m.id === loaderId);
+            if (idx !== -1) { const updated = [...prev]; updated[idx] = finalMsg; return updated; }
+            return [...prev, finalMsg];
+          });
+          const elapsed = Date.now() - now.getTime();
+          if (elapsed < MIN_LOADER_MS) { setTimeout(finalize, MIN_LOADER_MS - elapsed); } else { finalize(); }
+        } catch (e) { toast.error('TTS failed'); }
+        return;
       } else {
         // Check if user is approving a terminal command
         const isApproval = /^(y|yes)\b/i.test(content.trim());
@@ -1284,217 +1238,30 @@ export function ChatInterface({
         rightOpen ? "md:pr-[var(--sidebar-width)]" : "md:pr-0"
       )}>
 
-        {/* Messages */}
-        <div className="flex-1 flex flex-col min-h-0">
-          <ScrollArea className="flex-1">
-          {allMessages.length === 0 ? (
-            <div className="flex items-center justify-center h-full text-muted-foreground">
-              <div className="text-center animate-in fade-in-0 slide-in-from-bottom-4 duration-500">
-                <MessageSquare className="h-12 w-12 mx-auto mb-4 opacity-50 animate-in fade-in-0 duration-700" style={{ animationDelay: '200ms' }} />
-                <p className="text-lg font-medium animate-in fade-in-0 duration-700" style={{ animationDelay: '400ms' }}>Welcome to SuperAgent!</p>
-                <p className="text-sm animate-in fade-in-0 duration-700" style={{ animationDelay: '600ms' }}>Start a conversation by typing a message below.</p>
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-0">
-              {allMessages.map((message, idx) => {
-                const hasSeen = seenMessageIdsRef.current.has(message.id);
-                if (!hasSeen) {
-                  seenMessageIdsRef.current.add(message.id);
-                }
-                const shouldAnimate = !hasSeen && !message.streaming;
-                return (
-                <div
-                  key={message.id}
-                  className={shouldAnimate ? 'animate-in fade-in-0 slide-in-from-bottom-2 duration-200' : ''}
-                  style={shouldAnimate ? { animationDelay: `${Math.min(idx * 30, 200)}ms` } : undefined}
-                >
-                  <ChatMessage 
-                    message={message} 
-                    isStreaming={message.streaming}
-                    agentNameOverride={agentMeta.name}
-                    agentAvatarOverride={agentMeta.avatarUrl}
-                    userNameOverride={userMeta.name}
-                    userAvatarOverride={userMeta.avatarUrl}
-                  />
-                  {message.role === 'assistant' && pendingTerminalSuggestions.has(message.id) && (
-                    (() => {
-                      const suggSeen = seenSuggestionIdsRef.current.has(message.id);
-                      if (!suggSeen) seenSuggestionIdsRef.current.add(message.id);
-                      const suggAnimate = !suggSeen;
-                      return (
-                        <div
-                          className={`pl-16 pr-3 pb-2 ${suggAnimate ? 'animate-in fade-in-0 duration-200' : ''}`}
-                          style={suggAnimate ? { animationDelay: '120ms' } : undefined}
-                        >
-                      <AgentTerminalSuggestion
-                        command={pendingTerminalSuggestions.get(message.id)!.command}
-                        reason={pendingTerminalSuggestions.get(message.id)!.reason}
-                        onApprove={async (cmd) => {
-                          const mentioned = participantsRef.current.find(p => p.type === 'agent' && new RegExp(`@${p.name.replace(/[-/\\^$*+?.()|[\]{}]/g, '')}`, 'i').test(messages.find(m => m.id === message.id)?.content || ''));
-                          await routeApprovedCommand(cmd, mentioned?.id);
-                          handleRejectTerminalCommand(message.id, true);
-                        }}
-                        onReject={() => handleRejectTerminalCommand(message.id, false)}
-                      />
-                        </div>
-                      );
-                    })()
-                  )}
-                </div>
-                );
-              })}
-              <div ref={messagesEndRef} />
-            </div>
-          )}
-          </ScrollArea>
-        </div>
+        <MessagesPanel
+          allMessages={allMessages}
+          pendingTerminalSuggestions={pendingTerminalSuggestions}
+          seenMessageIdsRef={seenMessageIdsRef}
+          seenSuggestionIdsRef={seenSuggestionIdsRef}
+          messagesEndRef={messagesEndRef}
+          agentMeta={agentMeta}
+          userMeta={userMeta}
+          participantsRef={participantsRef}
+          routeApprovedCommand={routeApprovedCommand}
+          handleRejectTerminalCommand={handleRejectTerminalCommand}
+        />
       </div>
 
 
-      {/* Right participants panel (fixed column; width mirrors ShadCN variable) */}
-      <div className={`hidden md:block fixed inset-y-0 right-0 z-10 border-l bg-background transition-transform duration-200 ease-linear ${rightOpen ? 'translate-x-0' : 'translate-x-full'}`} style={{ width: 'var(--sidebar-width)' }}>
-        <div className="h-12 px-3 flex items-center justify-between border-b">
-          <div className="flex items-center gap-2 text-sm">
-            <button className={`px-2 py-1 rounded ${rightTab === 'participants' ? 'bg-accent' : ''}`} onClick={() => setRightTab('participants')}>Participants</button>
-            <button className={`px-2 py-1 rounded ${rightTab === 'tasks' ? 'bg-accent' : ''}`} onClick={() => setRightTab('tasks')}>Tasks{toolRuns.size > 0 ? ` (${[...toolRuns.values()].filter(r => r.status === 'running').length})` : ''}</button>
-          </div>
-          <div className="flex items-center gap-2">
-            {rightTab === 'participants' && (
-              <button
-                aria-label="Add participant"
-                onClick={() => setShowAddAgent(true)}
-                className="size-6 inline-flex items-center justify-center rounded-md border bg-background hover:bg-accent text-foreground"
-              >
-                +
-              </button>
-            )}
-            <button onClick={() => setRightOpen(false)} className="text-xs text-muted-foreground hover:text-foreground">Close</button>
-          </div>
-        </div>
-        <div className="p-3 space-y-2 overflow-y-auto h-[calc(100%-3rem)]">
-          {rightTab === 'participants' ? (
-            <>
-              {participants.map((p) => (
-                <div key={`${p.type}-${p.id}`} className="group flex items-center gap-2">
-                  <div className="h-7 w-7 rounded-full bg-muted overflow-hidden flex items-center justify-center">
-                    {p.avatar ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img src={p.avatar} alt={p.name} className="h-full w-full object-cover" />
-                    ) : (
-                      <span className="text-xs font-medium">{p.name?.charAt(0)?.toUpperCase() || '?'}</span>
-                    )}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm truncate">{p.name}</div>
-                    <div className="text-xs text-muted-foreground">{p.type === 'agent' ? 'Agent' : 'User'}</div>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <div className={`h-2 w-2 rounded-full ${p.status === 'online' ? 'bg-green-500' : p.status === 'away' ? 'bg-yellow-500' : 'bg-gray-400'}`} />
-                    {p.type === 'agent' && (
-                      <button
-                        onClick={() => {
-                          // TODO: implement removeParticipant on socket; update local state for now
-                          setParticipants(prev => prev.filter(participant => !(participant.type === 'agent' && participant.id === p.id)));
-                        }}
-                        className="opacity-0 group-hover:opacity-100 transition-opacity text-red-500 hover:text-red-700 p-1"
-                        title="Remove agent"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ))}
-              {participants.length === 0 && (
-                <div className="text-xs text-muted-foreground">No participants</div>
-              )}
-              {/* Add Agent Modal */}
-              <AddAgentModal
-                open={showAddAgent}
-                onClose={() => setShowAddAgent(false)}
-                agents={allAgents}
-                existingIds={new Set(participants.filter(p => p.type === 'agent').map(p => p.id))}
-                onInvite={async (agentId) => {
-                  const isChannel = !!agentMeta.name; // if currentRoom looks like an agent id
-                  if (isChannel) {
-                    // Navigate to multi-agent room with both agents
-                    const multiRoomId = `${currentRoom}-${agentId}`;
-                    window.location.href = `/c/${multiRoomId}`;
-                    return;
-                  }
-                  // TODO: implement inviteParticipant on socket when we enable multi-agent rooms
-                  // Optimistically add to participants list (for existing group rooms)
-                  (async () => {
-                    try {
-                      const base = getHttpBaseFromWs(WEBSOCKET_URL);
-                      const res = await fetch(`${base}/api/agents/${agentId}`);
-                      if (res.ok) {
-                        const data = await res.json();
-                        const avatar = data.avatar as string | undefined;
-                        const resolvedAvatar = avatar ? (avatar.startsWith('/') ? `${base}${avatar}` : avatar) : undefined;
-                        setParticipants(prev => {
-                          if (prev.some(p => p.type === 'agent' && p.id === agentId)) return prev;
-                          return [...prev, { id: agentId, type: 'agent', name: data.name || 'Agent', avatar: resolvedAvatar, status: 'online' }];
-                        });
-                      }
-                    } catch {}
-                  })();
-                  setShowAddAgent(false);
-                }}
-                search={agentSearch}
-                setSearch={setAgentSearch}
-                httpBase={getHttpBaseFromWs(WEBSOCKET_URL)}
-              />
-            </>
-          ) : (
-            <>
-              {[...toolRuns.values()].reverse().map(run => {
-                const icon = run.tool.startsWith('serpapi') || run.tool === 'serpapi' ? <Search className="h-3.5 w-3.5" /> : run.tool === 'web' ? <Globe2 className="h-3.5 w-3.5" /> : run.tool === 'elevenlabs' ? <Mic className="h-3.5 w-3.5" /> : <Wrench className="h-3.5 w-3.5" />;
-                const meta: string[] = [];
-                if (run.tool === 'serpapi') {
-                  const engine = (run.args?.engine || 'google');
-                  const q = (run.args?.query || '').toString();
-                  meta.push(`${engine}`);
-                  if (q) meta.push(q.slice(0, 60) + (q.length > 60 ? '…' : ''));
-                } else if (run.tool === 'web' && run.args?.url) {
-                  try { const u = new URL(run.args.url); meta.push(u.hostname); } catch { meta.push(String(run.args.url)); }
-                } else if (run.tool === 'elevenlabs') {
-                  if (run.args?.voiceId) meta.push(`voice=${run.args.voiceId}`);
-                }
-                const started = run.startedAt ? new Date(run.startedAt) : undefined;
-                const duration = run.durationMs ? `${Math.max(1, Math.round(run.durationMs/1000))}s` : (run.status === 'running' && started ? `${Math.max(1, Math.round((Date.now()-run.startedAt)/1000))}s` : undefined);
-                return (
-                  <div key={run.toolCallId} className="border rounded p-2 text-xs">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5">
-                        {icon}
-                        <div className="font-medium">{run.tool}.{run.func}</div>
-                      </div>
-                      <div className={`px-1 rounded ${run.status === 'running' ? 'bg-yellow-500/20 text-yellow-500' : run.status === 'succeeded' ? 'bg-green-500/20 text-green-500' : 'bg-red-500/20 text-red-500'}`}>{run.status}</div>
-                    </div>
-                    <div className="mt-1 flex items-center justify-between text-muted-foreground">
-                      <div className="truncate">{meta.join(' · ')}</div>
-                      {duration && <div className="ml-2 whitespace-nowrap">{duration}</div>}
-                    </div>
-                    <div className="mt-2">
-                      <JsonFormatter 
-                        data={run.args} 
-                        title="Arguments" 
-                        className="text-xs"
-                        defaultExpanded={false}
-                        showCopyButton={true}
-                      />
-                    </div>
-                    {run.error && <div className="mt-1 text-red-500">error: {run.error}</div>}
-                  </div>
-                );
-              })}
-              {toolRuns.size === 0 && <div className="text-xs text-muted-foreground">No tasks yet</div>}
-            </>
-          )}
-        </div>
-      </div>
+      <RightPanel
+        rightOpen={rightOpen}
+        rightTab={rightTab}
+        setRightOpen={setRightOpen}
+        setRightTab={setRightTab}
+        toolRuns={toolRuns}
+        participants={participants}
+        agentMeta={agentMeta}
+      />
 
       {/* Footer input fixed to viewport bottom, responsive to both sidebars */}
       <ChatFooterBar
@@ -1502,6 +1269,7 @@ export function ChatInterface({
         onSendMessage={handleSendMessage}
         disabled={!isConnected}
         availableProviders={availableProviders}
+        availableModels={availableModels}
       />
     </div>
   );

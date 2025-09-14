@@ -344,7 +344,7 @@ export const ModelConfigs = {
   // Additional OpenAI aliases (availability depends on account)
   'gpt-4.1': { provider: 'openai' as LLMProvider, maxTokens: 128000 },
   'gpt-4.1-mini': { provider: 'openai' as LLMProvider, maxTokens: 128000 },
-  // Note: gpt-5 family may be gated; include if enabled on the account
+  // gpt-5 family (availability may be gated by account)
   'gpt-5': { provider: 'openai' as LLMProvider, maxTokens: 200000 },
   'gpt-5-mini': { provider: 'openai' as LLMProvider, maxTokens: 200000 },
   

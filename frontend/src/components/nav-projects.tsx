@@ -153,7 +153,8 @@ export function NavProjects() {
                             return (
                               <Avatar 
                                 key={participant.id} 
-                                className="h-5 w-5 border border-background"
+                                className="h-5 w-5 border border-background animate-glow"
+                                style={{ animationDelay: `${index * 0.3}s` }}
                               >
                                 <AvatarImage 
                                   src={agent?.avatar ? (agent.avatar.startsWith('/') ? `http://localhost:3001${agent.avatar}` : agent.avatar) : undefined} 
