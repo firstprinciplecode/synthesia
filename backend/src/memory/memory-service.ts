@@ -50,6 +50,11 @@ export interface ConversationSummary {
 }
 
 export class MemoryService {
+  private sanitizeText(input: string | undefined): string {
+    if (!input) return ''
+    // Remove lone surrogate halves to satisfy JSON/db encoders
+    return input.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')
+  }
   private pinecone: Pinecone | null = null;
   private shortTermMemories: Map<string, ShortTermMemory> = new Map();
   private readonly SHORT_TERM_SIZE = 10;
@@ -86,7 +91,8 @@ export class MemoryService {
     }
 
     const memory = this.shortTermMemories.get(agentId)!;
-    memory.messages.push(message);
+    const safeMsg = { ...message, content: this.sanitizeText(message.content) }
+    memory.messages.push(safeMsg);
 
     // Keep only last N messages
     if (memory.messages.length > memory.maxSize) {
@@ -104,14 +110,15 @@ export class MemoryService {
       const pc = this.ensurePinecone();
       if (!pc) return; // gracefully skip if Pinecone not configured
       const index = pc.index(process.env.PINECONE_INDEX_NAME || 'superagent');
-      const embedding = await embeddingService.generateEmbedding(content);
+      const safe = this.sanitizeText(content)
+      const embedding = await embeddingService.generateEmbedding(safe);
       
       await index.upsert([{
         id: metadata.messageId,
         values: embedding,
         metadata: {
           ...metadata,
-          content,
+          content: safe,
         },
       }]);
     } catch (error) {
@@ -268,6 +275,7 @@ export class MemoryService {
       level,
     };
 
+    // Ensure summaries are isolated per agent and conversation
     const result = await db.insert(conversationSummaries).values(summaryData).returning();
     return result[0] as ConversationSummary;
   }

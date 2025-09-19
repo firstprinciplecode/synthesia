@@ -66,6 +66,8 @@ export class SuperAgentWebSocket {
   private connected = false;
   private requestResolvers: Map<string, { resolve: (v: any) => void; reject: (e: any) => void }> = new Map();
   private dedupeInFlight: Map<string, Promise<any>> = new Map();
+  private lastResultIdByRoom: Map<string, string> = new Map();
+  private pendingResultWaiters: Map<string, Array<(rid: string) => void>> = new Map();
 
   private onMessage: OnMessage;
   private onMessageDelta: OnMessageDelta;
@@ -100,6 +102,11 @@ export class SuperAgentWebSocket {
     this.onParticipantsUpdate = onParticipantsUpdate;
     this.onToolCall = onToolCall;
     this.onToolResult = onToolResult;
+  }
+
+  // Expose latest stable resultId for the given room, if known
+  getLastResultId(roomId: string): string | undefined {
+    return this.lastResultIdByRoom.get(roomId);
   }
 
   isConnected(): boolean {
@@ -189,7 +196,15 @@ export class SuperAgentWebSocket {
       const pending = this.requestResolvers.get(res.id);
       if (pending) {
         this.requestResolvers.delete(res.id);
-        if (res.error) pending.reject(new Error(res.error.message || 'JSON-RPC error'));
+        if (res.error) {
+          try {
+            const msg = String(res.error.message || '');
+            if (/No URL for index/i.test(msg)) {
+              console.warn('[tool] web.scrape.pick error:', msg);
+            }
+          } catch {}
+          pending.reject(new Error(res.error.message || 'JSON-RPC error'));
+        }
         else pending.resolve(res.result);
       }
       return;
@@ -280,6 +295,21 @@ export class SuperAgentWebSocket {
           if (this.onToolResult) this.onToolResult(params);
           break;
         }
+        case 'search.results': {
+          const rid = String(params?.resultId || '');
+          const roomId = String(params?.roomId || '');
+          if (rid && roomId) this.lastResultIdByRoom.set(roomId, rid);
+          if (rid && roomId) {
+            const arr = this.pendingResultWaiters.get(roomId);
+            if (arr && arr.length) {
+              this.pendingResultWaiters.set(roomId, []);
+              for (const fn of arr) {
+                try { fn(rid); } catch {}
+              }
+            }
+          }
+          break;
+        }
         default:
           // ignore unknown notifications
           break;
@@ -317,7 +347,7 @@ export class SuperAgentWebSocket {
   }
 
   async executeAgentCommand(command: string, roomId: string, reason?: string): Promise<any> {
-    return this.sendRequest('agent.command', { roomId, command, reason });
+    return this.sendRequest('agent.execute', { roomId, command, reason });
   }
 
   // ElevenLabs
@@ -343,8 +373,21 @@ export class SuperAgentWebSocket {
     return this.sendRequest('tool.web.scrape', { roomId, url, ...(agentId ? { agentId } : {}) });
   }
 
-  async webScrapePick(index: number, roomId: string, agentId?: string): Promise<any> {
-    return this.sendRequest('tool.web.scrape.pick', { roomId, index, ...(agentId ? { agentId } : {}) });
+  async webScrapePick(index: number, roomId: string, agentId?: string, resultId?: string): Promise<any> {
+    const rid = resultId || this.lastResultIdByRoom.get(roomId);
+    return this.sendRequest('tool.web.scrape.pick', { roomId, index, ...(rid ? { resultId: rid } : {}), ...(agentId ? { agentId } : {}) });
+  }
+
+  // Code search
+  async codeSearch(
+    pattern: string,
+    roomId: string,
+    options?: { path?: string; glob?: string; maxResults?: number; caseInsensitive?: boolean; regex?: boolean },
+    agentId?: string,
+  ): Promise<any> {
+    const params: any = { roomId, pattern, ...(options || {}) };
+    if (agentId) params.agentId = agentId;
+    return this.sendRequest('tool.code.search', params);
   }
 
   // X/Twitter
@@ -715,10 +758,12 @@ export class SuperAgentWebSocketLegacy {
     });
   }
 
-  async webScrapePick(index: number, roomId: string, agentId?: string): Promise<any> {
+  async webScrapePick(index: number, roomId: string, agentId?: string, resultId?: string): Promise<any> {
+    // Do not depend on legacy internals here; only pass resultId if provided
     return this.sendRequestDedupe('tool.web.scrape.pick', {
       roomId,
       index,
+      ...(resultId ? { resultId } : {}),
       ...(agentId ? { agentId } : {}),
     });
   }

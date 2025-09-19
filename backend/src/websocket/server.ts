@@ -31,6 +31,9 @@ import { handleXSearch, handleXLists, handleXListTweets, handleXTweet, handleXDm
 import { handleSerpSearch, handleSerpImages, handleSerpRun } from '../handlers/tools/serpapi.js';
 import { AgentOrchestrator } from '../agents/agent-orchestrator.js';
 import { buildUserProfileContext } from '../agents/context-builder.js';
+import { setLastLinks, getLastLinks } from './link-cache.js';
+import { createResults, getResults, getLatestResultId } from './results-registry.js';
+import { codeSearch } from '../tools/code-search.js';
 
 export class WebSocketServer {
   private llmRouter: LLMRouter;
@@ -38,6 +41,7 @@ export class WebSocketServer {
   private rooms: Map<string, Set<string>> = new Map();
   private connectionUserId: Map<string, string> = new Map();
   private lastLinks: Map<string, string[]> = new Map();
+  private roomLastLinks: Map<string, string[]> = new Map();
   private toolRegistry: ToolRegistry = new ToolRegistry();
   private toolRunner: ToolRunner;
   // Track invited agents per room (roomId -> Set<agentId>)
@@ -75,8 +79,49 @@ export class WebSocketServer {
       functions: {
         run: {
           name: 'run',
+          description: 'Run a SerpAPI engine (e.g., google_news, images, finance)',
+          tags: ['search','news','web','images'],
+          synonyms: ['news.search','web.search','image.search'],
           execute: async (args, ctx) => {
             return await serpapiService.run(String(args.engine || ''), String(args.query || ''), args.extra || undefined)
+          },
+        },
+      },
+    }));
+    this.toolRegistry.register(new Tool({
+      name: 'code',
+      functions: {
+        search: {
+          name: 'search',
+          description: 'Search codebase for a pattern (ripgrep fallback to grep)',
+          tags: ['code','search','grep'],
+          approval: 'ask',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              pattern: { type: 'string' },
+              path: { type: 'string' },
+              glob: { type: 'string' },
+              maxResults: { type: 'number' },
+              caseInsensitive: { type: 'boolean' },
+              regex: { type: 'boolean' },
+            },
+            required: ['pattern']
+          },
+          execute: async (args, ctx) => {
+            const out = await codeSearch({
+              pattern: String(args.pattern || ''),
+              path: args.path ? String(args.path) : undefined,
+              glob: args.glob ? String(args.glob) : undefined,
+              maxResults: args.maxResults ? Number(args.maxResults) : undefined,
+              caseInsensitive: !!args.caseInsensitive,
+              regex: !!args.regex,
+            })
+            const header = `Code search for "${args.pattern}": ${out.results.length} hit(s) using ${out.used}`
+            const md = [header]
+              .concat(out.results.slice(0, 50).map(r => `- ${r.file}:${r.line} — ${r.text}`))
+              .join('\n')
+            return { ok: true, results: out.results, markdown: md }
           },
         },
       },
@@ -86,6 +131,10 @@ export class WebSocketServer {
       functions: {
         tweet: {
           name: 'tweet',
+          description: 'Post a tweet (side-effectful)',
+          tags: ['post','x','publish'],
+          sideEffects: true,
+          approval: 'ask',
           execute: async (args, ctx) => {
             const text = String(args.text || '').trim();
             if (!text) throw new Error('text is required');
@@ -95,6 +144,10 @@ export class WebSocketServer {
         },
         dm: {
           name: 'dm',
+          description: 'Send a direct message on X (side-effectful)',
+          tags: ['dm','x','message'],
+          sideEffects: true,
+          approval: 'ask',
           execute: async (args, ctx) => {
             const to = String(args.recipientId || '').trim();
             const text = String(args.text || '').trim();
@@ -105,6 +158,9 @@ export class WebSocketServer {
         },
         search: {
           name: 'search',
+          description: 'Search recent tweets for a query',
+          tags: ['search','x','social'],
+          synonyms: ['x.search','twitter search'],
           execute: async (args, ctx) => {
             const q = String(args.query || '').trim();
             const max = Number(args.max || 10);
@@ -115,6 +171,8 @@ export class WebSocketServer {
         },
         lists: {
           name: 'lists',
+          description: 'List owned Twitter lists for a handle or current user',
+          tags: ['x','lists'],
           execute: async (args, ctx) => {
             const userId = this.connectionUserId.get(ctx.connectionId) || 'default-user';
             const handle = String(args.username || '').trim();
@@ -126,6 +184,8 @@ export class WebSocketServer {
         },
         listTweets: {
           name: 'listTweets',
+          description: 'Fetch tweets from a list',
+          tags: ['x','lists','search'],
           execute: async (args, ctx) => {
             const listId = String(args.listId || '').trim();
             const max = Number(args.max || 20);
@@ -292,6 +352,9 @@ export class WebSocketServer {
           break;
         case 'tool.x.listTweets':
           await handleXListTweets(this.buildXCtx(), connectionId, request);
+          break;
+        case 'tool.code.search':
+          await this.handleCodeSearch(connectionId, request);
           break;
           
         default:
@@ -637,13 +700,12 @@ export class WebSocketServer {
         console.error('Error loading user profile:', error);
       }
 
-      const shortTermMemory = memoryService.getShortTerm(activeUserId);
+      // Short-term memory per agent/room
+      const shortTermMemory = memoryService.getShortTerm(roomId);
       
       // Get relevant long-term memory
       const userMessage = message.content.map(part => part.text).join('');
-      const relevantMemories = await (activeUserId
-        ? memoryService.searchLongTermByUser(activeUserId, userMessage, 3, { agentId: roomId as any, roomId: roomId as any })
-        : memoryService.searchLongTerm(connectionId, userMessage, 3));
+      const relevantMemories = await memoryService.searchLongTerm(roomId, userMessage, 3, 'conversation');
       
       // Build context from user profile and memories
       let memoryContext = '';
@@ -805,47 +867,183 @@ ${personaBlock}${memoryContext}`,
       // For single-agent rooms (isAgentRoom = true), run primary agent logic
       // This prevents double responses when an agent is both the primary agent and in participants
 
-      // Stream LLM response via orchestrator (primary agent = roomId)
+      // Choose execution mode (feature-flag)
+      const useLoop = process.env.AGENT_LOOP === '1';
+      console.log(`[debug] AGENT_LOOP env var: "${process.env.AGENT_LOOP}", useLoop: ${useLoop}`);
       this.roomSpeaking.add(roomId);
-      const { fullResponse } = await this.orchestrator.streamPrimaryAgentResponse({
-        roomId,
-        activeUserId,
-        connectionId,
-        agentRecord: isAgentRoom ? (await db.select().from(agents).where(eq(agents.id as any, roomId as any)))[0] : null,
-        userProfile,
-        userMessage,
-        runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
-        onDelta: (delta: string) => {
-          this.bus.broadcastToRoom(roomId, {
-            jsonrpc: '2.0',
-            method: 'message.delta',
-            params: { roomId, messageId, delta, authorId: roomId, authorType: 'agent' },
-          } as MessageDeltaNotification);
-        },
-      });
-
-      // Send completion notification
-      this.bus.broadcastToRoom(roomId, {
-        jsonrpc: '2.0',
-        method: 'message.complete',
-        params: {
-          runId,
-          messageId,
-          finalMessage: {
-            role: 'assistant',
-            content: [{ type: 'text', text: fullResponse }],
+      let responseText = '';
+      if (useLoop) {
+        const agentRecord = isAgentRoom ? (await db.select().from(agents).where(eq(agents.id as any, roomId as any)))[0] : null;
+        const { finalText, pendingApproval } = await this.orchestrator.runTask({
+          roomId,
+          activeUserId,
+          connectionId,
+          agentRecord,
+          userProfile,
+          userMessage,
+          runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
+          executeTool: async (call) => {
+            const fn = call.func || 'run';
+            // Special-case: web.scrape.pick is an RPC handler, not a ToolRunner function
+            if (call.name === 'web' && fn === 'scrape.pick') {
+              const pickIndex = Number(call.args?.index || 0);
+              const rid = String(call.args?.resultId || '');
+              if (!pickIndex || pickIndex < 1) throw new Error('index must be >= 1');
+              let url: string | undefined;
+              if (rid) {
+                const stored = getResults(rid);
+                const itemsLen = stored?.items?.length || 0;
+                console.log('[pick.executeTool] room=%s resultId=%s items=%d index=%d', roomId, rid, itemsLen, pickIndex);
+                if (!stored || stored.roomId !== roomId) throw new Error('Invalid or expired resultId for this room');
+                url = stored.items.find(i => i.index === pickIndex)?.url;
+              } else {
+                const links = (this.lastLinks.get(connectionId) || this.roomLastLinks.get(roomId) || getLastLinks(connectionId) || []);
+                console.log('[pick.executeTool] room=%s resultId=<none> links=%d index=%d', roomId, links.length, pickIndex);
+                url = links[pickIndex - 1];
+              }
+              if (!url) throw new Error(`No URL for index ${pickIndex}`);
+              const trRunId = randomUUID();
+              const toolCallId = randomUUID();
+              this.bus.broadcastToolCall(roomId, trRunId, toolCallId, 'web', 'scrape.pick', { index: pickIndex });
+              const result = await webScraperService.scrape(url);
+              this.bus.broadcastToolResult(roomId, trRunId, toolCallId, { ok: true });
+              return { ok: true, result, pickedIndex: pickIndex };
+            }
+            const { runId: trRunId, toolCallId, result } = await this.toolRunner.run(call.name, fn, call.args || {}, { roomId, userId: activeUserId } as any);
+            // Mirror via bus for UI
+            this.bus.broadcastToolCall(roomId, trRunId, toolCallId, call.name, fn, call.args || {});
+            this.bus.broadcastToolResult(roomId, trRunId, toolCallId, result);
+            try {
+              if (call.name === 'serpapi' && fn === 'run' && result) {
+                const raw = (result as any).raw || {};
+                let links: string[] = [];
+                if (Array.isArray(raw.news_results) && raw.news_results.length) {
+                  links = raw.news_results.map((n: any) => n.link).filter((u: any) => typeof u === 'string');
+                } else if (Array.isArray(raw.organic_results) && raw.organic_results.length) {
+                  links = raw.organic_results.map((r: any) => r.link).filter((u: any) => typeof u === 'string');
+                }
+                if (links.length) {
+                  this.lastLinks.set(connectionId, links);
+                  this.roomLastLinks.set(roomId, links);
+                  setLastLinks(connectionId, links);
+                  // Create stable results and broadcast to clients
+                  const items = links.slice(0, 10).map((url, i) => ({ index: i + 1, url }));
+                  const rid = createResults(roomId, items);
+                  this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'search.results', params: { roomId, resultId: rid, items } });
+                } else {
+                  // Fallback: parse markdown for [View](...)
+                  try {
+                    const md = String((result as any).markdown || '');
+                    const mdLinks: string[] = [];
+                    const re = /\[View\]\((https?:\/\/[^\s)]+)\)/g;
+                    let m: RegExpExecArray | null;
+                    while ((m = re.exec(md)) !== null) { mdLinks.push(m[1]); }
+                    if (mdLinks.length) {
+                      this.lastLinks.set(connectionId, mdLinks);
+                      this.roomLastLinks.set(roomId, mdLinks);
+                      setLastLinks(connectionId, mdLinks);
+                      const items = mdLinks.slice(0, 10).map((url, i) => ({ index: i + 1, url }));
+                      const rid = createResults(roomId, items);
+                      this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'search.results', params: { roomId, resultId: rid, items } });
+                    }
+                  } catch {}
+                }
+              }
+            } catch {}
+            return result;
           },
-          authorId: roomId,
-          authorType: 'agent',
-        },
-      });
+          onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: roomId, authorType: 'agent' } }),
+          onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: roomId, authorType: 'agent' } } as MessageDeltaNotification),
+          getCatalog: () => this.toolRegistry.catalog(),
+          getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
+        });
+        responseText = finalText;
+        
+        // If we have pending approval and user said yes, continue the loop
+        if (pendingApproval && /^(yes|y|ok|okay|sure|go ahead|do it|run it|execute)$/i.test(userMessage.trim())) {
+          const { finalText: approvedText } = await this.orchestrator.runTask({
+            roomId,
+            activeUserId,
+            connectionId,
+            agentRecord,
+            userProfile,
+            userMessage: `User approved the ${pendingApproval.tool} request for "${pendingApproval.hint}"`,
+            runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
+            executeTool: async (call) => {
+              const fn = call.func || 'run';
+              if (call.name === 'web' && fn === 'scrape.pick') {
+                const pickIndex = Number(call.args?.index || 0);
+                const rid = String(call.args?.resultId || '');
+                if (!pickIndex || pickIndex < 1) throw new Error('index must be >= 1');
+                let url: string | undefined;
+                if (rid) {
+                  const stored = getResults(rid);
+                  const itemsLen = stored?.items?.length || 0;
+                  console.log('[pick.executeTool.approved] room=%s resultId=%s items=%d index=%d', roomId, rid, itemsLen, pickIndex);
+                  if (!stored || stored.roomId !== roomId) throw new Error('Invalid or expired resultId for this room');
+                  url = stored.items.find(i => i.index === pickIndex)?.url;
+                } else {
+                  const links = (this.lastLinks.get(connectionId) || this.roomLastLinks.get(roomId) || getLastLinks(connectionId) || []);
+                  console.log('[pick.executeTool.approved] room=%s resultId=<none> links=%d index=%d', roomId, links.length, pickIndex);
+                  url = links[pickIndex - 1];
+                }
+                if (!url) throw new Error(`No URL for index ${pickIndex}`);
+                const trRunId = randomUUID();
+                const toolCallId = randomUUID();
+                this.bus.broadcastToolCall(roomId, trRunId, toolCallId, 'web', 'scrape.pick', { index: pickIndex });
+                const result = await webScraperService.scrape(url);
+                this.bus.broadcastToolResult(roomId, trRunId, toolCallId, { ok: true });
+                return { ok: true, result, pickedIndex: pickIndex };
+              }
+              const { runId: trRunId, toolCallId, result } = await this.toolRunner.run(call.name, fn, call.args || {}, { roomId, userId: activeUserId } as any);
+              // Mirror via bus for UI
+              this.bus.broadcastToolCall(roomId, trRunId, toolCallId, call.name, fn, call.args || {});
+              this.bus.broadcastToolResult(roomId, trRunId, toolCallId, result);
+              return result;
+            },
+            onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: roomId, authorType: 'agent' } }),
+            onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: roomId, authorType: 'agent' } } as MessageDeltaNotification),
+            getCatalog: () => this.toolRegistry.catalog(),
+            getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
+            pendingApproval,
+          });
+          responseText = approvedText;
+        }
+        
+        this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: responseText }] }, authorId: roomId, authorType: 'agent' } });
+      } else {
+        const { fullResponse } = await this.orchestrator.streamPrimaryAgentResponse({
+          roomId,
+          activeUserId,
+          connectionId,
+          agentRecord: isAgentRoom ? (await db.select().from(agents).where(eq(agents.id as any, roomId as any)))[0] : null,
+          userProfile,
+          userMessage,
+          runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
+          onDelta: (delta: string) => {
+            this.bus.broadcastToRoom(roomId, {
+              jsonrpc: '2.0',
+              method: 'message.delta',
+              params: { roomId, messageId, delta, authorId: roomId, authorType: 'agent' },
+            } as MessageDeltaNotification);
+          },
+        });
+        responseText = fullResponse;
+        this.bus.broadcastToRoom(roomId, {
+          jsonrpc: '2.0',
+          method: 'message.complete',
+          params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] }, authorId: roomId, authorType: 'agent' },
+        });
+      }
 
       // Primary finished speaking
       this.roomSpeaking.delete(roomId);
 
       // Participation routing (enqueue other invited agents if relevant)
       try {
-        const candidates = await this.routeParticipation(roomId, userMessage);
+        let candidates = await this.routeParticipation(roomId, userMessage);
+        // Prevent the primary agent (roomId) from being re-enqueued in single-agent rooms
+        candidates = candidates.filter(aid => aid !== roomId);
         // Filter by cooldown and cap
         const now = Date.now();
         const cool = this.roomCooldownUntil.get(roomId) || new Map<string, number>();
@@ -873,7 +1071,7 @@ ${personaBlock}${memoryContext}`,
       const assistantMemoryMessage = {
         id: messageId + '-assistant',
         role: 'assistant' as const,
-        content: fullResponse,
+        content: responseText,
         timestamp: new Date(),
         conversationId: roomId,
         agentId: roomId as any,
@@ -882,7 +1080,7 @@ ${personaBlock}${memoryContext}`,
 
       // Check for auto-executable commands if autoExecuteTools is enabled
       if (autoExecuteTools) {
-        const autoExecutableCommands = this.extractAutoExecutableCommands(fullResponse);
+        const autoExecutableCommands = this.extractAutoExecutableCommands(responseText);
         for (const command of autoExecutableCommands) {
           try {
             console.log(`[auto-execute] Running command: ${command}`);
@@ -907,9 +1105,9 @@ ${personaBlock}${memoryContext}`,
         }
       }
 
-      // Add to short-term memory
-      memoryService.addToShortTerm(activeUserId, userMemoryMessage);
-      memoryService.addToShortTerm(activeUserId, assistantMemoryMessage);
+      // Add to short-term memory (scope by agent/room to avoid cross-agent leakage)
+      memoryService.addToShortTerm(roomId, userMemoryMessage);
+      memoryService.addToShortTerm(roomId, assistantMemoryMessage);
 
       // Add to long-term memory
       await memoryService.addToLongTerm(userMessage, ({
@@ -922,7 +1120,7 @@ ${personaBlock}${memoryContext}`,
         userId: activeUserId,
       } as any));
 
-      await memoryService.addToLongTerm(fullResponse, ({
+      await memoryService.addToLongTerm(responseText, ({
         agentId: roomId as any,
         conversationId: roomId,
         messageId: messageId + '-assistant',
@@ -932,9 +1130,9 @@ ${personaBlock}${memoryContext}`,
         userId: activeUserId,
       } as any));
 
-      // Check if we should perform reflection
-      if (await memoryService.shouldReflect(activeUserId)) {
-        await memoryService.performReflection(activeUserId);
+      // Check if we should perform reflection (per agent)
+      if (await memoryService.shouldReflect(roomId)) {
+        await memoryService.performReflection(roomId);
       }
 
       // Send run completed notification
@@ -1147,16 +1345,44 @@ ${personaBlock}${memoryContext}`,
       const runId = randomUUID();
       const toolCallId = randomUUID();
       this.bus.broadcastToolCall(roomId, runId, toolCallId, 'serpapi', 'run', { engine: engineUse, query, extra: params.extra });
-      // Capture last links if present (news or organic)
+      // Capture last links deterministically
       try {
-        const raw = (result as any).raw || {};
-        let links: string[] = [];
-        if (Array.isArray(raw.news_results) && raw.news_results.length) {
-          links = raw.news_results.map((n: any) => n.link).filter((u: any) => typeof u === 'string');
-        } else if (Array.isArray(raw.organic_results) && raw.organic_results.length) {
-          links = raw.organic_results.map((r: any) => r.link).filter((u: any) => typeof u === 'string');
+        let urls: string[] = [];
+        // Prefer structured items from the service
+        const itemsFromService = Array.isArray((result as any).items) ? (result as any).items : [];
+        if (itemsFromService.length) {
+          urls = itemsFromService.map((it: any) => it.link || it.url).filter((u: any) => typeof u === 'string');
         }
-        if (links.length) this.lastLinks.set(connectionId, links);
+        // Next, raw news/organic
+        if (!urls.length) {
+          const raw = (result as any).raw || {};
+          if (Array.isArray(raw.news_results) && raw.news_results.length) {
+            urls = raw.news_results.map((n: any) => n.link).filter((u: any) => typeof u === 'string');
+          } else if (Array.isArray(raw.organic_results) && raw.organic_results.length) {
+            urls = raw.organic_results.map((r: any) => r.link).filter((u: any) => typeof u === 'string');
+          }
+        }
+        // Finally, parse markdown for [View](url)
+        if (!urls.length) {
+          try {
+            const md = String((result as any).markdown || '');
+            const mdLinks: string[] = [];
+            const re = /\[View\]\((https?:\/\/[^\s)]+)\)/g;
+            let m: RegExpExecArray | null;
+            while ((m = re.exec(md)) !== null) { mdLinks.push(m[1]); }
+            urls = mdLinks;
+          } catch {}
+        }
+        console.log('[serpapi.run:url-derive] urls=', urls.length);
+        if (urls.length) {
+          this.lastLinks.set(connectionId, urls);
+          this.roomLastLinks.set(roomId, urls);
+          setLastLinks(connectionId, urls);
+          const items = urls.slice(0, 10).map((url, i) => ({ index: i + 1, url }));
+          const rid = createResults(roomId, items);
+          console.log('[serpapi.run:search.results] room=%s items=%d resultId=%s', roomId, items.length, rid);
+          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'search.results', params: { roomId, resultId: rid, items } });
+        }
       } catch {}
       this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
@@ -1202,13 +1428,25 @@ ${personaBlock}${memoryContext}`,
 
   private async handleWebScrapePick(connectionId: string, request: JSONRPCRequest) {
     try {
-      const { index } = (request.params || {}) as { index?: number };
+      const { index, resultId } = (request.params || {}) as { index?: number; resultId?: string };
       if (!index || index < 1) {
         this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'index must be >= 1');
         return;
       }
-      const links = this.lastLinks.get(connectionId) || [];
-      const url = links[index - 1];
+      const roomId = this.getRoomForConnection(connectionId) || 'default-room';
+      let url: string | undefined;
+      if (resultId) {
+        const stored = getResults(resultId);
+        if (!stored || stored.roomId !== roomId) {
+          this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'Invalid or expired resultId for this room');
+          return;
+        }
+        url = stored.items.find(i => i.index === index)?.url;
+      } else {
+        // Fallback to last links if no resultId given
+        const links = (this.lastLinks.get(connectionId) || this.roomLastLinks.get(roomId) || getLastLinks(connectionId) || []);
+        url = links[index - 1];
+      }
       if (!url) {
         this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, `No URL for index ${index}`);
         return;
@@ -1217,7 +1455,7 @@ ${personaBlock}${memoryContext}`,
       const toolCallId = randomUUID();
       console.log('[web.scrape.pick] index=', index, 'url=', url);
       const result = await webScraperService.scrape(url);
-      const roomId = this.getRoomForConnection(connectionId) || 'default-room';
+      
       const preview = (result.text || '').replace(/\s+/g, ' ').trim();
       const summary = `${result.title ? `**${result.title}**\n\n` : ''}- URL: ${result.url}\n- Links: ${result.links?.length || 0}, Images: ${result.images?.length || 0}\n\n${preview.slice(0, 800)}`;
       console.log('[web.scrape.pick] text.length=', (result.text || '').length, 'preview.sample=', preview.slice(0, 120));
@@ -1694,16 +1932,26 @@ ${personaBlock}${memoryContext}`,
         // Extract Personality and Extra instructions blocks if present
         const personalityMatch = agentInstructions.match(/Personality:\s*([\s\S]*?)(?:\n\n|$)/);
         const extraMatch = agentInstructions.match(/Extra instructions:\s*([\s\S]*)$/);
-        const personality = personalityMatch ? personalityMatch[1].trim() : '';
-        const extra = extraMatch ? extraMatch[1].trim() : '';
         const desc = a.description ? `Description: ${a.description}` : '';
         
-        agentPersona = [
-          agentName ? `Agent Name: ${agentName}` : '',
-          desc,
-          personality ? `Personality: ${personality}` : '',
-          extra ? `Extra instructions: ${extra}` : '',
-        ].filter(Boolean).join('\n');
+        if (personalityMatch || extraMatch) {
+          // Structured format
+          const personality = personalityMatch ? personalityMatch[1].trim() : '';
+          const extra = extraMatch ? extraMatch[1].trim() : '';
+          agentPersona = [
+            agentName ? `Agent Name: ${agentName}` : '',
+            desc,
+            personality ? `Personality: ${personality}` : '',
+            extra ? `Extra instructions: ${extra}` : '',
+          ].filter(Boolean).join('\n');
+        } else {
+          // Unstructured format - treat entire instructions as personality
+          agentPersona = [
+            agentName ? `Agent Name: ${agentName}` : '',
+            desc,
+            agentInstructions ? `Instructions: ${agentInstructions}` : '',
+          ].filter(Boolean).join('\n');
+        }
       }
     } catch {}
 
@@ -1843,6 +2091,43 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
     this.roomSpeaking.delete(roomId);
     if ((this.roomQueue.get(roomId) || []).length > 0) {
       this.processRoomQueue(roomId, userMessage, activeUserId).catch(() => {});
+    }
+  }
+
+  private async handleCodeSearch(connectionId: string, request: JSONRPCRequest) {
+    try {
+      const params = (request.params || {}) as any;
+      const pattern = String(params.pattern || '').trim();
+      if (!pattern) {
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'pattern is required');
+        return;
+      }
+      const out = await codeSearch({
+        pattern,
+        path: params.path ? String(params.path) : undefined,
+        glob: params.glob ? String(params.glob) : undefined,
+        maxResults: params.maxResults ? Number(params.maxResults) : undefined,
+        caseInsensitive: !!params.caseInsensitive,
+        regex: !!params.regex,
+      });
+      const roomId = this.getRoomForConnection(connectionId) || 'default-room';
+      const runId = randomUUID();
+      const toolCallId = randomUUID();
+      this.bus.broadcastToolCall(roomId, runId, toolCallId, 'code', 'search', { pattern, path: params.path, glob: params.glob });
+      const header = `Code search for "${pattern}": ${out.results.length} hit(s) using ${out.used}`;
+      const md = [header]
+        .concat(out.results.slice(0, 50).map((r: any) => `- ${r.file}:${r.line} — ${r.text}`))
+        .join('\n');
+      this.bus.broadcastToRoom(roomId, {
+        jsonrpc: '2.0',
+        method: 'message.received',
+        params: { roomId, messageId: randomUUID(), authorId: connectionId as any, authorType: 'agent', message: md },
+      });
+      this.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+      this.bus.sendResponse(connectionId, request.id, { ok: true, results: out.results, used: out.used });
+    } catch (e: any) {
+      console.error('[tool.code.search] error', e);
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'Code search failed');
     }
   }
 }

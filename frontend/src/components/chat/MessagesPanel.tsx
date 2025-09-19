@@ -79,9 +79,16 @@ export function MessagesPanel({
                             command={pendingTerminalSuggestions.get(message.id)!.command}
                             reason={pendingTerminalSuggestions.get(message.id)!.reason}
                             onApprove={async (cmd) => {
-                              const mentioned = participantsRef.current.find(p => p.type === 'agent' && new RegExp(`@${p.name.replace(/[-/\\^$*+?.()|[\]{}]/g, '')}`, 'i').test(allMessages.find(m => m.id === message.id)?.content || ''));
-                              await routeApprovedCommand(cmd, mentioned?.id);
-                              handleRejectTerminalCommand(message.id, true);
+                              try {
+                                const mentioned = participantsRef.current.find(p => p.type === 'agent' && new RegExp(`@${p.name.replace(/[-/\\^$*+?.()|[\]{}]/g, '')}`, 'i').test(allMessages.find(m => m.id === message.id)?.content || ''));
+                                await routeApprovedCommand(cmd, mentioned?.id);
+                                handleRejectTerminalCommand(message.id, true);
+                                // Mark this suggestion as handled so it doesn't reappear on re-renders
+                                try { (window as any)._superagent_handled = (window as any)._superagent_handled || new Set(); (window as any)._superagent_handled.add(message.id); } catch {}
+                              } catch (e) {
+                                console.error('[approval] command failed', e);
+                                handleRejectTerminalCommand(message.id, false);
+                              }
                             }}
                             onReject={() => handleRejectTerminalCommand(message.id, false)}
                           />

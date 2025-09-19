@@ -55,58 +55,19 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isUser, isTerminal, isStreaming, message.content]);
 
-  // Buffered streaming display like Perplexity
+  // Simple streaming display without fade effects
   const [displayContent, setDisplayContent] = useState(message.content || '');
-  const [lastRenderedLen, setLastRenderedLen] = useState((message.content || '').length);
-  const [fadeActive, setFadeActive] = useState(false);
-  const latestContentRef = useRef(message.content || '');
-  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // When message id changes, reset display content
   useEffect(() => {
     setDisplayContent(message.content || '');
-    latestContentRef.current = message.content || '';
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [message.id]);
 
-  // Buffer incoming content and flush at a controlled cadence
+  // Update display content immediately when streaming
   useEffect(() => {
-    latestContentRef.current = message.content || '';
-
-    if (!isTerminal && !isUser && isStreaming) {
-      // If no timer running, start a short cadence flush
-      if (!flushTimerRef.current) {
-        const flush = () => {
-          setDisplayContent((prev) => {
-            const next = latestContentRef.current;
-            if (next !== prev) {
-              setFadeActive(true);
-              setTimeout(() => setFadeActive(false), 220);
-              return next;
-            }
-            return prev;
-          });
-          flushTimerRef.current = setTimeout(flush, 140); // ~7 fps perception
-        };
-        flush();
-      }
-    } else {
-      // Stream ended or not applicable → final flush and clear
-      if (flushTimerRef.current) {
-        clearTimeout(flushTimerRef.current);
-        flushTimerRef.current = null;
-      }
-      setDisplayContent(latestContentRef.current);
-      setFadeActive(false);
-    }
-
-    return () => {
-      if (flushTimerRef.current && (!isStreaming || isTerminal || isUser)) {
-        clearTimeout(flushTimerRef.current);
-        flushTimerRef.current = null;
-      }
-    };
-  }, [isStreaming, isTerminal, isUser, message.content]);
+    setDisplayContent(message.content || '');
+  }, [message.content]);
   
   const renderWithMentions = (text: string) => {
     const parts = text.split(/(\B@[a-zA-Z0-9_:\/\.\-]+)/g);
@@ -160,7 +121,7 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
   } as any;
   
   return (
-    <div className="flex gap-3 p-3 hover:bg-muted/50 group animate-in fade-in-50 duration-150 ease-out">
+    <div className="flex gap-3 p-3 hover:bg-muted/50 group">
       <Avatar className="h-10 w-10 flex-shrink-0">
         {isUser && userAvatar ? (
           <AvatarImage src={userAvatar} alt={userName || 'User'} />
@@ -192,10 +153,7 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
           )}
         </div>
         
-        <div
-          key={isStreaming ? `${message.id}-${(displayContent || '').length}` : undefined}
-          className={`text-sm leading-relaxed text-foreground transition-opacity duration-200 ${isStreaming ? 'streaming-reveal' : ''}`}
-        >
+        <div className="text-sm leading-relaxed text-foreground">
           {isUser ? (
             <p className="whitespace-pre-wrap m-0">{renderWithMentions(displayContent)}</p>
           ) : isTerminal ? (
@@ -264,23 +222,8 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
                       )
                     )}
                     {!isInlineCards && nonImageText && (
-                      <div className="mt-0 streaming-reveal">
-                        <span className="stream-chunk">
-                          <JsonMarkdownRenderer content={nonImageText.slice(0, lastRenderedLen)} />
-                        </span>
-                        {nonImageText.length > lastRenderedLen && (
-                          <span className="stream-chunk new">
-                            <JsonMarkdownRenderer content={nonImageText.slice(lastRenderedLen)} />
-                          </span>
-                        )}
-                        {isStreaming && lastRenderedLen !== nonImageText.length && (
-                          <span style={{ display: 'none' }}
-                            aria-hidden
-                            ref={(el) => {
-                              if (el) setLastRenderedLen(nonImageText.length)
-                            }}
-                          />
-                        )}
+                      <div className="mt-0">
+                        <JsonMarkdownRenderer content={nonImageText} />
                       </div>
                     )}
                     {selected && (

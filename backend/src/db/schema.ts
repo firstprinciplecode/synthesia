@@ -70,6 +70,7 @@ export const agents = pgTable('agents', {
   
   // Tool Configuration
   autoExecuteTools: boolean('auto_execute_tools').default(false), // Whether to auto-execute tools or ask for permission
+  toolPreferences: jsonb('tool_preferences'), // Optional per-agent tool preferences (capabilities -> preferred tools, approval)
   
   // Interest-based participation
   interests: jsonb('interests'), // array of strings

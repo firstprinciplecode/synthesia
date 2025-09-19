@@ -61,11 +61,13 @@ export class WSClient {
   serpapiImages(query: string, roomId: string, num?: number, agentId?: string) { return this.client.serpapiImages(query, roomId, num, agentId); }
   serpapiRun(engine: string, query: string, roomId: string, extra?: Record<string, any>, agentId?: string) { return this.client.serpapiRun(engine, query, roomId, extra, agentId); }
   webScrape(url: string, roomId: string, agentId?: string) { return this.client.webScrape(url, roomId, agentId); }
-  webScrapePick(index: number, roomId: string, agentId?: string) { return this.client.webScrapePick(index, roomId, agentId); }
+  webScrapePick(index: number, roomId: string, agentId?: string, resultId?: string) { return this.client.webScrapePick(index, roomId, agentId, resultId); }
+  codeSearch(pattern: string, roomId: string, options?: { path?: string; glob?: string; maxResults?: number; caseInsensitive?: boolean; regex?: boolean }, agentId?: string) { return this.client.codeSearch(pattern, roomId, options, agentId); }
   xSearch(query: string, roomId: string, num?: number, agentId?: string) { return this.client.xSearch(query, roomId, num, agentId); }
   xLists(handle: string, roomId: string, agentId?: string) { return this.client.xLists(handle, roomId, agentId); }
   xTweet(text: string, roomId: string, media?: { url: string }[], agentId?: string) { return this.client.xTweet(text, roomId, media, agentId); }
   xDm(handle: string, text: string, roomId: string, agentId?: string) { return this.client.xDm(handle, text, roomId, agentId); }
+  getLastResultId(roomId: string) { return (this.client as any).getLastResultId?.(roomId); }
 }
 
 

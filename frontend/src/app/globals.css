@@ -135,22 +135,6 @@ html, body, #__next {
     }
   }
   
-  @keyframes stream-fade-in {
-    0% {
-      opacity: 0;
-      transform: translateY(2px);
-    }
-    100% {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-  
-  @keyframes stream-fade-only {
-    from { opacity: 0.15; }
-    to { opacity: 1; }
-  }
-  
   .animate-glow {
     position: relative;
   }
@@ -172,38 +156,6 @@ html, body, #__next {
       glowing-dot 8s ease-in-out infinite,
       dot-travel 3s linear infinite;
     pointer-events: none;
-  }
-  
-  .streaming-text {
-    animation: stream-fade-in 0.3s ease-out;
-  }
-  
-  .streaming-fade {
-    will-change: opacity;
-    animation: stream-fade-only 220ms ease-out;
-  }
-  
-  .streaming-reveal {
-    position: relative;
-  }
-  
-  .streaming-reveal .stream-chunk {
-    display: inline;
-  }
-  
-  .streaming-reveal .stream-chunk.new {
-    animation: stream-fade-only 200ms ease-out;
-  }
-  
-  @keyframes stream-reveal {
-    0% {
-      width: 20px;
-      opacity: 1;
-    }
-    100% {
-      width: 0px;
-      opacity: 0;
-    }
   }
 }
 

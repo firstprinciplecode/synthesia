@@ -66,6 +66,7 @@ export function ChatInterface({
   const seenSuggestionIdsRef = useRef<Set<string>>(new Set());
   const streamBuffersRef = useRef<Map<string, string>>(new Map());
   const streamTimersRef = useRef<Map<string, any>>(new Map());
+  const handledSuggestionIdsRef = useRef<Set<string>>(new Set());
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -277,7 +278,9 @@ export function ChatInterface({
             const merged = upsertMessage(prev, messageWithIdentity as any);
             if (merged !== prev) {
               const suggestion = extractTerminalSuggestions(message.content);
-              if (suggestion) setPendingTerminalSuggestions(prevMap => { const map = new Map(prevMap); map.set(message.id, suggestion); return map; });
+              if (suggestion && !handledSuggestionIdsRef.current.has(message.id)) {
+                setPendingTerminalSuggestions(prevMap => { const map = new Map(prevMap); map.set(message.id, suggestion); return map; });
+              }
               return merged;
             }
           }
@@ -289,7 +292,7 @@ export function ChatInterface({
           // Check for terminal suggestions in assistant messages
           if (message.role === 'assistant') {
             const suggestion = extractTerminalSuggestions(message.content);
-            if (suggestion) {
+            if (suggestion && !handledSuggestionIdsRef.current.has(message.id)) {
               setPendingTerminalSuggestions(prev => {
                 const updated = new Map(prev);
                 updated.set(message.id, suggestion);
@@ -1062,11 +1065,35 @@ export function ChatInterface({
       return;
     }
     // Web scraper tools
-    const wsPick = normalized.match(/^tool\.web\.scrape\.pick\s*\{\s*index:\s*(\d+)\s*\}$/i) || normalized.match(/^tool\.web\.scrape\.pick\s+(\d+)$/i);
-    if (wsPick) {
-      const idx = parseInt(wsPick[1], 10);
+    const wsPickJson = normalized.match(/^tool\.web\.scrape\.pick\s*\{\s*index:\s*(\d+)\s*(?:,\s*resultId:\s*\"([^\"]+)\")?\s*\}$/i);
+    const wsPickSimple = normalized.match(/^tool\.web\.scrape\.pick\s+(\d+)$/i);
+    if (wsPickJson) {
+      const idx = parseInt(wsPickJson[1], 10);
+      const rid = wsPickJson[2];
       if (!Number.isNaN(idx)) {
-        await wsRef.current!.webScrapePick(idx, currentRoom, attributedAgentId);
+        await wsRef.current!.webScrapePick(idx, currentRoom, attributedAgentId, rid);
+        return;
+      }
+    }
+    if (wsPickSimple) {
+      const idx = parseInt(wsPickSimple[1], 10);
+      if (!Number.isNaN(idx)) {
+        // If we don't yet have a resultId cached, wait briefly for search.results
+        let rid = wsRef.current?.getLastResultId?.(currentRoom) as any;
+        if (!rid) {
+          rid = await new Promise<string | undefined>((resolve) => {
+            const timeout = setTimeout(() => resolve(undefined), 1000);
+            try {
+              // Hook into websocket client internal waiter list
+              const anyClient = wsRef.current as any;
+              anyClient.client?.pendingResultWaiters?.set?.(currentRoom, [ (r: string) => { clearTimeout(timeout); resolve(r); } ]);
+            } catch {
+              clearTimeout(timeout);
+              resolve(undefined);
+            }
+          });
+        }
+        await wsRef.current!.webScrapePick(idx, currentRoom, attributedAgentId, rid);
         return;
       }
     }
@@ -1074,6 +1101,20 @@ export function ChatInterface({
     if (wsScrape) {
       const url = wsScrape[1];
       await wsRef.current!.webScrape(url, currentRoom, attributedAgentId);
+      return;
+    }
+    // Code search: accept JSON-like or simple form
+    const codeJson = normalized.match(/^tool\.code\.search\s*\{\s*pattern:\s*\"([^\"]+)\"(,\s*path:\s*\"([^\"]+)\")?[^}]*\}$/i);
+    const codeSimple = normalized.match(/^tool\.code\.search\s+\"([^\"]+)\"$/i) || normalized.match(/^tool\.code\.search\s+(.+)$/i);
+    if (codeJson) {
+      const pattern = codeJson[1];
+      const path = codeJson[3];
+      await wsRef.current!.codeSearch(pattern, currentRoom, path ? { path } : undefined, attributedAgentId);
+      return;
+    }
+    if (codeSimple) {
+      const pattern = (codeSimple[1] || '').trim();
+      await wsRef.current!.codeSearch(pattern, currentRoom, undefined, attributedAgentId);
       return;
     }
     await handleApproveTerminalCommand(normalized);
