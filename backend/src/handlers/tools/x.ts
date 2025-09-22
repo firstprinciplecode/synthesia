@@ -3,6 +3,7 @@ import { WebSocketBus } from '../../websocket/bus.js';
 import { ToolRunner } from '../../tools/tool-runner.js';
 import { formatXSearchMarkdown } from '../../formatters/x.js';
 import { randomUUID } from 'crypto';
+import { db, messages } from '../../db/index.js';
 
 export type XHandlersContext = {
   bus: WebSocketBus;
@@ -35,6 +36,20 @@ export async function handleXSearch(ctx: XHandlersContext, connectionId: string,
     },
   });
   ctx.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+  // Persist X search summary to message history
+  try {
+    await db.insert(messages as any).values({
+      id: randomUUID(),
+      conversationId: room,
+      authorId: room,
+      authorType: 'agent',
+      role: 'assistant',
+      content: [{ type: 'text', text: md }] as any,
+      status: 'completed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as any);
+  } catch {}
   ctx.bus.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
 }
 
@@ -68,6 +83,20 @@ export async function handleXLists(ctx: XHandlersContext, connectionId: string, 
     },
   });
   ctx.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+  // Persist lists summary to message history
+  try {
+    await db.insert(messages as any).values({
+      id: randomUUID(),
+      conversationId: room,
+      authorId: room,
+      authorType: 'agent',
+      role: 'assistant',
+      content: [{ type: 'text', text: markdown }] as any,
+      status: 'completed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as any);
+  } catch {}
   ctx.bus.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
 }
 
@@ -94,6 +123,21 @@ export async function handleXListTweets(ctx: XHandlersContext, connectionId: str
     },
   });
   ctx.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+  // Persist list tweets to history (as a JSON code block message)
+  try {
+    const text = `X list ${listId} tweets:\n\n\`\`\`json\n${JSON.stringify(res.result?.data || [], null, 2)}\n\`\`\``;
+    await db.insert(messages as any).values({
+      id: randomUUID(),
+      conversationId: room,
+      authorId: room,
+      authorType: 'agent',
+      role: 'assistant',
+      content: [{ type: 'text', text }] as any,
+      status: 'completed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as any);
+  } catch {}
   ctx.bus.sendResponse(connectionId, request.id!, { ok: true, result: res.result });
 }
 

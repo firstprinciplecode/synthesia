@@ -11,23 +11,31 @@ import remarkGfm from 'remark-gfm';
 import { TerminalOutput } from '@/components/chat/TerminalOutput';
 import { TypingDots } from './TypingDots';
 import { JsonMarkdownRenderer } from './JsonMarkdownRenderer';
+import { LinkPreview } from './LinkPreview';
 
 interface ChatMessageProps {
   message: ChatMessageType;
   isStreaming?: boolean;
+  animateHeader?: boolean;
   agentNameOverride?: string;
   agentAvatarOverride?: string;
   userNameOverride?: string;
   userAvatarOverride?: string;
+  currentUserId?: string;
+  readByOthers?: boolean;
+  readByCount?: number;
 }
 
-export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvatarOverride, userNameOverride, userAvatarOverride }: ChatMessageProps) {
+export function ChatMessage({ message, isStreaming, animateHeader, agentNameOverride, agentAvatarOverride, userNameOverride, userAvatarOverride, currentUserId, readByOthers, readByCount }: ChatMessageProps) {
+  // Keyframe-based animation handled in CSS; no JS state needed
   const isUser = message.role === 'user';
   const isTerminal = message.role === 'terminal';
   const agentName = ((message as any).agentName as string | undefined) || agentNameOverride;
   const agentAvatar = ((message as any).agentAvatar as string | undefined) || agentAvatarOverride;
   const userName = ((message as any).userName as string | undefined) || userNameOverride;
+  const authorUserId = (message as any).authorUserId as string | undefined;
   const userAvatar = ((message as any).userAvatar as string | undefined) || userAvatarOverride;
+  const isSelf = !!authorUserId && !!currentUserId && authorUserId === currentUserId;
   
   // ASCII spinner for terminal placeholders
   const [spinner, setSpinner] = useState('|');
@@ -120,9 +128,24 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
     },
   } as any;
   
+  // Extract the first external URL from the message for preview (skip data: and internal routes)
+  const firstUrlForPreview = React.useMemo(() => {
+    try {
+      const text = String(displayContent || '');
+      const urlRegex = /(https?:\/\/[\w\-]+(\.[\w\-]+)+(:\d+)?(\/[\w\-.,@?^=%&:/~+#]*[\w\-@?^=%&/~+#])?)/gi;
+      const matches = text.match(urlRegex);
+      if (!matches || matches.length === 0) return null;
+      const u = new URL(matches[0]);
+      if (u.protocol === 'http:' || u.protocol === 'https:') return u.toString();
+      return null;
+    } catch { return null; }
+  }, [displayContent]);
+
   return (
     <div className="flex gap-3 p-3 hover:bg-muted/50 group">
-      <Avatar className="h-10 w-10 flex-shrink-0">
+      <Avatar
+        className={`h-10 w-10 flex-shrink-0 ${animateHeader ? 'sa-fade-in-up' : ''}`}
+      >
         {isUser && userAvatar ? (
           <AvatarImage src={userAvatar} alt={userName || 'User'} />
         ) : !isUser && !isTerminal && agentAvatar ? (
@@ -138,12 +161,14 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
       </Avatar>
       
       <div className="flex flex-col gap-0 flex-1 min-w-0">
-        <div className="flex items-baseline gap-2">
+        <div
+          className={`flex items-baseline gap-2 ${animateHeader ? 'sa-fade-in-up' : ''}`}
+        >
           <span 
             className="font-semibold text-sm text-foreground"
             title={isTerminal && message.terminalResult ? `$ ${message.terminalResult.command}` : undefined}
           >
-            {isUser ? 'You' : isTerminal ? 'Terminal' : (agentName || 'Agent')}
+            {isUser ? (isSelf ? 'You' : ((userName && userName.trim()) || 'User')) : isTerminal ? 'Terminal' : (agentName || 'Agent')}
           </span>
           <span className="text-xs text-muted-foreground">
             {message.timestamp.toLocaleTimeString()}
@@ -155,7 +180,12 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
         
         <div className="text-sm leading-relaxed text-foreground">
           {isUser ? (
-            <p className="whitespace-pre-wrap m-0">{renderWithMentions(displayContent)}</p>
+            <div>
+              <p className="whitespace-pre-wrap m-0">{renderWithMentions(displayContent)}</p>
+              {firstUrlForPreview && (
+                <LinkPreview url={firstUrlForPreview} />
+              )}
+            </div>
           ) : isTerminal ? (
             <div className="font-mono">
               {message.terminalResult ? (
@@ -226,6 +256,9 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
                         <JsonMarkdownRenderer content={nonImageText} />
                       </div>
                     )}
+                    {!isInlineCards && firstUrlForPreview && (
+                      <LinkPreview url={firstUrlForPreview} />
+                    )}
                     {selected && (
                       <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={() => setSelected(null)}>
                         <div className="max-w-screen-md w-full">
@@ -244,6 +277,10 @@ export function ChatMessage({ message, isStreaming, agentNameOverride, agentAvat
                 <span className="inline-block w-1 h-4 bg-current animate-pulse ml-1" />
               )}
             </div>
+          )}
+          {/* Read receipts: show only for your own messages when others have read */}
+          {isUser && isSelf && !!readByOthers && (
+            <div className="mt-1 text-[10px] text-muted-foreground">{readByCount && readByCount > 1 ? `Read by ${readByCount}` : 'Read'}</div>
           )}
         </div>
       </div>

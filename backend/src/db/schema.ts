@@ -381,6 +381,95 @@ export const chunksRelations = relations(chunks, ({ one }) => ({
   }),
 }));
 
+// === SOCIAL CORE (Actors, Rooms, Relationships, Policies, Feed) ===
+
+export const actors = pgTable('actors', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  type: varchar('type', { length: 20 }).notNull(), // user | agent
+  handle: varchar('handle', { length: 191 }).unique(),
+  displayName: varchar('display_name', { length: 255 }),
+  avatarUrl: text('avatar_url'),
+  ownerUserId: varchar('owner_user_id', { length: 191 }), // if this is an agent owned by a user
+  orgId: varchar('org_id', { length: 191 }),
+  capabilityTags: jsonb('capability_tags'),
+  settings: jsonb('settings'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  typeIdx: index('actors_type_idx').on(table.type),
+  ownerIdx: index('actors_owner_idx').on(table.ownerUserId),
+  orgIdx: index('actors_org_idx').on(table.orgId),
+}));
+
+export const rooms = pgTable('rooms', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  kind: varchar('kind', { length: 20 }).notNull(), // dm | group | channel | feed
+  title: varchar('title', { length: 255 }),
+  slug: varchar('slug', { length: 191 }),
+  createdByActorId: varchar('created_by_actor_id', { length: 191 }).notNull(),
+  orgId: varchar('org_id', { length: 191 }),
+  isPublic: boolean('is_public').default(false),
+  policyId: varchar('policy_id', { length: 191 }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  kindIdx: index('rooms_kind_idx').on(table.kind),
+  slugIdx: index('rooms_slug_idx').on(table.slug),
+  orgIdx: index('rooms_org_idx').on(table.orgId),
+}));
+
+export const roomMembers = pgTable('room_members', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  roomId: varchar('room_id', { length: 191 }).notNull(),
+  actorId: varchar('actor_id', { length: 191 }).notNull(),
+  role: varchar('role', { length: 20 }).notNull().default('member'), // owner | admin | member | guest
+  joinsAt: timestamp('joins_at').defaultNow().notNull(),
+  leavesAt: timestamp('leaves_at'),
+  settings: jsonb('settings'),
+}, (table) => ({
+  uniqueMember: index('room_members_room_actor_idx').on(table.roomId, table.actorId),
+  actorIdx: index('room_members_actor_idx').on(table.actorId),
+  roomIdx: index('room_members_room_idx').on(table.roomId),
+}));
+
+export const relationships = pgTable('relationships', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  fromActorId: varchar('from_actor_id', { length: 191 }).notNull(),
+  toActorId: varchar('to_actor_id', { length: 191 }).notNull(),
+  kind: varchar('kind', { length: 20 }).notNull(), // follow | block | mute
+  metadata: jsonb('metadata'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  uniqueEdge: index('relationships_unique_edge_idx').on(table.fromActorId, table.toActorId, table.kind),
+  toIdx: index('relationships_to_idx').on(table.toActorId, table.kind),
+  fromIdx: index('relationships_from_idx').on(table.fromActorId, table.kind),
+}));
+
+export const policies = pgTable('policies', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  scope: varchar('scope', { length: 20 }).notNull(), // room | actor | org
+  scopeId: varchar('scope_id', { length: 191 }).notNull(),
+  requireApproval: varchar('require_approval', { length: 10 }).notNull().default('ask'), // auto|ask|off
+  toolLimits: jsonb('tool_limits'),
+  autoReplyThreshold: numeric('auto_reply_threshold', { precision: 3, scale: 2 }).default('0.70'),
+  safety: jsonb('safety'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  uniqueScope: index('policies_scope_idx').on(table.scope, table.scopeId),
+}));
+
+export const feedItems = pgTable('feed_items', {
+  id: varchar('id', { length: 191 }).primaryKey(), // usually messageId
+  actorId: varchar('actor_id', { length: 191 }).notNull(),
+  replyToId: varchar('reply_to_id', { length: 191 }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  createdIdx: index('feed_items_created_idx').on(table.createdAt),
+  actorIdx: index('feed_items_actor_idx').on(table.actorId, table.createdAt),
+  replyIdx: index('feed_items_reply_idx').on(table.replyToId),
+}));
+
 // === MEMORY SYSTEM ===
 
 export const agentProfiles = pgTable('agent_profiles', {

@@ -8,7 +8,10 @@ import {
   ErrorCodes,
   MessageCreateRequest,
   MessageDeltaNotification,
-  RunStatusNotification
+  RunStatusNotification,
+  TypingStartRequest,
+  TypingStopRequest,
+  RoomTypingNotification
 } from '../types/protocol.js';
 import { LLMRouter, ModelConfigs, SupportedModel } from '../llm/providers.js';
 import { ParticipationRouter } from './participation-router.js';
@@ -51,6 +54,8 @@ export class WebSocketServer {
   private roomSpeaking: Set<string> = new Set();
   private roomQueue: Map<string, string[]> = new Map();
   private roomCooldownUntil: Map<string, Map<string, number>> = new Map();
+  private roomTyping: Map<string, Map<string, number>> = new Map(); // roomId -> actorId -> expiresAtMs
+  private roomReceipts: Map<string, Map<string, Set<string>>> = new Map(); // roomId -> messageId -> Set<actorId>
   private bus: WebSocketBus;
   private roomsRegistry: RoomRegistry;
   private orchestrator: AgentOrchestrator;
@@ -240,10 +245,47 @@ export class WebSocketServer {
     });
   }
 
+  private async canonicalizeUserId(userId: string): Promise<string> {
+    try {
+      const uid = String(userId || '').trim();
+      if (uid.includes('@')) {
+        const rows = await db.select().from(users).where(eq(users.email as any, uid as any));
+        if (rows.length && rows[0]?.id) return String(rows[0].id);
+      }
+      return uid;
+    } catch {
+      return userId;
+    }
+  }
+
+  private async resolvePrimaryUserActorId(userId: string): Promise<string> {
+    try {
+      const canonical = await this.canonicalizeUserId(userId);
+      const rows = await db.select().from(DBSchema.actors).where(eq(DBSchema.actors.ownerUserId as any, canonical as any));
+      const users = (rows as any[]).filter(a => a.type === 'user');
+      const sorted = users.sort((x: any, y: any) => new Date(y.updatedAt || y.createdAt || 0).getTime() - new Date(x.updatedAt || x.createdAt || 0).getTime());
+      if (sorted.length) return sorted[0].id as string;
+    } catch {}
+    return userId;
+  }
+
   register(fastify: FastifyInstance) {
     const self = this;
     fastify.register(async function (fastify: any) {
-      fastify.get('/ws', { websocket: true }, self.handleConnection.bind(self));
+      fastify.get('/ws', { websocket: true }, (connection: any, request: any) => {
+        try {
+          // Try to parse NextAuth session from cookie header (JWT strategy)
+          const cookie = String(request.headers['cookie'] || '');
+          const m = cookie.match(/next-auth\.session-token=([^;]+)/) || cookie.match(/__Secure-next-auth\.session-token=([^;]+)/);
+          if (m) {
+            // We don't verify JWT signature here; for dev map token presence to a user hint
+            const hinted = (request.headers['x-user-id'] as string) || 'default-user';
+            const cid = (connection as any).socket ? (connection as any).socket : connection;
+            // assign after connection established in handleConnection via a side-channel
+          }
+        } catch {}
+        self.handleConnection(connection, request);
+      });
     });
   }
 
@@ -288,6 +330,12 @@ export class WebSocketServer {
       
       // Route to appropriate handler
       switch (request.method) {
+        case 'typing.start':
+          await this.handleTypingStart(connectionId, request as TypingStartRequest);
+          break;
+        case 'typing.stop':
+          await this.handleTypingStop(connectionId, request as TypingStopRequest);
+          break;
         case 'message.create':
           await this.handleMessageCreate(connectionId, request as MessageCreateRequest);
           break;
@@ -338,6 +386,9 @@ export class WebSocketServer {
         case 'tool.web.scrape.pick':
           await this.handleWebScrapePick(connectionId, request);
           break;
+        case 'message.read':
+          await this.handleMessageRead(connectionId, request);
+          break;
         case 'tool.x.tweet':
           await handleXTweet(this.buildXCtx(), connectionId, request);
           break;
@@ -368,6 +419,16 @@ export class WebSocketServer {
 
   // Lightweight helper to decide which invited agents should speak next based on content and mentions
   private async routeParticipation(roomId: string, text: string): Promise<string[]> {
+    // Do not invite agents in direct messages between users
+    try {
+      const r = await db.select().from(DBSchema.rooms).where(eq(DBSchema.rooms.id as any, roomId as any));
+      if (r.length && String((r[0] as any).kind) === 'dm') {
+        console.log(`[routeParticipation] Room ${roomId} is a DM; suppressing agent participation.`);
+        return [];
+      }
+    } catch (e) {
+      console.warn('[routeParticipation] Failed to read room kind, continuing with default behavior');
+    }
     // Eligible agents come from DB conversation participants; fallback to legacy invited set
     let eligible: string[] = [];
     try {
@@ -388,6 +449,33 @@ export class WebSocketServer {
     } catch (e) {
       console.error(`[routeParticipation] Error fetching conversation:`, e);
     }
+    // Fallback to Social Core room members → actors → agents mapping
+    if (eligible.length === 0) {
+      try {
+        const members = await db.select().from(DBSchema.roomMembers).where(eq(DBSchema.roomMembers.roomId as any, roomId as any));
+        const candidateAgentIds: string[] = [];
+        for (const m of members as any[]) {
+          try {
+            const aRows = await db.select().from(DBSchema.actors).where(eq(DBSchema.actors.id as any, m.actorId as any));
+            if (!aRows.length) continue;
+            const act: any = aRows[0];
+            if (String(act.type) !== 'agent') continue;
+            const settings = (act.settings || {}) as any;
+            const mappedAgentId = settings?.agentId;
+            if (mappedAgentId && typeof mappedAgentId === 'string') {
+              candidateAgentIds.push(mappedAgentId);
+            }
+          } catch {}
+        }
+        eligible = Array.from(new Set(candidateAgentIds));
+        if (eligible.length) {
+          console.log(`[routeParticipation] Eligible agents from Social Core members:`, eligible);
+        }
+      } catch (e) {
+        console.error(`[routeParticipation] Error fetching Social Core room members:`, e);
+      }
+    }
+    // Legacy invited set fallback
     if (eligible.length === 0) {
       eligible = Array.from(this.roomAgents.get(roomId) || []);
     }
@@ -400,7 +488,10 @@ export class WebSocketServer {
         if (rows.length) {
           const agentName = String(rows[0].name || '').toLowerCase();
           agentIdByName.set(agentName, aid);
-          console.log(`[routeParticipation] Agent mapping: "${agentName}" -> ${aid}`);
+          // Also add condensed slug (no spaces) for @handle-style mentions
+          const slug = agentName.replace(/\s+/g, '');
+          if (slug && slug !== agentName) agentIdByName.set(slug, aid);
+          console.log(`[routeParticipation] Agent mapping: "${agentName}" (slug: ${slug}) -> ${aid}`);
         }
       }
     } catch {}
@@ -481,6 +572,21 @@ export class WebSocketServer {
         },
       });
 
+      // Persist terminal result to message history
+      try {
+        await db.insert(DBSchema.messages as any).values({
+          id: randomUUID(),
+          conversationId: (roomId || 'default-room') as any,
+          authorId: String(agentId || roomId || 'agent'),
+          authorType: 'agent',
+          role: 'terminal',
+          content: [{ type: 'text', text: `$ ${result.command}\n${result.stdout}${result.stderr ? '\n' + result.stderr : ''}` }] as any,
+          status: 'completed',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        } as any);
+      } catch {}
+
       // Send response to requester
       this.bus.sendResponse(connectionId, request.id, {
         command: result.command,
@@ -551,6 +657,21 @@ export class WebSocketServer {
           timestamp: new Date().toISOString(),
         },
       });
+
+      // Persist terminal output as a terminal message in history
+      try {
+        await db.insert(DBSchema.messages as any).values({
+          id: randomUUID(),
+          conversationId: (roomId || 'default-room') as any,
+          authorId: String(roomId || 'agent'),
+          authorType: 'agent',
+          role: 'terminal',
+          content: [{ type: 'text', text: `$ ${result.command}\n${result.stdout}${result.stderr ? '\n' + result.stderr : ''}` }] as any,
+          status: 'completed',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        } as any);
+      } catch {}
 
       // Send response to requester
       this.bus.sendResponse(connectionId, request.id, {
@@ -636,6 +757,35 @@ export class WebSocketServer {
         return;
       }
 
+      // Resolve active user and primary actor id (for author identity)
+      const DEFAULT_USER_ID = 'default-user';
+      const rawActiveUserId = this.connectionUserId.get(connectionId) || DEFAULT_USER_ID;
+      const activeUserId = await this.canonicalizeUserId(rawActiveUserId);
+      const myActorId = await this.resolvePrimaryUserActorId(activeUserId);
+
+      // Check if this room is a DM; if so, no agents or system fallback should speak
+      let isDmRoom = false;
+      try {
+        const r = await db.select().from(DBSchema.rooms).where(eq(DBSchema.rooms.id as any, roomId as any));
+        isDmRoom = !!(r.length && String((r[0] as any).kind) === 'dm');
+      } catch {}
+
+      // Resolve friendly author identity (name/avatar) for immediate client rendering
+      let authorName: string | undefined = undefined;
+      let authorAvatar: string | undefined = undefined;
+      try {
+        const aRows = await db.select().from(DBSchema.actors).where(eq(DBSchema.actors.id as any, myActorId as any));
+        const act: any = aRows[0];
+        if (act && (act.ownerUserId || activeUserId)) {
+          const ownerId = act.ownerUserId || activeUserId;
+          const uRows = await db.select().from(users).where(eq(users.id, ownerId));
+          if (uRows.length) {
+            authorName = uRows[0].name || uRows[0].email || undefined;
+            authorAvatar = uRows[0].avatar || undefined;
+          }
+        }
+      } catch {}
+
       // Echo the user message to the room
       this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
@@ -643,11 +793,58 @@ export class WebSocketServer {
         params: {
           roomId,
           messageId: randomUUID(),
-          authorId: connectionId,
+          authorId: myActorId,
           authorType: 'user',
+          authorUserId: activeUserId,
+          authorName,
+          authorAvatar,
           message,
         },
       });
+
+      // Persist user message to DB
+      try {
+        await db.insert(DBSchema.messages as any).values({
+          id: randomUUID(),
+          conversationId: roomId,
+          authorId: String(myActorId),
+          authorType: 'user',
+          role: 'user',
+          content: Array.isArray(message?.content) ? (message.content as any) : [{ type: 'text', text: String(message || '') }] as any,
+          status: 'completed',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        } as any);
+      } catch {}
+
+      // For DM rooms, do not trigger agent routing or system fallback; store only the user message and return
+      if (isDmRoom) {
+        try {
+          const userMessage = message.content.map((p: any) => p.text).join('');
+          const msgId = randomUUID();
+          const mem = {
+            id: msgId,
+            role: 'user' as const,
+            content: userMessage,
+            timestamp: new Date(),
+            conversationId: roomId,
+            agentId: roomId as any,
+            metadata: { userId: activeUserId },
+          };
+          memoryService.addToShortTerm(roomId, mem);
+          await memoryService.addToLongTerm(userMessage, ({
+            agentId: roomId as any,
+            conversationId: roomId,
+            messageId: msgId,
+            role: 'user',
+            timestamp: new Date().toISOString(),
+            messageType: 'conversation',
+            userId: activeUserId,
+          } as any));
+        } catch {}
+        if ((request as any).id) this.bus.sendResponse(connectionId, (request as any).id, { ok: true });
+        return;
+      }
 
       // Start agent run
       const runId = randomUUID();
@@ -688,8 +885,7 @@ export class WebSocketServer {
 
       // Get agent profile and preferences for context
       // Load user profile for the active connection
-      const DEFAULT_USER_ID = 'default-user';
-      const activeUserId = this.connectionUserId.get(connectionId) || DEFAULT_USER_ID;
+      // activeUserId already resolved above
       let userProfile = null;
       try {
         const userRows = await db.select().from(users).where(eq(users.id, activeUserId));
@@ -717,33 +913,53 @@ export class WebSocketServer {
         });
       }
 
-      // Resolve agent persona and settings by roomId (treat roomId as agentId)
+      // Resolve agent persona and settings; support legacy agentId rooms and agent_chat rooms
       let agentName = '';
       let agentPersona = '';
       let autoExecuteTools = false;
       let isAgentRoom = false;
+      let primaryAgentId: string | null = null;
       try {
         const { db, agents } = await import('../db/index.js');
         const { eq } = await import('drizzle-orm');
+        // Legacy: roomId is agentId
         const rows = await db.select().from(agents).where(eq(agents.id, roomId as any));
         if (rows.length > 0) {
-          isAgentRoom = true;
-          const a: any = rows[0];
-          agentName = a.name || '';
-          autoExecuteTools = a.autoExecuteTools || false;
-          const instr: string = a.instructions || '';
-          const desc = a.description ? `Description: ${a.description}` : '';
-          // Extract Personality and Extra instructions blocks if present
-          const personalityMatch = instr.match(/Personality:\s*([\s\S]*?)(?:\n\n|$)/);
-          const extraMatch = instr.match(/Extra instructions:\s*([\s\S]*)$/);
-          const personality = personalityMatch ? personalityMatch[1].trim() : '';
-          const extra = extraMatch ? extraMatch[1].trim() : '';
-          agentPersona = [
-            agentName ? `Agent Name: ${agentName}` : '',
-            desc,
-            personality ? `Personality: ${personality}` : '',
-            extra ? `Extra instructions: ${extra}` : '',
-          ].filter(Boolean).join('\n');
+          primaryAgentId = String(roomId);
+        } else {
+          // agent_chat: find agent actor in members and map to agentId via settings.agentId
+          try {
+            const { rooms, roomMembers, actors } = await import('../db/index.js');
+            const rr = await db.select().from(rooms).where(eq(rooms.id as any, roomId as any));
+            if (rr.length && String((rr[0] as any).kind) === 'agent_chat') {
+              const m = await db.select().from(roomMembers).where(eq(roomMembers.roomId as any, roomId as any));
+              const actorIds = (m as any[]).map(x => x.actorId);
+              const aRows = await db.select().from(actors);
+              const agentActor = (aRows as any[]).find(a => a.type === 'agent' && actorIds.includes(a.id) && a?.settings?.agentId);
+              if (agentActor?.settings?.agentId) primaryAgentId = String(agentActor.settings.agentId);
+            }
+          } catch {}
+        }
+        if (primaryAgentId) {
+          const pr = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+          if (pr.length > 0) {
+            isAgentRoom = true;
+            const a: any = pr[0];
+            agentName = a.name || '';
+            autoExecuteTools = a.autoExecuteTools || false;
+            const instr: string = a.instructions || '';
+            const desc = a.description ? `Description: ${a.description}` : '';
+            const personalityMatch = instr.match(/Personality:\s*([\s\S]*?)(?:\n\n|$)/);
+            const extraMatch = instr.match(/Extra instructions:\s*([\s\S]*)$/);
+            const personality = personalityMatch ? personalityMatch[1].trim() : '';
+            const extra = extraMatch ? extraMatch[1].trim() : '';
+            agentPersona = [
+              agentName ? `Agent Name: ${agentName}` : '',
+              desc,
+              personality ? `Personality: ${personality}` : '',
+              extra ? `Extra instructions: ${extra}` : '',
+            ].filter(Boolean).join('\n');
+          }
         }
       } catch {}
 
@@ -873,7 +1089,7 @@ ${personaBlock}${memoryContext}`,
       this.roomSpeaking.add(roomId);
       let responseText = '';
       if (useLoop) {
-        const agentRecord = isAgentRoom ? (await db.select().from(agents).where(eq(agents.id as any, roomId as any)))[0] : null;
+        const agentRecord = isAgentRoom && primaryAgentId ? (await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any)))[0] : null;
         const { finalText, pendingApproval } = await this.orchestrator.runTask({
           roomId,
           activeUserId,
@@ -952,8 +1168,8 @@ ${personaBlock}${memoryContext}`,
             } catch {}
             return result;
           },
-          onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: roomId, authorType: 'agent' } }),
-          onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: roomId, authorType: 'agent' } } as MessageDeltaNotification),
+          onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: (primaryAgentId || roomId), authorType: 'agent' } }),
+          onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' } } as MessageDeltaNotification),
           getCatalog: () => this.toolRegistry.catalog(),
           getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
         });
@@ -1001,8 +1217,8 @@ ${personaBlock}${memoryContext}`,
               this.bus.broadcastToolResult(roomId, trRunId, toolCallId, result);
               return result;
             },
-            onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: roomId, authorType: 'agent' } }),
-            onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: roomId, authorType: 'agent' } } as MessageDeltaNotification),
+            onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: (primaryAgentId || roomId), authorType: 'agent' } }),
+            onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' } } as MessageDeltaNotification),
             getCatalog: () => this.toolRegistry.catalog(),
             getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
             pendingApproval,
@@ -1010,13 +1226,13 @@ ${personaBlock}${memoryContext}`,
           responseText = approvedText;
         }
         
-        this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: responseText }] }, authorId: roomId, authorType: 'agent' } });
+        this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: responseText }] }, authorId: (primaryAgentId || roomId), authorType: 'agent' } });
       } else {
         const { fullResponse } = await this.orchestrator.streamPrimaryAgentResponse({
           roomId,
           activeUserId,
           connectionId,
-          agentRecord: isAgentRoom ? (await db.select().from(agents).where(eq(agents.id as any, roomId as any)))[0] : null,
+          agentRecord: isAgentRoom && primaryAgentId ? (await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any)))[0] : null,
           userProfile,
           userMessage,
           runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
@@ -1024,7 +1240,7 @@ ${personaBlock}${memoryContext}`,
             this.bus.broadcastToRoom(roomId, {
               jsonrpc: '2.0',
               method: 'message.delta',
-              params: { roomId, messageId, delta, authorId: roomId, authorType: 'agent' },
+              params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' },
             } as MessageDeltaNotification);
           },
         });
@@ -1032,9 +1248,26 @@ ${personaBlock}${memoryContext}`,
         this.bus.broadcastToRoom(roomId, {
           jsonrpc: '2.0',
           method: 'message.complete',
-          params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] }, authorId: roomId, authorType: 'agent' },
+          params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] }, authorId: (primaryAgentId || roomId), authorType: 'agent' },
         });
       }
+
+      // Persist assistant final message for primary agent responses (single-agent rooms)
+      try {
+        if (responseText && typeof responseText === 'string') {
+          await db.insert(DBSchema.messages as any).values({
+            id: messageId,
+            conversationId: roomId,
+            authorId: String(primaryAgentId || roomId),
+            authorType: 'agent',
+            role: 'assistant',
+            content: [{ type: 'text', text: responseText }] as any,
+            status: 'completed',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          } as any);
+        }
+      } catch {}
 
       // Primary finished speaking
       this.roomSpeaking.delete(roomId);
@@ -1042,8 +1275,11 @@ ${personaBlock}${memoryContext}`,
       // Participation routing (enqueue other invited agents if relevant)
       try {
         let candidates = await this.routeParticipation(roomId, userMessage);
-        // Prevent the primary agent (roomId) from being re-enqueued in single-agent rooms
-        candidates = candidates.filter(aid => aid !== roomId);
+        // Prevent the primary agent from being re-enqueued in single-agent rooms
+        // In legacy single-agent rooms, primary agent id == roomId
+        // In agent_chat rooms, primaryAgentId is the real agent id
+        const excludeId = (primaryAgentId || roomId);
+        candidates = candidates.filter(aid => aid !== excludeId);
         // Filter by cooldown and cap
         const now = Date.now();
         const cool = this.roomCooldownUntil.get(roomId) || new Map<string, number>();
@@ -1099,6 +1335,20 @@ ${personaBlock}${memoryContext}`,
                 timestamp: new Date().toISOString(),
               },
             });
+          // Persist auto-executed terminal output
+          try {
+            await db.insert(DBSchema.messages as any).values({
+              id: randomUUID(),
+              conversationId: roomId as any,
+              authorId: String(primaryAgentId || roomId),
+              authorType: 'agent',
+              role: 'terminal',
+              content: [{ type: 'text', text: `$ ${result.command}\n${result.stdout}${result.stderr ? '\n' + result.stderr : ''}` }] as any,
+              status: 'completed',
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            } as any);
+          } catch {}
           } catch (error) {
             console.error(`[auto-execute] Error executing command "${command}":`, error);
           }
@@ -1641,8 +1891,22 @@ ${personaBlock}${memoryContext}`,
   
 
   private async handleRoomJoin(connectionId: string, request: JSONRPCRequest) {
-    const { roomId, userId } = request.params as { roomId: string; userId?: string };
-    
+    const { roomId } = request.params as { roomId: string; userId?: string };
+    // Derive userId from request params, then headers fallback
+    let userId: string | undefined = (request.params as any)?.userId;
+    try {
+      // @ts-ignore internal
+      const conn: any = this.connections.get(connectionId);
+      const req: any = (conn && conn.req) || null;
+      // In Fastify WS, original HTTP request is on connection.request
+      const hdrs = (req && req.headers) || (conn && conn.request && conn.request.headers) || {};
+      const hinted = String(hdrs['x-user-id'] || '').trim();
+      if (!userId && hinted) userId = hinted;
+    } catch {}
+    // Canonicalize to UUID for stable identity mapping
+    if (userId) {
+      try { userId = await this.canonicalizeUserId(userId) } catch {}
+    }
     this.roomsRegistry.addConnection(roomId, connectionId, userId);
     
     this.bus.sendResponse(connectionId, request.id, { 
@@ -1898,6 +2162,99 @@ ${personaBlock}${memoryContext}`,
     }
   }
 
+  private pruneTyping(roomId: string) {
+    const now = Date.now();
+    const map = this.roomTyping.get(roomId);
+    if (!map) return;
+    for (const [actorId, expires] of map.entries()) {
+      if (expires <= now) map.delete(actorId);
+    }
+    if (map.size === 0) this.roomTyping.delete(roomId);
+  }
+
+  private broadcastTyping(roomId: string) {
+    this.pruneTyping(roomId);
+    const map = this.roomTyping.get(roomId) || new Map();
+    const typing = Array.from(map.keys()).map(actorId => ({ actorId }));
+    const notif: RoomTypingNotification = {
+      jsonrpc: '2.0',
+      method: 'room.typing',
+      params: { roomId, typing, updatedAt: new Date().toISOString() },
+    };
+    this.bus.broadcastToRoom(roomId, notif);
+  }
+
+  private broadcastReceipts(roomId: string, messageId: string) {
+    const byMessage = this.roomReceipts.get(roomId);
+    const actorIds = Array.from(byMessage?.get(messageId) || []);
+    this.bus.broadcastToRoom(roomId, {
+      jsonrpc: '2.0',
+      method: 'message.receipts',
+      params: { roomId, messageId, actorIds, updatedAt: new Date().toISOString() },
+    } as any);
+  }
+
+  private async handleTypingStart(connectionId: string, request: TypingStartRequest) {
+    const { roomId } = request.params || ({} as any);
+    if (!roomId) {
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'roomId required');
+      return;
+    }
+    // Resolve actorId: prefer provided, else current user
+    let actorId = String(request.params?.actorId || '');
+    if (!actorId) {
+      const userId = this.connectionUserId.get(connectionId) || 'default-user';
+      actorId = userId;
+    }
+    const ttlMs = Math.min(Math.max(Number(request.params?.ttlMs || 4000), 1000), 15000);
+    if (!this.roomTyping.has(roomId)) this.roomTyping.set(roomId, new Map());
+    const map = this.roomTyping.get(roomId)!;
+    map.set(actorId, Date.now() + ttlMs);
+    this.roomTyping.set(roomId, map);
+    this.bus.sendResponse(connectionId, request.id, { ok: true });
+    this.broadcastTyping(roomId);
+  }
+
+  private async handleTypingStop(connectionId: string, request: TypingStopRequest) {
+    const { roomId } = request.params || ({} as any);
+    if (!roomId) {
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'roomId required');
+      return;
+    }
+    let actorId = String(request.params?.actorId || '');
+    if (!actorId) {
+      const userId = this.connectionUserId.get(connectionId) || 'default-user';
+      actorId = userId;
+    }
+    const map = this.roomTyping.get(roomId);
+    if (map) {
+      map.delete(actorId);
+      if (map.size === 0) this.roomTyping.delete(roomId);
+    }
+    this.bus.sendResponse(connectionId, request.id, { ok: true });
+    this.broadcastTyping(roomId);
+  }
+
+  private async handleMessageRead(connectionId: string, request: any) {
+    const roomId = String(request?.params?.roomId || '');
+    const messageId = String(request?.params?.messageId || '');
+    if (!roomId || !messageId) {
+      this.bus.sendError(connectionId, request?.id, ErrorCodes.INVALID_PARAMS, 'roomId and messageId required');
+      return;
+    }
+    let actorId = String(request?.params?.actorId || '');
+    if (!actorId) {
+      actorId = this.connectionUserId.get(connectionId) || 'default-user';
+    }
+    if (!this.roomReceipts.has(roomId)) this.roomReceipts.set(roomId, new Map());
+    const byMessage = this.roomReceipts.get(roomId)!;
+    if (!byMessage.has(messageId)) byMessage.set(messageId, new Set());
+    byMessage.get(messageId)!.add(actorId);
+    this.roomReceipts.set(roomId, byMessage);
+    this.bus.sendResponse(connectionId, request?.id, { ok: true });
+    this.broadcastReceipts(roomId, messageId);
+  }
+
   // Public method to get router info
   getAvailableProviders() {
     return this.llmRouter.getAvailableProviders();
@@ -1963,11 +2320,15 @@ ${personaBlock}${memoryContext}`,
       params: { runId, status: 'running', startedAt: new Date().toISOString() },
     } as RunStatusNotification);
 
-    // Load Pinecone memory for this agent
+    // Load Pinecone memory for this agent, scoped to this user/room
     let memoryContext = '';
     try {
-      const memoryResults = await memoryService.searchLongTerm(nextAgentId, userMessage, 5);
-      
+      const memoryResults = await memoryService.searchLongTermByUser(
+        activeUserId,
+        userMessage,
+        5,
+        { agentId: nextAgentId as any, roomId }
+      );
       if (memoryResults.length > 0) {
         memoryContext = `\n\nRELEVANT MEMORY:\n${memoryResults.map(m => `- ${m.content}`).join('\n')}\n`;
       }
@@ -2025,6 +2386,20 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
               authorType: 'agent',
             },
           });
+          // Persist assistant final message
+          try {
+            await db.insert(DBSchema.messages as any).values({
+              id: messageId,
+              conversationId: roomId,
+              authorId: String(nextAgentId),
+              authorType: 'agent',
+              role: 'assistant',
+              content: [{ type: 'text', text: fullResponse }] as any,
+              status: 'completed',
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            } as any);
+          } catch {}
         }
       }
     } catch (e) {

@@ -10,12 +10,16 @@ export function ChatFooterBar({
   disabled,
   availableProviders,
   availableModels,
+  onTyping,
+  placeholder,
 }: {
   rightOpen: boolean;
   onSendMessage: (text: string, options?: any) => void;
   disabled?: boolean;
   availableProviders: string[];
   availableModels?: Array<{ name: string; provider: string; maxTokens: number }>;
+  onTyping?: (event: 'start' | 'stop') => void;
+  placeholder?: string;
 }) {
   const { state } = useSidebar();
   
@@ -35,6 +39,8 @@ export function ChatFooterBar({
           disabled={!!disabled}
           availableProviders={availableProviders}
           availableModels={availableModels}
+          onTyping={onTyping}
+          placeholderOverride={placeholder}
         />
       </div>
     </div>

@@ -39,6 +39,8 @@ type OnAgentAnalysis = (content: string, authorId?: string, authorType?: string)
 type OnParticipantsUpdate = (payload: { roomId: string; participants: Array<{ id: string; type: 'user'|'agent'; name: string; avatar?: string | null; status?: string }>; updatedAt: string }) => void;
 type OnToolCall = (payload: { runId: string; toolCallId: string; tool: string; function: string; args: Record<string, any> }) => void;
 type OnToolResult = (payload: { runId: string; toolCallId: string; result?: any; error?: string }) => void;
+type OnTyping = (payload: { roomId: string; typing: Array<{ actorId: string; type?: 'user'|'agent' }>; updatedAt: string }) => void;
+type OnReceipts = (payload: { roomId: string; messageId: string; actorIds: string[]; updatedAt: string }) => void;
 
 interface JSONRPCRequest {
   jsonrpc: '2.0';
@@ -78,6 +80,8 @@ export class SuperAgentWebSocket {
   private onParticipantsUpdate?: OnParticipantsUpdate;
   private onToolCall?: OnToolCall;
   private onToolResult?: OnToolResult;
+  private onTyping?: OnTyping;
+  private onReceipts?: OnReceipts;
 
   constructor(
     url: string,
@@ -91,6 +95,8 @@ export class SuperAgentWebSocket {
     onParticipantsUpdate?: OnParticipantsUpdate,
     onToolCall?: OnToolCall,
     onToolResult?: OnToolResult,
+    onTyping?: OnTyping,
+    onReceipts?: OnReceipts,
   ) {
     this.url = url;
     this.onMessage = onMessage;
@@ -102,6 +108,8 @@ export class SuperAgentWebSocket {
     this.onParticipantsUpdate = onParticipantsUpdate;
     this.onToolCall = onToolCall;
     this.onToolResult = onToolResult;
+    this.onTyping = onTyping;
+    this.onReceipts = onReceipts;
   }
 
   // Expose latest stable resultId for the given room, if known
@@ -235,8 +243,17 @@ export class SuperAgentWebSocket {
             timestamp: new Date(),
             authorId: params?.authorId,
             authorType: params?.authorType,
+            // passthrough user id so UI can label sender correctly in DMs
+            ...(params?.authorUserId ? { authorUserId: params.authorUserId } : {}),
+            ...(params?.authorName ? { userName: params.authorName } : {}),
+            ...(params?.authorAvatar ? { userAvatar: params.authorAvatar } : {}),
             streaming: false,
           };
+          // If this is a user-authored message and we have a friendly name/avatar, attach them
+          if (m.role === 'user') {
+            if (!('userName' in (m as any)) && typeof (params?.authorName) === 'string') (m as any).userName = params.authorName;
+            if (!('userAvatar' in (m as any)) && typeof (params?.authorAvatar) === 'string') (m as any).userAvatar = params.authorAvatar;
+          }
           this.onMessage(m);
           break;
         }
@@ -295,6 +312,14 @@ export class SuperAgentWebSocket {
           if (this.onToolResult) this.onToolResult(params);
           break;
         }
+        case 'room.typing': {
+          if (this.onTyping) this.onTyping(params);
+          break;
+        }
+        case 'message.receipts': {
+          if (this.onReceipts) this.onReceipts(params);
+          break;
+        }
         case 'search.results': {
           const rid = String(params?.resultId || '');
           const roomId = String(params?.roomId || '');
@@ -320,6 +345,18 @@ export class SuperAgentWebSocket {
   // Public API used by ChatInterface
   async joinRoom(roomId: string, userId?: string): Promise<any> {
     return this.sendRequestDedupe('room.join', { roomId, userId });
+  }
+
+  async markMessageRead(roomId: string, messageId: string, actorId?: string): Promise<any> {
+    return this.sendRequest('message.read', { roomId, messageId, ...(actorId ? { actorId } : {}) });
+  }
+
+  async typingStart(roomId: string, actorId?: string, ttlMs?: number): Promise<any> {
+    return this.sendRequest('typing.start', { roomId, ...(actorId ? { actorId } : {}), ...(ttlMs ? { ttlMs } : {}) });
+  }
+
+  async typingStop(roomId: string, actorId?: string): Promise<any> {
+    return this.sendRequest('typing.stop', { roomId, ...(actorId ? { actorId } : {}) });
   }
 
   async sendMessage(roomId: string, content: string, options?: Record<string, any>): Promise<any> {

@@ -4,6 +4,7 @@ import { ToolRunner } from '../../tools/tool-runner.js';
 import { serpapiService } from '../../tools/serpapi-service.js';
 import { formatSerpListAsMarkdown, formatGoogleNewsMarkdown } from '../../formatters/serpapi.js';
 import { createResults } from '../../websocket/results-registry.js';
+import { db, messages } from '../../db/index.js';
 
 export type SerpHandlersContext = {
   bus: WebSocketBus;
@@ -43,6 +44,20 @@ export async function handleSerpSearch(ctx: SerpHandlersContext, connectionId: s
     },
   });
   ctx.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+  // Persist tool summary to message history
+  try {
+    await db.insert(messages as any).values({
+      id: crypto.randomUUID(),
+      conversationId: room,
+      authorId: room,
+      authorType: 'agent',
+      role: 'assistant',
+      content: [{ type: 'text', text: md }] as any,
+      status: 'completed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as any);
+  } catch {}
   ctx.bus.sendResponse(connectionId, request.id!, { ok: true });
 }
 
@@ -71,6 +86,20 @@ export async function handleSerpImages(ctx: SerpHandlersContext, connectionId: s
     },
   });
   ctx.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+  // Persist image results to message history (as assistant message)
+  try {
+    await db.insert(messages as any).values({
+      id: crypto.randomUUID(),
+      conversationId: room,
+      authorId: room,
+      authorType: 'agent',
+      role: 'assistant',
+      content: [{ type: 'text', text: md }] as any,
+      status: 'completed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as any);
+  } catch {}
   ctx.bus.sendResponse(connectionId, request.id!, { ok: true });
 }
 
@@ -185,6 +214,20 @@ export async function handleSerpRun(ctx: SerpHandlersContext, connectionId: stri
     },
   });
   ctx.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+  // Persist tool summary to message history
+  try {
+    await db.insert(messages as any).values({
+      id: crypto.randomUUID(),
+      conversationId: roomId,
+      authorId: roomId,
+      authorType: 'agent',
+      role: 'assistant',
+      content: [{ type: 'text', text: messageMd }] as any,
+      status: 'completed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as any);
+  } catch {}
   ctx.bus.sendResponse(connectionId, request.id!, { ok: true, result });
 }
 
