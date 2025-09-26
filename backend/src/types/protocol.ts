@@ -37,3 +37,31 @@ export type RunStatusNotification = JSONRPCNotification & {
 };
 
 
+// Typing indicators
+export type TypingStartRequest = JSONRPCRequest & {
+  method: 'typing.start';
+  params: { roomId: string; actorId?: string; type?: 'user' | 'agent'; ttlMs?: number };
+};
+
+export type TypingStopRequest = JSONRPCRequest & {
+  method: 'typing.stop';
+  params: { roomId: string; actorId?: string };
+};
+
+export type RoomTypingNotification = JSONRPCNotification & {
+  method: 'room.typing';
+  params: { roomId: string; typing: Array<{ actorId: string; type?: 'user' | 'agent' }>; updatedAt: string };
+};
+
+// Read receipts
+export type MessageReadRequest = JSONRPCRequest & {
+  method: 'message.read';
+  params: { roomId: string; messageId: string; actorId?: string };
+};
+
+export type MessageReceiptsNotification = JSONRPCNotification & {
+  method: 'message.receipts';
+  params: { roomId: string; messageId: string; actorIds: string[]; updatedAt: string };
+};
+
+

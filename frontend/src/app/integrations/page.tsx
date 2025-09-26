@@ -5,6 +5,7 @@ import { SidebarInset, SidebarProvider, SidebarTrigger } from '@/components/ui/s
 import { AppSidebar } from '@/components/app-sidebar';
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from '@/components/ui/breadcrumb';
 import React from 'react';
+import { useSession } from 'next-auth/react';
 
 const GROUPS: Array<{ name: string; engines: string[] }> = [
   { name: 'Web', engines: ['google', 'google_news', 'google_images', 'google_maps', 'bing_images'] },
@@ -15,6 +16,7 @@ const GROUPS: Array<{ name: string; engines: string[] }> = [
 ];
 
 export default function IntegrationsPage() {
+  const { status } = useSession();
   return (
     <SidebarProvider>
       <AppSidebar />
@@ -37,7 +39,12 @@ export default function IntegrationsPage() {
         </header>
         <div className="p-4 space-y-6">
           <h1 className="text-base font-semibold">Tools & APIs</h1>
-          <section>
+          {status !== 'authenticated' && (
+            <div className="text-sm text-muted-foreground">
+              You must be signed in to manage integrations.
+            </div>
+          )}
+          {status === 'authenticated' && (<section>
             <h2 className="text-sm font-semibold">SerpAPI Engines</h2>
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {GROUPS.map((group) => (
@@ -57,9 +64,9 @@ export default function IntegrationsPage() {
             <p className="text-xs text-muted-foreground mt-3">
               Tip: Use <code className="px-1 py-0.5 rounded bg-muted">serpapi.&lt;engine&gt; "query"</code> or <code className="px-1 py-0.5 rounded bg-muted">@serpapi …</code> in chat.
             </p>
-          </section>
+          </section>)}
 
-          <section>
+          {status === 'authenticated' && (<section>
             <h2 className="text-sm font-semibold mt-6">Audio (ElevenLabs)</h2>
             <div className="border rounded-md p-3 space-y-2 text-sm">
               <div className="text-xs text-muted-foreground">Text-to-Speech</div>
@@ -78,12 +85,12 @@ export default function IntegrationsPage() {
               </div>
               <div className="text-xs text-muted-foreground">Requires ELEVENLAB_API_KEY in backend .env</div>
             </div>
-          </section>
+          </section>)}
 
-          <section>
+          {status === 'authenticated' && (<section>
             <h2 className="text-sm font-semibold mt-6">X (Twitter)</h2>
             <XIntegrationCard />
-          </section>
+          </section>)}
         </div>
       </SidebarInset>
     </SidebarProvider>

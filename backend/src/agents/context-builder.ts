@@ -1,21 +1,37 @@
 import { randomUUID } from 'crypto';
 
-export function parseAgentPersona(agent: any): { agentName: string; persona: string; autoExecuteTools: boolean } {
+export function parseAgentPersona(agent: any): { agentName: string; persona: string; autoExecuteTools: boolean; toolPreferences?: Array<{ capability?: string[]; prefer?: string[]; approval?: 'auto'|'ask' }> } {
   const agentName = agent?.name || '';
   const instructions: string = agent?.instructions || '';
   const desc = agent?.description ? `Description: ${agent.description}` : '';
+  
+  // Check for structured format first (Personality: / Extra instructions:)
   const personalityMatch = instructions.match(/Personality:\s*([\s\S]*?)(?:\n\n|$)/);
   const extraMatch = instructions.match(/Extra instructions:\s*([\s\S]*)$/);
-  const personality = personalityMatch ? personalityMatch[1].trim() : '';
-  const extra = extraMatch ? extraMatch[1].trim() : '';
-  const persona = [
-    agentName ? `Agent Name: ${agentName}` : '',
-    desc,
-    personality ? `Personality: ${personality}` : '',
-    extra ? `Extra instructions: ${extra}` : '',
-  ].filter(Boolean).join('\n');
+  
+  let persona = '';
+  if (personalityMatch || extraMatch) {
+    // Structured format
+    const personality = personalityMatch ? personalityMatch[1].trim() : '';
+    const extra = extraMatch ? extraMatch[1].trim() : '';
+    persona = [
+      agentName ? `Agent Name: ${agentName}` : '',
+      desc,
+      personality ? `Personality: ${personality}` : '',
+      extra ? `Extra instructions: ${extra}` : '',
+    ].filter(Boolean).join('\n');
+  } else {
+    // Unstructured format - treat entire instructions as personality
+    persona = [
+      agentName ? `Agent Name: ${agentName}` : '',
+      desc,
+      instructions ? `Instructions: ${instructions}` : '',
+    ].filter(Boolean).join('\n');
+  }
+  
   const autoExecuteTools = !!agent?.autoExecuteTools;
-  return { agentName, persona, autoExecuteTools };
+  const toolPreferences = Array.isArray(agent?.toolPreferences) ? agent.toolPreferences : undefined;
+  return { agentName, persona, autoExecuteTools, toolPreferences };
 }
 
 export function buildMemoryContextFromLongTerm(memories: Array<{ content: string }>): string {
@@ -42,13 +58,23 @@ export function buildSystemPrompt(options: {
   persona: string;
   memoryContext: string;
   autoExecuteTools: boolean;
+  toolPreferences?: Array<{ capability?: string[]; prefer?: string[]; approval?: 'auto'|'ask' }>;
 }): string {
-  const { userName, connectionId, persona, memoryContext, autoExecuteTools } = options;
-  const personalizedGreeting = userName ? `Hello ${userName}!` : 'Hello there!';
-  const personaBlock = persona ? `\n\nAGENT PERSONA\n${persona}\n\n` : '\n\n';
-  return `You are a helpful AI assistant with tool access and memory. When greeting the user, address them by name: "${userName || 'there'}".
+  const { userName, connectionId, persona, memoryContext, autoExecuteTools, toolPreferences } = options;
+  const personaBlock = persona ? `AGENT PERSONA\n${persona}\n\n` : '';
+  let prompt = `${personaBlock}
+ROLE & VOICE
+- You are the agent above. Stay strictly in character and tone. Persona overrides any conflicting style or general guidance below.
+- When greeting the user, a brief on-air style greeting consistent with your persona is allowed.
 
-${personalizedGreeting} You have access to their profile information and should use it to provide personalized assistance.
+USER CONTEXT
+- Address the user by first name: "${userName || 'there'}".
+
+STYLE GUIDE
+- Be concise by default (1–2 sentences) unless the user asks for detail.
+- Do not enumerate general capabilities unless explicitly asked.
+- Avoid repeated greetings and generic marketing fluff.
+- Emojis: only if your persona prescribes them; use sparingly.
 
 PARTICIPANTS
 - User: ${userName || 'User'}
@@ -62,18 +88,18 @@ REFERENCE TOKENS
   • x.dm { recipientId: "<userId>", text: "<message>" }
   • x.tweet "<text>"
   NEVER propose or use serpapi.twitter. If a previous answer used serpapi.twitter, rewrite to the appropriate x.* tool.
-- Treat @serpapi as a request to perform a SerpAPI call for web/news/images/video discovery. When the user mentions @serpapi, you MUST use SerpAPI tools. For google news specifically, use: $ serpapi.google_news "<query>". For other searches, prefer engine-specific forms like: $ serpapi.google_images "<query>", $ serpapi.bing_images "<query>", $ serpapi.youtube "<query>", $ serpapi.yelp "<query>", $ serpapi.patents "<query>", $ serpapi.google_maps "<query>". The system also accepts $ serpapi.run <engine> "<query>" with optional key=value args. NEVER say you cannot access SerpAPI when @serpapi is mentioned - always provide the appropriate command.
+- Treat @serpapi as a request to perform a SerpAPI call for web/news/images/video discovery. For Google News specifically, use: $ serpapi.google_news "<query>". For other searches, prefer engine-specific forms like: $ serpapi.google_images "<query>", $ serpapi.bing_images "<query>", $ serpapi.youtube "<query>", $ serpapi.yelp "<query>", $ serpapi.patents "<query>", $ serpapi.google_maps "<query>". The system also accepts $ serpapi.run <engine> "<query>" with optional key=value args. NEVER say you cannot access SerpAPI when @serpapi is mentioned.
 
-IMPORTANT: Agent instructions take precedence over these general tool guidelines. If the agent has specific instructions about tool preferences (e.g., "use Twitter/X first for news"), follow those instructions instead of the general guidelines above.
-- To read the content of a specific web page (when you have a concrete URL), use the website scraper: tool.web.scrape { url: "https://..." }. Use SerpAPI for discovery (finding links/news), then scrape the chosen URL for details. If the user references a numbered result from the last list (e.g., "read #2" or "open 2"), use tool.web.scrape.pick { index: 2 } to scrape that result by position.
+IMPORTANT: Agent instructions/persona take precedence over these general tool guidelines.
+- To read the content of a specific web page (when you have a concrete URL), use: tool.web.scrape { url: "https://..." }.
+- If the user references a numbered result from the last list (e.g., "read #2"), use tool.web.scrape.pick { index: 2 }.
 - Treat @elevenlabs as a request to synthesize speech. Propose the tool call in one line: elevenlabs.tts "<text>" voice=<voiceId> format=mp3 (voice optional).
-- Finance tools are available when needed (no default preference). When the user asks for quotes or finance news, use:
-  • finance.getQuote { symbol: "NVDA" }
-  • finance.getNews { symbol: "NVDA", max: 5 }
-  Prefer canonical tools over raw engine strings across all domains. Do not invent engine names. If given a company name, map to a ticker when possible (e.g., NVIDIA → NVDA).
+- Finance tools are available when needed. For quotes/news, use finance.getQuote / finance.getNews.
+- Prefer canonical tools over raw engine strings across all domains.
+
 - When proposing a terminal command, produce exactly one suggestion line in the format:
   Should I run: $ <command>
-  where <command> contains no backticks or extra prose. Do not append explanations on the same line.
+  where <command> contains no backticks or extra prose.
 
 ${autoExecuteTools 
   ? `TERMINAL EXECUTION POLICY
@@ -92,7 +118,22 @@ SAFETY
 
 ENVIRONMENT
 - Current working directory: /tmp/superagent-sandbox/agent-${options.connectionId}
-${personaBlock}${memoryContext}`;
+
+${memoryContext}`;
+
+  // Inject TOOL PREFERENCES if provided (data-driven)
+  if (toolPreferences && Array.isArray(toolPreferences) && toolPreferences.length) {
+    const lines: string[] = [];
+    lines.push('\nTOOL PREFERENCES');
+    for (const pref of toolPreferences) {
+      const caps = (pref.capability || []).join(', ');
+      const prefers = (pref.prefer || []).join(', ');
+      const appr = pref.approval || 'ask';
+      lines.push(`- Capability [${caps}]: prefer ${prefers || '(none)'} (approval: ${appr})`);
+    }
+    prompt = `${prompt}\n${lines.join('\n')}`;
+  }
+  return prompt;
 }
 
 export function buildMessagesFromShortTerm(shortTerm: any[]): Array<{ role: 'user'|'assistant'|'system'; content: string }> {

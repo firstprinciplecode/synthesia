@@ -8,7 +8,10 @@ import {
   ErrorCodes,
   MessageCreateRequest,
   MessageDeltaNotification,
-  RunStatusNotification
+  RunStatusNotification,
+  TypingStartRequest,
+  TypingStopRequest,
+  RoomTypingNotification
 } from '../types/protocol.js';
 import { LLMRouter, ModelConfigs, SupportedModel } from '../llm/providers.js';
 import { ParticipationRouter } from './participation-router.js';
@@ -31,6 +34,9 @@ import { handleXSearch, handleXLists, handleXListTweets, handleXTweet, handleXDm
 import { handleSerpSearch, handleSerpImages, handleSerpRun } from '../handlers/tools/serpapi.js';
 import { AgentOrchestrator } from '../agents/agent-orchestrator.js';
 import { buildUserProfileContext } from '../agents/context-builder.js';
+import { setLastLinks, getLastLinks } from './link-cache.js';
+import { createResults, getResults, getLatestResultId } from './results-registry.js';
+import { codeSearch } from '../tools/code-search.js';
 
 export class WebSocketServer {
   private llmRouter: LLMRouter;
@@ -38,6 +44,7 @@ export class WebSocketServer {
   private rooms: Map<string, Set<string>> = new Map();
   private connectionUserId: Map<string, string> = new Map();
   private lastLinks: Map<string, string[]> = new Map();
+  private roomLastLinks: Map<string, string[]> = new Map();
   private toolRegistry: ToolRegistry = new ToolRegistry();
   private toolRunner: ToolRunner;
   // Track invited agents per room (roomId -> Set<agentId>)
@@ -47,6 +54,8 @@ export class WebSocketServer {
   private roomSpeaking: Set<string> = new Set();
   private roomQueue: Map<string, string[]> = new Map();
   private roomCooldownUntil: Map<string, Map<string, number>> = new Map();
+  private roomTyping: Map<string, Map<string, number>> = new Map(); // roomId -> actorId -> expiresAtMs
+  private roomReceipts: Map<string, Map<string, Set<string>>> = new Map(); // roomId -> messageId -> Set<actorId>
   private bus: WebSocketBus;
   private roomsRegistry: RoomRegistry;
   private orchestrator: AgentOrchestrator;
@@ -75,8 +84,49 @@ export class WebSocketServer {
       functions: {
         run: {
           name: 'run',
+          description: 'Run a SerpAPI engine (e.g., google_news, images, finance)',
+          tags: ['search','news','web','images'],
+          synonyms: ['news.search','web.search','image.search'],
           execute: async (args, ctx) => {
             return await serpapiService.run(String(args.engine || ''), String(args.query || ''), args.extra || undefined)
+          },
+        },
+      },
+    }));
+    this.toolRegistry.register(new Tool({
+      name: 'code',
+      functions: {
+        search: {
+          name: 'search',
+          description: 'Search codebase for a pattern (ripgrep fallback to grep)',
+          tags: ['code','search','grep'],
+          approval: 'ask',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              pattern: { type: 'string' },
+              path: { type: 'string' },
+              glob: { type: 'string' },
+              maxResults: { type: 'number' },
+              caseInsensitive: { type: 'boolean' },
+              regex: { type: 'boolean' },
+            },
+            required: ['pattern']
+          },
+          execute: async (args, ctx) => {
+            const out = await codeSearch({
+              pattern: String(args.pattern || ''),
+              path: args.path ? String(args.path) : undefined,
+              glob: args.glob ? String(args.glob) : undefined,
+              maxResults: args.maxResults ? Number(args.maxResults) : undefined,
+              caseInsensitive: !!args.caseInsensitive,
+              regex: !!args.regex,
+            })
+            const header = `Code search for "${args.pattern}": ${out.results.length} hit(s) using ${out.used}`
+            const md = [header]
+              .concat(out.results.slice(0, 50).map(r => `- ${r.file}:${r.line} — ${r.text}`))
+              .join('\n')
+            return { ok: true, results: out.results, markdown: md }
           },
         },
       },
@@ -86,6 +136,10 @@ export class WebSocketServer {
       functions: {
         tweet: {
           name: 'tweet',
+          description: 'Post a tweet (side-effectful)',
+          tags: ['post','x','publish'],
+          sideEffects: true,
+          approval: 'ask',
           execute: async (args, ctx) => {
             const text = String(args.text || '').trim();
             if (!text) throw new Error('text is required');
@@ -95,6 +149,10 @@ export class WebSocketServer {
         },
         dm: {
           name: 'dm',
+          description: 'Send a direct message on X (side-effectful)',
+          tags: ['dm','x','message'],
+          sideEffects: true,
+          approval: 'ask',
           execute: async (args, ctx) => {
             const to = String(args.recipientId || '').trim();
             const text = String(args.text || '').trim();
@@ -105,6 +163,9 @@ export class WebSocketServer {
         },
         search: {
           name: 'search',
+          description: 'Search recent tweets for a query',
+          tags: ['search','x','social'],
+          synonyms: ['x.search','twitter search'],
           execute: async (args, ctx) => {
             const q = String(args.query || '').trim();
             const max = Number(args.max || 10);
@@ -115,6 +176,8 @@ export class WebSocketServer {
         },
         lists: {
           name: 'lists',
+          description: 'List owned Twitter lists for a handle or current user',
+          tags: ['x','lists'],
           execute: async (args, ctx) => {
             const userId = this.connectionUserId.get(ctx.connectionId) || 'default-user';
             const handle = String(args.username || '').trim();
@@ -126,6 +189,8 @@ export class WebSocketServer {
         },
         listTweets: {
           name: 'listTweets',
+          description: 'Fetch tweets from a list',
+          tags: ['x','lists','search'],
           execute: async (args, ctx) => {
             const listId = String(args.listId || '').trim();
             const max = Number(args.max || 20);
@@ -180,10 +245,47 @@ export class WebSocketServer {
     });
   }
 
+  private async canonicalizeUserId(userId: string): Promise<string> {
+    try {
+      const uid = String(userId || '').trim();
+      if (uid.includes('@')) {
+        const rows = await db.select().from(users).where(eq(users.email as any, uid as any));
+        if (rows.length && rows[0]?.id) return String(rows[0].id);
+      }
+      return uid;
+    } catch {
+      return userId;
+    }
+  }
+
+  private async resolvePrimaryUserActorId(userId: string): Promise<string> {
+    try {
+      const canonical = await this.canonicalizeUserId(userId);
+      const rows = await db.select().from(DBSchema.actors).where(eq(DBSchema.actors.ownerUserId as any, canonical as any));
+      const users = (rows as any[]).filter(a => a.type === 'user');
+      const sorted = users.sort((x: any, y: any) => new Date(y.updatedAt || y.createdAt || 0).getTime() - new Date(x.updatedAt || x.createdAt || 0).getTime());
+      if (sorted.length) return sorted[0].id as string;
+    } catch {}
+    return userId;
+  }
+
   register(fastify: FastifyInstance) {
     const self = this;
     fastify.register(async function (fastify: any) {
-      fastify.get('/ws', { websocket: true }, self.handleConnection.bind(self));
+      fastify.get('/ws', { websocket: true }, (connection: any, request: any) => {
+        try {
+          // Try to parse NextAuth session from cookie header (JWT strategy)
+          const cookie = String(request.headers['cookie'] || '');
+          const m = cookie.match(/next-auth\.session-token=([^;]+)/) || cookie.match(/__Secure-next-auth\.session-token=([^;]+)/);
+          if (m) {
+            // We don't verify JWT signature here; for dev map token presence to a user hint
+            const hinted = (request.headers['x-user-id'] as string) || 'default-user';
+            const cid = (connection as any).socket ? (connection as any).socket : connection;
+            // assign after connection established in handleConnection via a side-channel
+          }
+        } catch {}
+        self.handleConnection(connection, request);
+      });
     });
   }
 
@@ -228,6 +330,12 @@ export class WebSocketServer {
       
       // Route to appropriate handler
       switch (request.method) {
+        case 'typing.start':
+          await this.handleTypingStart(connectionId, request as TypingStartRequest);
+          break;
+        case 'typing.stop':
+          await this.handleTypingStop(connectionId, request as TypingStopRequest);
+          break;
         case 'message.create':
           await this.handleMessageCreate(connectionId, request as MessageCreateRequest);
           break;
@@ -278,6 +386,9 @@ export class WebSocketServer {
         case 'tool.web.scrape.pick':
           await this.handleWebScrapePick(connectionId, request);
           break;
+        case 'message.read':
+          await this.handleMessageRead(connectionId, request);
+          break;
         case 'tool.x.tweet':
           await handleXTweet(this.buildXCtx(), connectionId, request);
           break;
@@ -293,6 +404,9 @@ export class WebSocketServer {
         case 'tool.x.listTweets':
           await handleXListTweets(this.buildXCtx(), connectionId, request);
           break;
+        case 'tool.code.search':
+          await this.handleCodeSearch(connectionId, request);
+          break;
           
         default:
           this.bus.sendError(connectionId, request.id, ErrorCodes.METHOD_NOT_FOUND, `Method not found: ${request.method}`);
@@ -305,6 +419,16 @@ export class WebSocketServer {
 
   // Lightweight helper to decide which invited agents should speak next based on content and mentions
   private async routeParticipation(roomId: string, text: string): Promise<string[]> {
+    // Do not invite agents in direct messages between users
+    try {
+      const r = await db.select().from(DBSchema.rooms).where(eq(DBSchema.rooms.id as any, roomId as any));
+      if (r.length && String((r[0] as any).kind) === 'dm') {
+        console.log(`[routeParticipation] Room ${roomId} is a DM; suppressing agent participation.`);
+        return [];
+      }
+    } catch (e) {
+      console.warn('[routeParticipation] Failed to read room kind, continuing with default behavior');
+    }
     // Eligible agents come from DB conversation participants; fallback to legacy invited set
     let eligible: string[] = [];
     try {
@@ -325,6 +449,33 @@ export class WebSocketServer {
     } catch (e) {
       console.error(`[routeParticipation] Error fetching conversation:`, e);
     }
+    // Fallback to Social Core room members → actors → agents mapping
+    if (eligible.length === 0) {
+      try {
+        const members = await db.select().from(DBSchema.roomMembers).where(eq(DBSchema.roomMembers.roomId as any, roomId as any));
+        const candidateAgentIds: string[] = [];
+        for (const m of members as any[]) {
+          try {
+            const aRows = await db.select().from(DBSchema.actors).where(eq(DBSchema.actors.id as any, m.actorId as any));
+            if (!aRows.length) continue;
+            const act: any = aRows[0];
+            if (String(act.type) !== 'agent') continue;
+            const settings = (act.settings || {}) as any;
+            const mappedAgentId = settings?.agentId;
+            if (mappedAgentId && typeof mappedAgentId === 'string') {
+              candidateAgentIds.push(mappedAgentId);
+            }
+          } catch {}
+        }
+        eligible = Array.from(new Set(candidateAgentIds));
+        if (eligible.length) {
+          console.log(`[routeParticipation] Eligible agents from Social Core members:`, eligible);
+        }
+      } catch (e) {
+        console.error(`[routeParticipation] Error fetching Social Core room members:`, e);
+      }
+    }
+    // Legacy invited set fallback
     if (eligible.length === 0) {
       eligible = Array.from(this.roomAgents.get(roomId) || []);
     }
@@ -337,7 +488,10 @@ export class WebSocketServer {
         if (rows.length) {
           const agentName = String(rows[0].name || '').toLowerCase();
           agentIdByName.set(agentName, aid);
-          console.log(`[routeParticipation] Agent mapping: "${agentName}" -> ${aid}`);
+          // Also add condensed slug (no spaces) for @handle-style mentions
+          const slug = agentName.replace(/\s+/g, '');
+          if (slug && slug !== agentName) agentIdByName.set(slug, aid);
+          console.log(`[routeParticipation] Agent mapping: "${agentName}" (slug: ${slug}) -> ${aid}`);
         }
       }
     } catch {}
@@ -418,6 +572,21 @@ export class WebSocketServer {
         },
       });
 
+      // Persist terminal result to message history
+      try {
+        await db.insert(DBSchema.messages as any).values({
+          id: randomUUID(),
+          conversationId: (roomId || 'default-room') as any,
+          authorId: String(agentId || roomId || 'agent'),
+          authorType: 'agent',
+          role: 'terminal',
+          content: [{ type: 'text', text: `$ ${result.command}\n${result.stdout}${result.stderr ? '\n' + result.stderr : ''}` }] as any,
+          status: 'completed',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        } as any);
+      } catch {}
+
       // Send response to requester
       this.bus.sendResponse(connectionId, request.id, {
         command: result.command,
@@ -488,6 +657,21 @@ export class WebSocketServer {
           timestamp: new Date().toISOString(),
         },
       });
+
+      // Persist terminal output as a terminal message in history
+      try {
+        await db.insert(DBSchema.messages as any).values({
+          id: randomUUID(),
+          conversationId: (roomId || 'default-room') as any,
+          authorId: String(roomId || 'agent'),
+          authorType: 'agent',
+          role: 'terminal',
+          content: [{ type: 'text', text: `$ ${result.command}\n${result.stdout}${result.stderr ? '\n' + result.stderr : ''}` }] as any,
+          status: 'completed',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        } as any);
+      } catch {}
 
       // Send response to requester
       this.bus.sendResponse(connectionId, request.id, {
@@ -573,6 +757,35 @@ export class WebSocketServer {
         return;
       }
 
+      // Resolve active user and primary actor id (for author identity)
+      const DEFAULT_USER_ID = 'default-user';
+      const rawActiveUserId = this.connectionUserId.get(connectionId) || DEFAULT_USER_ID;
+      const activeUserId = await this.canonicalizeUserId(rawActiveUserId);
+      const myActorId = await this.resolvePrimaryUserActorId(activeUserId);
+
+      // Check if this room is a DM; if so, no agents or system fallback should speak
+      let isDmRoom = false;
+      try {
+        const r = await db.select().from(DBSchema.rooms).where(eq(DBSchema.rooms.id as any, roomId as any));
+        isDmRoom = !!(r.length && String((r[0] as any).kind) === 'dm');
+      } catch {}
+
+      // Resolve friendly author identity (name/avatar) for immediate client rendering
+      let authorName: string | undefined = undefined;
+      let authorAvatar: string | undefined = undefined;
+      try {
+        const aRows = await db.select().from(DBSchema.actors).where(eq(DBSchema.actors.id as any, myActorId as any));
+        const act: any = aRows[0];
+        if (act && (act.ownerUserId || activeUserId)) {
+          const ownerId = act.ownerUserId || activeUserId;
+          const uRows = await db.select().from(users).where(eq(users.id, ownerId));
+          if (uRows.length) {
+            authorName = uRows[0].name || uRows[0].email || undefined;
+            authorAvatar = uRows[0].avatar || undefined;
+          }
+        }
+      } catch {}
+
       // Echo the user message to the room
       this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
@@ -580,11 +793,58 @@ export class WebSocketServer {
         params: {
           roomId,
           messageId: randomUUID(),
-          authorId: connectionId,
+          authorId: myActorId,
           authorType: 'user',
+          authorUserId: activeUserId,
+          authorName,
+          authorAvatar,
           message,
         },
       });
+
+      // Persist user message to DB
+      try {
+        await db.insert(DBSchema.messages as any).values({
+          id: randomUUID(),
+          conversationId: roomId,
+          authorId: String(myActorId),
+          authorType: 'user',
+          role: 'user',
+          content: Array.isArray(message?.content) ? (message.content as any) : [{ type: 'text', text: String(message || '') }] as any,
+          status: 'completed',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        } as any);
+      } catch {}
+
+      // For DM rooms, do not trigger agent routing or system fallback; store only the user message and return
+      if (isDmRoom) {
+        try {
+          const userMessage = message.content.map((p: any) => p.text).join('');
+          const msgId = randomUUID();
+          const mem = {
+            id: msgId,
+            role: 'user' as const,
+            content: userMessage,
+            timestamp: new Date(),
+            conversationId: roomId,
+            agentId: roomId as any,
+            metadata: { userId: activeUserId },
+          };
+          memoryService.addToShortTerm(roomId, mem);
+          await memoryService.addToLongTerm(userMessage, ({
+            agentId: roomId as any,
+            conversationId: roomId,
+            messageId: msgId,
+            role: 'user',
+            timestamp: new Date().toISOString(),
+            messageType: 'conversation',
+            userId: activeUserId,
+          } as any));
+        } catch {}
+        if ((request as any).id) this.bus.sendResponse(connectionId, (request as any).id, { ok: true });
+        return;
+      }
 
       // Start agent run
       const runId = randomUUID();
@@ -625,8 +885,7 @@ export class WebSocketServer {
 
       // Get agent profile and preferences for context
       // Load user profile for the active connection
-      const DEFAULT_USER_ID = 'default-user';
-      const activeUserId = this.connectionUserId.get(connectionId) || DEFAULT_USER_ID;
+      // activeUserId already resolved above
       let userProfile = null;
       try {
         const userRows = await db.select().from(users).where(eq(users.id, activeUserId));
@@ -637,13 +896,12 @@ export class WebSocketServer {
         console.error('Error loading user profile:', error);
       }
 
-      const shortTermMemory = memoryService.getShortTerm(activeUserId);
+      // Short-term memory per agent/room
+      const shortTermMemory = memoryService.getShortTerm(roomId);
       
       // Get relevant long-term memory
       const userMessage = message.content.map(part => part.text).join('');
-      const relevantMemories = await (activeUserId
-        ? memoryService.searchLongTermByUser(activeUserId, userMessage, 3, { agentId: roomId as any, roomId: roomId as any })
-        : memoryService.searchLongTerm(connectionId, userMessage, 3));
+      const relevantMemories = await memoryService.searchLongTerm(roomId, userMessage, 3, 'conversation');
       
       // Build context from user profile and memories
       let memoryContext = '';
@@ -655,33 +913,53 @@ export class WebSocketServer {
         });
       }
 
-      // Resolve agent persona and settings by roomId (treat roomId as agentId)
+      // Resolve agent persona and settings; support legacy agentId rooms and agent_chat rooms
       let agentName = '';
       let agentPersona = '';
       let autoExecuteTools = false;
       let isAgentRoom = false;
+      let primaryAgentId: string | null = null;
       try {
         const { db, agents } = await import('../db/index.js');
         const { eq } = await import('drizzle-orm');
+        // Legacy: roomId is agentId
         const rows = await db.select().from(agents).where(eq(agents.id, roomId as any));
         if (rows.length > 0) {
-          isAgentRoom = true;
-          const a: any = rows[0];
-          agentName = a.name || '';
-          autoExecuteTools = a.autoExecuteTools || false;
-          const instr: string = a.instructions || '';
-          const desc = a.description ? `Description: ${a.description}` : '';
-          // Extract Personality and Extra instructions blocks if present
-          const personalityMatch = instr.match(/Personality:\s*([\s\S]*?)(?:\n\n|$)/);
-          const extraMatch = instr.match(/Extra instructions:\s*([\s\S]*)$/);
-          const personality = personalityMatch ? personalityMatch[1].trim() : '';
-          const extra = extraMatch ? extraMatch[1].trim() : '';
-          agentPersona = [
-            agentName ? `Agent Name: ${agentName}` : '',
-            desc,
-            personality ? `Personality: ${personality}` : '',
-            extra ? `Extra instructions: ${extra}` : '',
-          ].filter(Boolean).join('\n');
+          primaryAgentId = String(roomId);
+        } else {
+          // agent_chat: find agent actor in members and map to agentId via settings.agentId
+          try {
+            const { rooms, roomMembers, actors } = await import('../db/index.js');
+            const rr = await db.select().from(rooms).where(eq(rooms.id as any, roomId as any));
+            if (rr.length && String((rr[0] as any).kind) === 'agent_chat') {
+              const m = await db.select().from(roomMembers).where(eq(roomMembers.roomId as any, roomId as any));
+              const actorIds = (m as any[]).map(x => x.actorId);
+              const aRows = await db.select().from(actors);
+              const agentActor = (aRows as any[]).find(a => a.type === 'agent' && actorIds.includes(a.id) && a?.settings?.agentId);
+              if (agentActor?.settings?.agentId) primaryAgentId = String(agentActor.settings.agentId);
+            }
+          } catch {}
+        }
+        if (primaryAgentId) {
+          const pr = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+          if (pr.length > 0) {
+            isAgentRoom = true;
+            const a: any = pr[0];
+            agentName = a.name || '';
+            autoExecuteTools = a.autoExecuteTools || false;
+            const instr: string = a.instructions || '';
+            const desc = a.description ? `Description: ${a.description}` : '';
+            const personalityMatch = instr.match(/Personality:\s*([\s\S]*?)(?:\n\n|$)/);
+            const extraMatch = instr.match(/Extra instructions:\s*([\s\S]*)$/);
+            const personality = personalityMatch ? personalityMatch[1].trim() : '';
+            const extra = extraMatch ? extraMatch[1].trim() : '';
+            agentPersona = [
+              agentName ? `Agent Name: ${agentName}` : '',
+              desc,
+              personality ? `Personality: ${personality}` : '',
+              extra ? `Extra instructions: ${extra}` : '',
+            ].filter(Boolean).join('\n');
+          }
         }
       } catch {}
 
@@ -805,47 +1083,203 @@ ${personaBlock}${memoryContext}`,
       // For single-agent rooms (isAgentRoom = true), run primary agent logic
       // This prevents double responses when an agent is both the primary agent and in participants
 
-      // Stream LLM response via orchestrator (primary agent = roomId)
+      // Choose execution mode (feature-flag)
+      const useLoop = process.env.AGENT_LOOP === '1';
+      console.log(`[debug] AGENT_LOOP env var: "${process.env.AGENT_LOOP}", useLoop: ${useLoop}`);
       this.roomSpeaking.add(roomId);
-      const { fullResponse } = await this.orchestrator.streamPrimaryAgentResponse({
-        roomId,
-        activeUserId,
-        connectionId,
-        agentRecord: isAgentRoom ? (await db.select().from(agents).where(eq(agents.id as any, roomId as any)))[0] : null,
-        userProfile,
-        userMessage,
-        runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
-        onDelta: (delta: string) => {
-          this.bus.broadcastToRoom(roomId, {
-            jsonrpc: '2.0',
-            method: 'message.delta',
-            params: { roomId, messageId, delta, authorId: roomId, authorType: 'agent' },
-          } as MessageDeltaNotification);
-        },
-      });
-
-      // Send completion notification
-      this.bus.broadcastToRoom(roomId, {
-        jsonrpc: '2.0',
-        method: 'message.complete',
-        params: {
-          runId,
-          messageId,
-          finalMessage: {
-            role: 'assistant',
-            content: [{ type: 'text', text: fullResponse }],
+      let responseText = '';
+      if (useLoop) {
+        const agentRecord = isAgentRoom && primaryAgentId ? (await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any)))[0] : null;
+        const { finalText, pendingApproval } = await this.orchestrator.runTask({
+          roomId,
+          activeUserId,
+          connectionId,
+          agentRecord,
+          userProfile,
+          userMessage,
+          runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
+          executeTool: async (call) => {
+            const fn = call.func || 'run';
+            // Special-case: web.scrape.pick is an RPC handler, not a ToolRunner function
+            if (call.name === 'web' && fn === 'scrape.pick') {
+              const pickIndex = Number(call.args?.index || 0);
+              const rid = String(call.args?.resultId || '');
+              if (!pickIndex || pickIndex < 1) throw new Error('index must be >= 1');
+              let url: string | undefined;
+              if (rid) {
+                const stored = getResults(rid);
+                const itemsLen = stored?.items?.length || 0;
+                console.log('[pick.executeTool] room=%s resultId=%s items=%d index=%d', roomId, rid, itemsLen, pickIndex);
+                if (!stored || stored.roomId !== roomId) throw new Error('Invalid or expired resultId for this room');
+                url = stored.items.find(i => i.index === pickIndex)?.url;
+              } else {
+                const links = (this.lastLinks.get(connectionId) || this.roomLastLinks.get(roomId) || getLastLinks(connectionId) || []);
+                console.log('[pick.executeTool] room=%s resultId=<none> links=%d index=%d', roomId, links.length, pickIndex);
+                url = links[pickIndex - 1];
+              }
+              if (!url) throw new Error(`No URL for index ${pickIndex}`);
+              const trRunId = randomUUID();
+              const toolCallId = randomUUID();
+              this.bus.broadcastToolCall(roomId, trRunId, toolCallId, 'web', 'scrape.pick', { index: pickIndex });
+              const result = await webScraperService.scrape(url);
+              this.bus.broadcastToolResult(roomId, trRunId, toolCallId, { ok: true });
+              return { ok: true, result, pickedIndex: pickIndex };
+            }
+            const { runId: trRunId, toolCallId, result } = await this.toolRunner.run(call.name, fn, call.args || {}, { roomId, userId: activeUserId } as any);
+            // Mirror via bus for UI
+            this.bus.broadcastToolCall(roomId, trRunId, toolCallId, call.name, fn, call.args || {});
+            this.bus.broadcastToolResult(roomId, trRunId, toolCallId, result);
+            try {
+              if (call.name === 'serpapi' && fn === 'run' && result) {
+                const raw = (result as any).raw || {};
+                let links: string[] = [];
+                if (Array.isArray(raw.news_results) && raw.news_results.length) {
+                  links = raw.news_results.map((n: any) => n.link).filter((u: any) => typeof u === 'string');
+                } else if (Array.isArray(raw.organic_results) && raw.organic_results.length) {
+                  links = raw.organic_results.map((r: any) => r.link).filter((u: any) => typeof u === 'string');
+                }
+                if (links.length) {
+                  this.lastLinks.set(connectionId, links);
+                  this.roomLastLinks.set(roomId, links);
+                  setLastLinks(connectionId, links);
+                  // Create stable results and broadcast to clients
+                  const items = links.slice(0, 10).map((url, i) => ({ index: i + 1, url }));
+                  const rid = createResults(roomId, items);
+                  this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'search.results', params: { roomId, resultId: rid, items } });
+                } else {
+                  // Fallback: parse markdown for [View](...)
+                  try {
+                    const md = String((result as any).markdown || '');
+                    const mdLinks: string[] = [];
+                    const re = /\[View\]\((https?:\/\/[^\s)]+)\)/g;
+                    let m: RegExpExecArray | null;
+                    while ((m = re.exec(md)) !== null) { mdLinks.push(m[1]); }
+                    if (mdLinks.length) {
+                      this.lastLinks.set(connectionId, mdLinks);
+                      this.roomLastLinks.set(roomId, mdLinks);
+                      setLastLinks(connectionId, mdLinks);
+                      const items = mdLinks.slice(0, 10).map((url, i) => ({ index: i + 1, url }));
+                      const rid = createResults(roomId, items);
+                      this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'search.results', params: { roomId, resultId: rid, items } });
+                    }
+                  } catch {}
+                }
+              }
+            } catch {}
+            return result;
           },
-          authorId: roomId,
-          authorType: 'agent',
-        },
-      });
+          onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: (primaryAgentId || roomId), authorType: 'agent' } }),
+          onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' } } as MessageDeltaNotification),
+          getCatalog: () => this.toolRegistry.catalog(),
+          getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
+        });
+        responseText = finalText;
+        
+        // If we have pending approval and user said yes, continue the loop
+        if (pendingApproval && /^(yes|y|ok|okay|sure|go ahead|do it|run it|execute)$/i.test(userMessage.trim())) {
+          const { finalText: approvedText } = await this.orchestrator.runTask({
+            roomId,
+            activeUserId,
+            connectionId,
+            agentRecord,
+            userProfile,
+            userMessage: `User approved the ${pendingApproval.tool} request for "${pendingApproval.hint}"`,
+            runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
+            executeTool: async (call) => {
+              const fn = call.func || 'run';
+              if (call.name === 'web' && fn === 'scrape.pick') {
+                const pickIndex = Number(call.args?.index || 0);
+                const rid = String(call.args?.resultId || '');
+                if (!pickIndex || pickIndex < 1) throw new Error('index must be >= 1');
+                let url: string | undefined;
+                if (rid) {
+                  const stored = getResults(rid);
+                  const itemsLen = stored?.items?.length || 0;
+                  console.log('[pick.executeTool.approved] room=%s resultId=%s items=%d index=%d', roomId, rid, itemsLen, pickIndex);
+                  if (!stored || stored.roomId !== roomId) throw new Error('Invalid or expired resultId for this room');
+                  url = stored.items.find(i => i.index === pickIndex)?.url;
+                } else {
+                  const links = (this.lastLinks.get(connectionId) || this.roomLastLinks.get(roomId) || getLastLinks(connectionId) || []);
+                  console.log('[pick.executeTool.approved] room=%s resultId=<none> links=%d index=%d', roomId, links.length, pickIndex);
+                  url = links[pickIndex - 1];
+                }
+                if (!url) throw new Error(`No URL for index ${pickIndex}`);
+                const trRunId = randomUUID();
+                const toolCallId = randomUUID();
+                this.bus.broadcastToolCall(roomId, trRunId, toolCallId, 'web', 'scrape.pick', { index: pickIndex });
+                const result = await webScraperService.scrape(url);
+                this.bus.broadcastToolResult(roomId, trRunId, toolCallId, { ok: true });
+                return { ok: true, result, pickedIndex: pickIndex };
+              }
+              const { runId: trRunId, toolCallId, result } = await this.toolRunner.run(call.name, fn, call.args || {}, { roomId, userId: activeUserId } as any);
+              // Mirror via bus for UI
+              this.bus.broadcastToolCall(roomId, trRunId, toolCallId, call.name, fn, call.args || {});
+              this.bus.broadcastToolResult(roomId, trRunId, toolCallId, result);
+              return result;
+            },
+            onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: (primaryAgentId || roomId), authorType: 'agent' } }),
+            onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' } } as MessageDeltaNotification),
+            getCatalog: () => this.toolRegistry.catalog(),
+            getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
+            pendingApproval,
+          });
+          responseText = approvedText;
+        }
+        
+        this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: responseText }] }, authorId: (primaryAgentId || roomId), authorType: 'agent' } });
+      } else {
+        const { fullResponse } = await this.orchestrator.streamPrimaryAgentResponse({
+          roomId,
+          activeUserId,
+          connectionId,
+          agentRecord: isAgentRoom && primaryAgentId ? (await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any)))[0] : null,
+          userProfile,
+          userMessage,
+          runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
+          onDelta: (delta: string) => {
+            this.bus.broadcastToRoom(roomId, {
+              jsonrpc: '2.0',
+              method: 'message.delta',
+              params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' },
+            } as MessageDeltaNotification);
+          },
+        });
+        responseText = fullResponse;
+        this.bus.broadcastToRoom(roomId, {
+          jsonrpc: '2.0',
+          method: 'message.complete',
+          params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] }, authorId: (primaryAgentId || roomId), authorType: 'agent' },
+        });
+      }
+
+      // Persist assistant final message for primary agent responses (single-agent rooms)
+      try {
+        if (responseText && typeof responseText === 'string') {
+          await db.insert(DBSchema.messages as any).values({
+            id: messageId,
+            conversationId: roomId,
+            authorId: String(primaryAgentId || roomId),
+            authorType: 'agent',
+            role: 'assistant',
+            content: [{ type: 'text', text: responseText }] as any,
+            status: 'completed',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          } as any);
+        }
+      } catch {}
 
       // Primary finished speaking
       this.roomSpeaking.delete(roomId);
 
       // Participation routing (enqueue other invited agents if relevant)
       try {
-        const candidates = await this.routeParticipation(roomId, userMessage);
+        let candidates = await this.routeParticipation(roomId, userMessage);
+        // Prevent the primary agent from being re-enqueued in single-agent rooms
+        // In legacy single-agent rooms, primary agent id == roomId
+        // In agent_chat rooms, primaryAgentId is the real agent id
+        const excludeId = (primaryAgentId || roomId);
+        candidates = candidates.filter(aid => aid !== excludeId);
         // Filter by cooldown and cap
         const now = Date.now();
         const cool = this.roomCooldownUntil.get(roomId) || new Map<string, number>();
@@ -873,7 +1307,7 @@ ${personaBlock}${memoryContext}`,
       const assistantMemoryMessage = {
         id: messageId + '-assistant',
         role: 'assistant' as const,
-        content: fullResponse,
+        content: responseText,
         timestamp: new Date(),
         conversationId: roomId,
         agentId: roomId as any,
@@ -882,7 +1316,7 @@ ${personaBlock}${memoryContext}`,
 
       // Check for auto-executable commands if autoExecuteTools is enabled
       if (autoExecuteTools) {
-        const autoExecutableCommands = this.extractAutoExecutableCommands(fullResponse);
+        const autoExecutableCommands = this.extractAutoExecutableCommands(responseText);
         for (const command of autoExecutableCommands) {
           try {
             console.log(`[auto-execute] Running command: ${command}`);
@@ -901,15 +1335,29 @@ ${personaBlock}${memoryContext}`,
                 timestamp: new Date().toISOString(),
               },
             });
+          // Persist auto-executed terminal output
+          try {
+            await db.insert(DBSchema.messages as any).values({
+              id: randomUUID(),
+              conversationId: roomId as any,
+              authorId: String(primaryAgentId || roomId),
+              authorType: 'agent',
+              role: 'terminal',
+              content: [{ type: 'text', text: `$ ${result.command}\n${result.stdout}${result.stderr ? '\n' + result.stderr : ''}` }] as any,
+              status: 'completed',
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            } as any);
+          } catch {}
           } catch (error) {
             console.error(`[auto-execute] Error executing command "${command}":`, error);
           }
         }
       }
 
-      // Add to short-term memory
-      memoryService.addToShortTerm(activeUserId, userMemoryMessage);
-      memoryService.addToShortTerm(activeUserId, assistantMemoryMessage);
+      // Add to short-term memory (scope by agent/room to avoid cross-agent leakage)
+      memoryService.addToShortTerm(roomId, userMemoryMessage);
+      memoryService.addToShortTerm(roomId, assistantMemoryMessage);
 
       // Add to long-term memory
       await memoryService.addToLongTerm(userMessage, ({
@@ -922,7 +1370,7 @@ ${personaBlock}${memoryContext}`,
         userId: activeUserId,
       } as any));
 
-      await memoryService.addToLongTerm(fullResponse, ({
+      await memoryService.addToLongTerm(responseText, ({
         agentId: roomId as any,
         conversationId: roomId,
         messageId: messageId + '-assistant',
@@ -932,9 +1380,9 @@ ${personaBlock}${memoryContext}`,
         userId: activeUserId,
       } as any));
 
-      // Check if we should perform reflection
-      if (await memoryService.shouldReflect(activeUserId)) {
-        await memoryService.performReflection(activeUserId);
+      // Check if we should perform reflection (per agent)
+      if (await memoryService.shouldReflect(roomId)) {
+        await memoryService.performReflection(roomId);
       }
 
       // Send run completed notification
@@ -1147,16 +1595,44 @@ ${personaBlock}${memoryContext}`,
       const runId = randomUUID();
       const toolCallId = randomUUID();
       this.bus.broadcastToolCall(roomId, runId, toolCallId, 'serpapi', 'run', { engine: engineUse, query, extra: params.extra });
-      // Capture last links if present (news or organic)
+      // Capture last links deterministically
       try {
-        const raw = (result as any).raw || {};
-        let links: string[] = [];
-        if (Array.isArray(raw.news_results) && raw.news_results.length) {
-          links = raw.news_results.map((n: any) => n.link).filter((u: any) => typeof u === 'string');
-        } else if (Array.isArray(raw.organic_results) && raw.organic_results.length) {
-          links = raw.organic_results.map((r: any) => r.link).filter((u: any) => typeof u === 'string');
+        let urls: string[] = [];
+        // Prefer structured items from the service
+        const itemsFromService = Array.isArray((result as any).items) ? (result as any).items : [];
+        if (itemsFromService.length) {
+          urls = itemsFromService.map((it: any) => it.link || it.url).filter((u: any) => typeof u === 'string');
         }
-        if (links.length) this.lastLinks.set(connectionId, links);
+        // Next, raw news/organic
+        if (!urls.length) {
+          const raw = (result as any).raw || {};
+          if (Array.isArray(raw.news_results) && raw.news_results.length) {
+            urls = raw.news_results.map((n: any) => n.link).filter((u: any) => typeof u === 'string');
+          } else if (Array.isArray(raw.organic_results) && raw.organic_results.length) {
+            urls = raw.organic_results.map((r: any) => r.link).filter((u: any) => typeof u === 'string');
+          }
+        }
+        // Finally, parse markdown for [View](url)
+        if (!urls.length) {
+          try {
+            const md = String((result as any).markdown || '');
+            const mdLinks: string[] = [];
+            const re = /\[View\]\((https?:\/\/[^\s)]+)\)/g;
+            let m: RegExpExecArray | null;
+            while ((m = re.exec(md)) !== null) { mdLinks.push(m[1]); }
+            urls = mdLinks;
+          } catch {}
+        }
+        console.log('[serpapi.run:url-derive] urls=', urls.length);
+        if (urls.length) {
+          this.lastLinks.set(connectionId, urls);
+          this.roomLastLinks.set(roomId, urls);
+          setLastLinks(connectionId, urls);
+          const items = urls.slice(0, 10).map((url, i) => ({ index: i + 1, url }));
+          const rid = createResults(roomId, items);
+          console.log('[serpapi.run:search.results] room=%s items=%d resultId=%s', roomId, items.length, rid);
+          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'search.results', params: { roomId, resultId: rid, items } });
+        }
       } catch {}
       this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
@@ -1202,13 +1678,25 @@ ${personaBlock}${memoryContext}`,
 
   private async handleWebScrapePick(connectionId: string, request: JSONRPCRequest) {
     try {
-      const { index } = (request.params || {}) as { index?: number };
+      const { index, resultId } = (request.params || {}) as { index?: number; resultId?: string };
       if (!index || index < 1) {
         this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'index must be >= 1');
         return;
       }
-      const links = this.lastLinks.get(connectionId) || [];
-      const url = links[index - 1];
+      const roomId = this.getRoomForConnection(connectionId) || 'default-room';
+      let url: string | undefined;
+      if (resultId) {
+        const stored = getResults(resultId);
+        if (!stored || stored.roomId !== roomId) {
+          this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'Invalid or expired resultId for this room');
+          return;
+        }
+        url = stored.items.find(i => i.index === index)?.url;
+      } else {
+        // Fallback to last links if no resultId given
+        const links = (this.lastLinks.get(connectionId) || this.roomLastLinks.get(roomId) || getLastLinks(connectionId) || []);
+        url = links[index - 1];
+      }
       if (!url) {
         this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, `No URL for index ${index}`);
         return;
@@ -1217,7 +1705,7 @@ ${personaBlock}${memoryContext}`,
       const toolCallId = randomUUID();
       console.log('[web.scrape.pick] index=', index, 'url=', url);
       const result = await webScraperService.scrape(url);
-      const roomId = this.getRoomForConnection(connectionId) || 'default-room';
+      
       const preview = (result.text || '').replace(/\s+/g, ' ').trim();
       const summary = `${result.title ? `**${result.title}**\n\n` : ''}- URL: ${result.url}\n- Links: ${result.links?.length || 0}, Images: ${result.images?.length || 0}\n\n${preview.slice(0, 800)}`;
       console.log('[web.scrape.pick] text.length=', (result.text || '').length, 'preview.sample=', preview.slice(0, 120));
@@ -1403,8 +1891,22 @@ ${personaBlock}${memoryContext}`,
   
 
   private async handleRoomJoin(connectionId: string, request: JSONRPCRequest) {
-    const { roomId, userId } = request.params as { roomId: string; userId?: string };
-    
+    const { roomId } = request.params as { roomId: string; userId?: string };
+    // Derive userId from request params, then headers fallback
+    let userId: string | undefined = (request.params as any)?.userId;
+    try {
+      // @ts-ignore internal
+      const conn: any = this.connections.get(connectionId);
+      const req: any = (conn && conn.req) || null;
+      // In Fastify WS, original HTTP request is on connection.request
+      const hdrs = (req && req.headers) || (conn && conn.request && conn.request.headers) || {};
+      const hinted = String(hdrs['x-user-id'] || '').trim();
+      if (!userId && hinted) userId = hinted;
+    } catch {}
+    // Canonicalize to UUID for stable identity mapping
+    if (userId) {
+      try { userId = await this.canonicalizeUserId(userId) } catch {}
+    }
     this.roomsRegistry.addConnection(roomId, connectionId, userId);
     
     this.bus.sendResponse(connectionId, request.id, { 
@@ -1660,6 +2162,99 @@ ${personaBlock}${memoryContext}`,
     }
   }
 
+  private pruneTyping(roomId: string) {
+    const now = Date.now();
+    const map = this.roomTyping.get(roomId);
+    if (!map) return;
+    for (const [actorId, expires] of map.entries()) {
+      if (expires <= now) map.delete(actorId);
+    }
+    if (map.size === 0) this.roomTyping.delete(roomId);
+  }
+
+  private broadcastTyping(roomId: string) {
+    this.pruneTyping(roomId);
+    const map = this.roomTyping.get(roomId) || new Map();
+    const typing = Array.from(map.keys()).map(actorId => ({ actorId }));
+    const notif: RoomTypingNotification = {
+      jsonrpc: '2.0',
+      method: 'room.typing',
+      params: { roomId, typing, updatedAt: new Date().toISOString() },
+    };
+    this.bus.broadcastToRoom(roomId, notif);
+  }
+
+  private broadcastReceipts(roomId: string, messageId: string) {
+    const byMessage = this.roomReceipts.get(roomId);
+    const actorIds = Array.from(byMessage?.get(messageId) || []);
+    this.bus.broadcastToRoom(roomId, {
+      jsonrpc: '2.0',
+      method: 'message.receipts',
+      params: { roomId, messageId, actorIds, updatedAt: new Date().toISOString() },
+    } as any);
+  }
+
+  private async handleTypingStart(connectionId: string, request: TypingStartRequest) {
+    const { roomId } = request.params || ({} as any);
+    if (!roomId) {
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'roomId required');
+      return;
+    }
+    // Resolve actorId: prefer provided, else current user
+    let actorId = String(request.params?.actorId || '');
+    if (!actorId) {
+      const userId = this.connectionUserId.get(connectionId) || 'default-user';
+      actorId = userId;
+    }
+    const ttlMs = Math.min(Math.max(Number(request.params?.ttlMs || 4000), 1000), 15000);
+    if (!this.roomTyping.has(roomId)) this.roomTyping.set(roomId, new Map());
+    const map = this.roomTyping.get(roomId)!;
+    map.set(actorId, Date.now() + ttlMs);
+    this.roomTyping.set(roomId, map);
+    this.bus.sendResponse(connectionId, request.id, { ok: true });
+    this.broadcastTyping(roomId);
+  }
+
+  private async handleTypingStop(connectionId: string, request: TypingStopRequest) {
+    const { roomId } = request.params || ({} as any);
+    if (!roomId) {
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'roomId required');
+      return;
+    }
+    let actorId = String(request.params?.actorId || '');
+    if (!actorId) {
+      const userId = this.connectionUserId.get(connectionId) || 'default-user';
+      actorId = userId;
+    }
+    const map = this.roomTyping.get(roomId);
+    if (map) {
+      map.delete(actorId);
+      if (map.size === 0) this.roomTyping.delete(roomId);
+    }
+    this.bus.sendResponse(connectionId, request.id, { ok: true });
+    this.broadcastTyping(roomId);
+  }
+
+  private async handleMessageRead(connectionId: string, request: any) {
+    const roomId = String(request?.params?.roomId || '');
+    const messageId = String(request?.params?.messageId || '');
+    if (!roomId || !messageId) {
+      this.bus.sendError(connectionId, request?.id, ErrorCodes.INVALID_PARAMS, 'roomId and messageId required');
+      return;
+    }
+    let actorId = String(request?.params?.actorId || '');
+    if (!actorId) {
+      actorId = this.connectionUserId.get(connectionId) || 'default-user';
+    }
+    if (!this.roomReceipts.has(roomId)) this.roomReceipts.set(roomId, new Map());
+    const byMessage = this.roomReceipts.get(roomId)!;
+    if (!byMessage.has(messageId)) byMessage.set(messageId, new Set());
+    byMessage.get(messageId)!.add(actorId);
+    this.roomReceipts.set(roomId, byMessage);
+    this.bus.sendResponse(connectionId, request?.id, { ok: true });
+    this.broadcastReceipts(roomId, messageId);
+  }
+
   // Public method to get router info
   getAvailableProviders() {
     return this.llmRouter.getAvailableProviders();
@@ -1694,16 +2289,26 @@ ${personaBlock}${memoryContext}`,
         // Extract Personality and Extra instructions blocks if present
         const personalityMatch = agentInstructions.match(/Personality:\s*([\s\S]*?)(?:\n\n|$)/);
         const extraMatch = agentInstructions.match(/Extra instructions:\s*([\s\S]*)$/);
-        const personality = personalityMatch ? personalityMatch[1].trim() : '';
-        const extra = extraMatch ? extraMatch[1].trim() : '';
         const desc = a.description ? `Description: ${a.description}` : '';
         
-        agentPersona = [
-          agentName ? `Agent Name: ${agentName}` : '',
-          desc,
-          personality ? `Personality: ${personality}` : '',
-          extra ? `Extra instructions: ${extra}` : '',
-        ].filter(Boolean).join('\n');
+        if (personalityMatch || extraMatch) {
+          // Structured format
+          const personality = personalityMatch ? personalityMatch[1].trim() : '';
+          const extra = extraMatch ? extraMatch[1].trim() : '';
+          agentPersona = [
+            agentName ? `Agent Name: ${agentName}` : '',
+            desc,
+            personality ? `Personality: ${personality}` : '',
+            extra ? `Extra instructions: ${extra}` : '',
+          ].filter(Boolean).join('\n');
+        } else {
+          // Unstructured format - treat entire instructions as personality
+          agentPersona = [
+            agentName ? `Agent Name: ${agentName}` : '',
+            desc,
+            agentInstructions ? `Instructions: ${agentInstructions}` : '',
+          ].filter(Boolean).join('\n');
+        }
       }
     } catch {}
 
@@ -1715,11 +2320,15 @@ ${personaBlock}${memoryContext}`,
       params: { runId, status: 'running', startedAt: new Date().toISOString() },
     } as RunStatusNotification);
 
-    // Load Pinecone memory for this agent
+    // Load Pinecone memory for this agent, scoped to this user/room
     let memoryContext = '';
     try {
-      const memoryResults = await memoryService.searchLongTerm(nextAgentId, userMessage, 5);
-      
+      const memoryResults = await memoryService.searchLongTermByUser(
+        activeUserId,
+        userMessage,
+        5,
+        { agentId: nextAgentId as any, roomId }
+      );
       if (memoryResults.length > 0) {
         memoryContext = `\n\nRELEVANT MEMORY:\n${memoryResults.map(m => `- ${m.content}`).join('\n')}\n`;
       }
@@ -1777,6 +2386,20 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
               authorType: 'agent',
             },
           });
+          // Persist assistant final message
+          try {
+            await db.insert(DBSchema.messages as any).values({
+              id: messageId,
+              conversationId: roomId,
+              authorId: String(nextAgentId),
+              authorType: 'agent',
+              role: 'assistant',
+              content: [{ type: 'text', text: fullResponse }] as any,
+              status: 'completed',
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            } as any);
+          } catch {}
         }
       }
     } catch (e) {
@@ -1843,6 +2466,43 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
     this.roomSpeaking.delete(roomId);
     if ((this.roomQueue.get(roomId) || []).length > 0) {
       this.processRoomQueue(roomId, userMessage, activeUserId).catch(() => {});
+    }
+  }
+
+  private async handleCodeSearch(connectionId: string, request: JSONRPCRequest) {
+    try {
+      const params = (request.params || {}) as any;
+      const pattern = String(params.pattern || '').trim();
+      if (!pattern) {
+        this.bus.sendError(connectionId, request.id, ErrorCodes.INVALID_PARAMS, 'pattern is required');
+        return;
+      }
+      const out = await codeSearch({
+        pattern,
+        path: params.path ? String(params.path) : undefined,
+        glob: params.glob ? String(params.glob) : undefined,
+        maxResults: params.maxResults ? Number(params.maxResults) : undefined,
+        caseInsensitive: !!params.caseInsensitive,
+        regex: !!params.regex,
+      });
+      const roomId = this.getRoomForConnection(connectionId) || 'default-room';
+      const runId = randomUUID();
+      const toolCallId = randomUUID();
+      this.bus.broadcastToolCall(roomId, runId, toolCallId, 'code', 'search', { pattern, path: params.path, glob: params.glob });
+      const header = `Code search for "${pattern}": ${out.results.length} hit(s) using ${out.used}`;
+      const md = [header]
+        .concat(out.results.slice(0, 50).map((r: any) => `- ${r.file}:${r.line} — ${r.text}`))
+        .join('\n');
+      this.bus.broadcastToRoom(roomId, {
+        jsonrpc: '2.0',
+        method: 'message.received',
+        params: { roomId, messageId: randomUUID(), authorId: connectionId as any, authorType: 'agent', message: md },
+      });
+      this.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+      this.bus.sendResponse(connectionId, request.id, { ok: true, results: out.results, used: out.used });
+    } catch (e: any) {
+      console.error('[tool.code.search] error', e);
+      this.bus.sendError(connectionId, request.id, ErrorCodes.INTERNAL_ERROR, e?.message || 'Code search failed');
     }
   }
 }

@@ -1,4 +1,6 @@
 import { AppSidebar } from "@/components/app-sidebar"
+import { getServerSession } from "next-auth"
+import { redirect } from "next/navigation"
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -14,7 +16,11 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 
-export default function Page() {
+export default async function Page() {
+  const session = await getServerSession()
+  if (!session) {
+    redirect('/api/auth/signin?callbackUrl=%2Fdashboard')
+  }
   return (
     <SidebarProvider>
       <AppSidebar />

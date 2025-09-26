@@ -44,30 +44,24 @@ class WebScraperService {
   };
 
   async scrape(url: string): Promise<ScrapeResult> {
-    // Attempt 1: normal fetch with browsery headers
-    let res = await fetch(url, { headers: this.defaultHeaders as any, redirect: 'follow' });
-    let contentType = (res.headers.get('content-type') || '').toLowerCase();
-
-    // If blocked, Attempt 2: retry with additional headers (referer)
-    if (!res.ok && [403, 406, 451].includes(res.status)) {
+    const fetchWithTimeout = async (resource: string, options: any, timeoutMs: number): Promise<Response> => {
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const retryHeaders = {
-          ...this.defaultHeaders,
-          referer: new URL(url).origin + '/',
-        } as any;
-        res = await fetch(url, { headers: retryHeaders, redirect: 'follow' });
-        contentType = (res.headers.get('content-type') || '').toLowerCase();
-      } catch {}
-    }
+        const res = await fetch(resource, { ...(options || {}), signal: controller.signal });
+        return res as any;
+      } finally {
+        clearTimeout(id);
+      }
+    };
 
-    // If still blocked, Attempt 3: use readable proxy (r.jina.ai)
-    if (!res.ok && [403, 406, 451].includes(res.status)) {
+    // Helper: fallback via readable proxy when sites send oversized headers or block bots
+    const fallbackViaJina = async (): Promise<ScrapeResult> => {
       try {
         const jinaUrl = `https://r.jina.ai/${url.startsWith('http') ? url : `http://${url}`}`;
         const jres = await fetch(jinaUrl, { headers: { 'user-agent': this.defaultHeaders['user-agent'] } as any });
         if (jres.ok) {
           const jtext = await jres.text();
-          // Try to extract a title from the first line or fallback
           const lines = jtext.split(/\n+/);
           const titleLine = (lines[0] || '').trim();
           return {
@@ -82,7 +76,50 @@ class WebScraperService {
           };
         }
       } catch {}
+      throw new Error('Fetch failed and proxy fallback unavailable');
+    };
+
+    // Attempt 1: normal fetch with browsery headers
+    let res: Response;
+    try {
+      res = await fetchWithTimeout(url, { headers: this.defaultHeaders as any, redirect: 'follow' }, 12000);
+    } catch (e: any) {
+      // Some sites (e.g., Yahoo Finance) return extremely large headers causing undici to throw before a response exists
+      if (e?.name === 'AbortError' || e?.code === 'UND_ERR_HEADERS_OVERFLOW' || /Headers\s+Overflow/i.test(String(e?.message || e))) {
+        return await fallbackViaJina();
+      }
+      throw e;
     }
+    let contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+    // If blocked, Attempt 2: retry with additional headers (referer)
+    if (!res.ok && [403, 406, 451].includes(res.status)) {
+      try {
+        const retryHeaders = {
+          ...this.defaultHeaders,
+          referer: new URL(url).origin + '/',
+        } as any;
+        try {
+          res = await fetchWithTimeout(url, { headers: retryHeaders, redirect: 'follow' }, 12000);
+          contentType = (res.headers.get('content-type') || '').toLowerCase();
+        } catch (e: any) {
+          if (e?.name === 'AbortError' || e?.code === 'UND_ERR_HEADERS_OVERFLOW' || /Headers\s+Overflow/i.test(String(e?.message || e))) {
+            return await fallbackViaJina();
+          }
+          throw e;
+        }
+      } catch {}
+    }
+
+    // If still blocked, Attempt 3: use readable proxy (r.jina.ai)
+    if (!res.ok && [403, 406, 451].includes(res.status)) {
+      try { return await fallbackViaJina(); } catch {}
+    }
+
+    // If slow 301/302 chains or non-OK statuses persist, fallback to proxy to avoid hanging the UI
+    try {
+      if (!res.ok) return await fallbackViaJina();
+    } catch {}
 
     if (!res.ok) {
       throw new Error(`Fetch failed (${res.status}) for ${url}`);

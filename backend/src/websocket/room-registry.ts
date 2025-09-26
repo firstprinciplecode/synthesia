@@ -1,4 +1,4 @@
-import { db, users, agents } from '../db/index.js';
+import { db, users, agents, actors, roomMembers } from '../db/index.js';
 import * as DBSchema from '../db/schema.js';
 import { eq } from 'drizzle-orm';
 
@@ -67,7 +67,7 @@ export class RoomRegistry {
     const userIds = participantsConns.map((cid) => this.connectionUserId.get(cid) || 'default-user');
     const uniqueUserIds = Array.from(new Set(userIds));
 
-    // Fetch user profiles
+    // Fetch user profiles for connected users
     const userProfiles: any[] = [];
     for (const uid of uniqueUserIds) {
       try {
@@ -105,10 +105,74 @@ export class RoomRegistry {
       } catch {}
     }
 
-    const participants: Participant[] = [
-      ...agentProfiles.map((a) => ({ id: a.id, type: 'agent' as const, name: a.name || 'Agent', avatar: a.avatar || null, status: 'online' })),
-      ...userProfiles.map((u) => ({ id: u.id, type: 'user' as const, name: u.name || u.email || 'User', avatar: u.avatar || null, status: 'online' })),
-    ];
+    // Include Social Core room members as participants (users and agents mapped via actors)
+    const socialParticipants: Participant[] = [];
+    try {
+      const members = await db.select().from(roomMembers).where(eq(roomMembers.roomId as any, roomId as any));
+      for (const m of members as any[]) {
+        try {
+          const aRows = await db.select().from(actors).where(eq(actors.id as any, m.actorId as any));
+          if (aRows.length === 0) continue;
+          const act: any = aRows[0];
+          if (String(act.type) === 'user') {
+            // Map to real user profile if available
+            let name = act.displayName || 'User';
+            let avatar = act.avatarUrl || null;
+            if (act.ownerUserId) {
+              const uRows = await db.select().from(users).where(eq(users.id, act.ownerUserId));
+              if (uRows.length) {
+                name = uRows[0].name || uRows[0].email || name;
+                avatar = uRows[0].avatar || avatar;
+              }
+            }
+            socialParticipants.push({ id: act.id, type: 'user', name, avatar, status: 'online' });
+          } else if (String(act.type) === 'agent') {
+            // Try to enrich from agents table if settings.agentId present
+            let name = act.displayName || 'Agent';
+            let avatar = act.avatarUrl || null;
+            const settings = (act.settings || {}) as any;
+            const agentId = settings?.agentId;
+            if (agentId) {
+              const agRows = await db.select().from(agents).where(eq(agents.id as any, agentId as any));
+              if (agRows.length) {
+                name = agRows[0].name || name;
+                avatar = agRows[0].avatar || avatar;
+              }
+            }
+            // Important: expose participant id as the agents.id so frontend can match authorId
+            socialParticipants.push({ id: agentId || act.id, type: 'agent', name, avatar, status: 'online' });
+          }
+        } catch {}
+      }
+    } catch {}
+
+    // Deduplicate by semantic identity: users by ownerUserId (if present) else id; agents by agentId (if present) else id
+    const byKey = new Map<string, Participant>();
+    const push = (p: Participant, key: string) => { if (!byKey.has(key)) byKey.set(key, p); };
+
+    // Direct agents (canonical by agent id)
+    for (const a of agentProfiles) {
+      push({ id: a.id, type: 'agent', name: a.name || 'Agent', avatar: a.avatar || null, status: 'online' }, `agent:${a.id}`);
+    }
+
+    // Connected users (canonical by user id)
+    for (const u of userProfiles) {
+      push({ id: u.id, type: 'user', name: u.name || u.email || 'User', avatar: u.avatar || null, status: 'online' }, `user:${u.id}`);
+    }
+
+    // Social Core members
+    for (const sp of socialParticipants) {
+      let key = `${sp.type}:${sp.id}`;
+      // Try to normalize user actor -> underlying user id if we can infer it from avatar/name match against connected users
+      if (sp.type === 'user') {
+        // Find a connected user with the same avatar or name; not perfect but avoids duplicates for default-user
+        const match = userProfiles.find(u => (u.avatar && sp.avatar && String(u.avatar) === String(sp.avatar)) || (u.name && sp.name && String(u.name) === String(sp.name)) || u.id === sp.id);
+        if (match) key = `user:${match.id}`;
+      }
+      push(sp, key);
+    }
+
+    const participants: Participant[] = Array.from(byKey.values());
 
     return participants;
   }

@@ -29,6 +29,8 @@ interface ChatInputProps {
   disabled?: boolean;
   availableProviders?: string[];
   availableModels?: Array<{ name: string; provider: string; maxTokens: number }>;
+  onTyping?: (event: 'start' | 'stop') => void;
+  placeholderOverride?: string;
 }
 
 // Fallback static options if backend list is unavailable
@@ -40,7 +42,7 @@ const MODEL_OPTIONS = {
   deepseek: ['deepseek-chat', 'deepseek-reasoner'],
 };
 
-export function ChatInput({ onSendMessage, disabled, availableProviders = [], availableModels = [] }: ChatInputProps) {
+export function ChatInput({ onSendMessage, disabled, availableProviders = [], availableModels = [], onTyping, placeholderOverride }: ChatInputProps) {
   const [message, setMessage] = useState('');
   const [selectedProvider, setSelectedProvider] = useState('openai');
   const [selectedModel, setSelectedModel] = useState('gpt-4o');
@@ -131,6 +133,7 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [], av
     const val = e.target.value;
     setMessage(val);
     resizeTextarea();
+    try { if (val.trim().length > 0) onTyping?.('start'); else onTyping?.('stop'); } catch {}
     const caret = e.target.selectionStart ?? val.length;
     const atIdx = val.lastIndexOf('@', Math.max(0, caret - 1));
     if (atIdx >= 0) {
@@ -169,7 +172,7 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [], av
               value={message}
               onChange={onChangeMessage}
               onKeyDown={handleKeyDown}
-              placeholder={terminalMode ? "Enter terminal command..." : "Ask anything"}
+              placeholder={placeholderOverride || (terminalMode ? "Enter terminal command..." : "Ask anything")}
               rows={1}
               className="min-h-[40px] resize-none pr-20 pl-20 py-2 rounded-xl border border-border focus:border-ring focus:ring-0 text-[15px] leading-6 bg-background animate-glow"
               disabled={disabled}

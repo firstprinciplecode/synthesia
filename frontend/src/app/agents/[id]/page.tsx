@@ -8,6 +8,13 @@ import { AppSidebar } from '@/components/app-sidebar';
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from '@/components/ui/breadcrumb';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
+import { useSession } from 'next-auth/react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { Upload } from 'lucide-react';
 
 type Agent = {
   id: string;
@@ -19,6 +26,7 @@ type Agent = {
 };
 
 export default function AgentDetailPage() {
+  const { status, data: session } = useSession();
   const params = useParams();
   const router = useRouter();
   const id = useMemo(() => (params?.id as string) || '', [params]);
@@ -34,34 +42,22 @@ export default function AgentDetailPage() {
   const [autoExecuteTools, setAutoExecuteTools] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const getBackendHttpBase = () => {
-    // Prefer local dev server
-    try {
-      if (typeof window !== 'undefined') return 'http://localhost:3001';
-    } catch {}
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || '';
-    try {
-      const u = new URL(wsUrl);
-      const proto = u.protocol === 'wss:' ? 'https:' : 'http:';
-      return `${proto}//${u.host}`;
-    } catch {
-      return 'http://localhost:3001';
-    }
-  };
+  const getBackendHttpBase = () => '/';
 
   useEffect(() => {
     if (!id) return;
     async function load() {
       try {
-        const base = getBackendHttpBase();
-        const res = await fetch(`${base}/api/agents/${id}`, { cache: 'no-store' });
+        const uid = (session as any)?.userId;
+        if (!uid) throw new Error('Not signed in');
+        const res = await fetch(`/api/agents/${id}`, { cache: 'no-store', headers: { 'x-user-id': uid } });
         if (!res.ok) throw new Error(`Failed to load agent`);
         const data = await res.json();
         setAgent(data);
         setName(data.name || '');
         setDescription(data.description || '');
         const av = data.avatar as string | undefined;
-        setAvatarUrl(av ? (av.startsWith('/') ? `${base}${av}` : av) : '');
+        setAvatarUrl(av || '');
         setAutoExecuteTools(data.autoExecuteTools || false);
         // We encode Personality + Extra instructions inside instructions field for now
         // Keep existing instructions and allow editing split parts
@@ -76,8 +72,8 @@ export default function AgentDetailPage() {
         setLoading(false);
       }
     }
-    load();
-  }, [id]);
+    if (status === 'authenticated') load();
+  }, [id, status, session]);
 
   async function onSave() {
     if (!id) return;
@@ -85,16 +81,17 @@ export default function AgentDetailPage() {
     // Convert avatarUrl back to relative if it points to our backend
     let avatarToSave = avatarUrl;
     try {
-      const base = getBackendHttpBase();
-      if (avatarToSave && avatarToSave.startsWith(base)) {
-        avatarToSave = avatarToSave.slice(base.length);
+      if (avatarToSave.startsWith('http://localhost:3001')) {
+        avatarToSave = avatarToSave.replace('http://localhost:3001', '');
+      } else if (avatarToSave.startsWith('https://agent.firstprinciple.co')) {
+        avatarToSave = avatarToSave.replace('https://agent.firstprinciple.co', '');
       }
     } catch {}
     const payload = { name, description, instructions, avatar: avatarToSave, autoExecuteTools };
-    const base = getBackendHttpBase();
-    const res = await fetch(`${base}/api/agents/${id}`, {
+    const uid = (session as any)?.userId;
+    const res = await fetch(`/api/agents/${id}`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) },
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
@@ -113,14 +110,13 @@ export default function AgentDetailPage() {
     try {
       const file = e.target.files?.[0];
       if (!file) return;
-      const base = getBackendHttpBase();
       const fd = new FormData();
       fd.append('file', file);
-      const res = await fetch(`${base}/api/agents/${id}/avatar`, { method: 'POST', body: fd });
+      const res = await fetch(`/api/agents/${id}/avatar`, { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'Upload failed');
       const url = data?.url as string;
-      setAvatarUrl(url.startsWith('http') ? url : `${base}${url}`);
+      setAvatarUrl(url);
       if (fileInputRef.current) fileInputRef.current.value = '';
     } catch (err: any) {
       setError(err?.message || 'Upload failed');
@@ -152,53 +148,79 @@ export default function AgentDetailPage() {
           </div>
         </header>
 
-        <div className="p-4 space-y-3 max-w-2xl">
+        <div className="p-4 space-y-4 max-w-3xl">
+          {status !== 'authenticated' && (
+            <div className="text-sm text-muted-foreground">Please sign in to edit agents.</div>
+          )}
           {loading && <p className="text-sm text-muted-foreground">Loading…</p>}
           {error && <p className="text-sm text-red-500">{error}</p>}
           {!loading && agent && (
             <>
-              <div>
-                <label className="block text-xs font-medium mb-1">Agent Name</label>
-                <input value={name} onChange={(e) => setName(e.target.value)} className="w-full border rounded px-2 py-1 text-sm bg-transparent" />
-              </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">Avatar URL</label>
-                <div className="flex items-center gap-2">
-                  <input value={avatarUrl} onChange={(e) => setAvatarUrl(e.target.value)} className="flex-1 border rounded px-2 py-1 text-sm bg-transparent" placeholder="https://..." />
-                  <button onClick={randomizeAvatar} className="text-xs font-semibold hover:underline">Generate</button>
-                  <button onClick={onClickUpload} className="text-xs font-semibold hover:underline">Upload</button>
-                  <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={onAvatarFileChange} />
-                </div>
-                {avatarUrl && (
-                  <img src={avatarUrl} alt="avatar" className="mt-2 h-10 w-10 rounded" />
-                )}
-              </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">Description</label>
-                <textarea value={description} onChange={(e) => setDescription(e.target.value)} className="w-full border rounded px-2 py-1 text-sm bg-transparent" rows={3} />
-              </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">Personality</label>
-                <textarea value={personality} onChange={(e) => setPersonality(e.target.value)} className="w-full border rounded px-2 py-1 text-sm bg-transparent" rows={3} placeholder="e.g., You speak like Gordon Ramsay" />
-              </div>
-              <div>
-                <label className="block text-xs font-medium mb-1">Extra instructions</label>
-                <textarea value={extra} onChange={(e) => setExtra(e.target.value)} className="w-full border rounded px-2 py-1 text-sm bg-transparent" rows={4} placeholder="e.g., When asked about latest news, use @serpapi google_news" />
-              </div>
-              <div className="flex items-center space-x-2">
-                <Switch
-                  id="auto-execute-tools"
-                  checked={autoExecuteTools}
-                  onCheckedChange={setAutoExecuteTools}
-                />
-                <Label htmlFor="auto-execute-tools" className="text-xs font-medium">
-                  Auto-execute tools (SerpAPI, etc.) without asking for permission
-                </Label>
-              </div>
-              <div className="pt-2">
-                <button onClick={onSave} className="text-sm font-semibold hover:underline">Save</button>
-                <Link href="/agents" className="ml-4 text-sm text-muted-foreground hover:underline">Cancel</Link>
-              </div>
+              <Card>
+                <CardHeader>
+                  <CardTitle>Agent Profile</CardTitle>
+                  <CardDescription>Identity and presentation.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-6">
+                  <div className="flex items-center gap-6">
+                    <Avatar className="h-24 w-24">
+                      <AvatarImage src={avatarUrl} alt={name || 'Agent'} />
+                      <AvatarFallback className="text-lg">{name ? name.charAt(0).toUpperCase() : 'A'}</AvatarFallback>
+                    </Avatar>
+                    <div className="space-y-2">
+                      <Label className="text-sm font-medium">Profile Photo</Label>
+                      <div className="flex gap-2">
+                        <Button variant="outline" size="sm" onClick={onClickUpload}>
+                          <Upload className="h-4 w-4 mr-2" />Upload Photo
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={randomizeAvatar}>Generate</Button>
+                      </div>
+                      <input ref={fileInputRef} type="file" accept="image/*" onChange={onAvatarFileChange} className="hidden" />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="agent-name">Agent Name</Label>
+                      <Input id="agent-name" value={name} onChange={(e) => setName(e.target.value)} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="avatar-url">Avatar URL</Label>
+                      <Input id="avatar-url" value={avatarUrl} onChange={(e) => setAvatarUrl(e.target.value)} placeholder="https://..." />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="agent-description">Description</Label>
+                    <Textarea id="agent-description" value={description} onChange={(e) => setDescription(e.target.value)} rows={3} placeholder="What is this agent for?" />
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Behavior</CardTitle>
+                  <CardDescription>Personality and extra instructions.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="agent-personality">Personality</Label>
+                    <Textarea id="agent-personality" value={personality} onChange={(e) => setPersonality(e.target.value)} rows={3} placeholder="e.g., You speak like Gordon Ramsay" />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="agent-extra">Extra instructions</Label>
+                    <Textarea id="agent-extra" value={extra} onChange={(e) => setExtra(e.target.value)} rows={4} placeholder="e.g., Prefer Twitter/X for fresh news" />
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Switch id="auto-execute-tools" checked={autoExecuteTools} onCheckedChange={setAutoExecuteTools} />
+                    <Label htmlFor="auto-execute-tools" className="text-sm">Auto-execute tools without asking for permission</Label>
+                  </div>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <Button variant="outline" asChild><Link href="/agents">Cancel</Link></Button>
+                    <Button onClick={onSave}>Save</Button>
+                  </div>
+                </CardContent>
+              </Card>
             </>
           )}
         </div>

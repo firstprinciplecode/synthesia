@@ -1,5 +1,5 @@
 import { memoryService } from '../memory/memory-service.js';
-import { db, agents } from '../db/index.js';
+import { db, agents, actors } from '../db/index.js';
 import { eq } from 'drizzle-orm';
 
 export interface ParticipationCandidate {
@@ -26,7 +26,9 @@ export class ParticipationRouter {
 			const full = String(name || '').toLowerCase();
 			const first = full.split(/\s+/)[0] || full;
 			const slug = full.replace(/\s+/g, '');
-			const candidates = [full, first, slug].filter(Boolean);
+			// Also recognize @v33-style handles by stripping spaces and punctuation
+			const handle = '@' + slug;
+			const candidates = [full, first, slug, handle.replace(/^@/, '')].filter(Boolean);
 			for (const c of candidates) {
 				const pattern = new RegExp(`(^|\\W)@${escape(c)}(\\W|$)`);
 				if (pattern.test(lower) && roomAgentIds.includes(id)) { mentionedIds.push(id); break; }
@@ -59,12 +61,26 @@ export class ParticipationRouter {
 			} catch {}
 		}
 
+		// Load actor capability tags for these agents (via actors.settings.agentId)
+		const capsByAgentId = new Map<string, string[]>();
+		try {
+			const list = await db.select().from(actors).where(eq(actors.type as any, 'agent' as any));
+			for (const act of list as any[]) {
+				const aid = act?.settings?.agentId;
+				if (aid && eligibleAgentIds.includes(aid)) {
+					const tags = Array.isArray(act.capabilityTags) ? (act.capabilityTags as string[]) : [];
+					capsByAgentId.set(aid, tags);
+				}
+			}
+		} catch {}
+
 		const scored: ParticipationCandidate[] = infos.map((a) => {
 			const keywordScore = this.computeKeywordScore(message, (a.keywords as string[] | null) || undefined);
+			const tagScore = this.computeKeywordScore(message, capsByAgentId.get(a.id) || []);
 			// Confidence threshold
 			const conf = Number(a.confidenceThreshold ?? 0.7);
-			const score = keywordScore;
-			const reason = keywordScore > 0 ? 'keyword match' : 'low relevance';
+			const score = Math.max(keywordScore, tagScore);
+			const reason = tagScore > keywordScore ? 'capability tag match' : (keywordScore > 0 ? 'keyword match' : 'low relevance');
 			return { agentId: a.id, name: a.name, score, reason };
 		}).filter((c) => c.score >= 0.01);
 

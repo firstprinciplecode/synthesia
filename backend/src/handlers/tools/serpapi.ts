@@ -3,6 +3,8 @@ import { WebSocketBus } from '../../websocket/bus.js';
 import { ToolRunner } from '../../tools/tool-runner.js';
 import { serpapiService } from '../../tools/serpapi-service.js';
 import { formatSerpListAsMarkdown, formatGoogleNewsMarkdown } from '../../formatters/serpapi.js';
+import { createResults } from '../../websocket/results-registry.js';
+import { db, messages } from '../../db/index.js';
 
 export type SerpHandlersContext = {
   bus: WebSocketBus;
@@ -32,17 +34,30 @@ export async function handleSerpSearch(ctx: SerpHandlersContext, connectionId: s
   };
   ctx.bus.broadcastToRoom(room, {
     jsonrpc: '2.0',
-    method: 'agent.analysis',
+    method: 'message.received',
     params: {
       roomId: room,
-      content: md,
-      model: 'tool.serpapi',
-      timestamp: new Date().toISOString(),
+      messageId: crypto.randomUUID(),
       authorId: (agentId || connectionId || 'agent') as any,
       authorType: 'agent',
+      message: md,
     },
   });
   ctx.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+  // Persist tool summary to message history
+  try {
+    await db.insert(messages as any).values({
+      id: crypto.randomUUID(),
+      conversationId: room,
+      authorId: room,
+      authorType: 'agent',
+      role: 'assistant',
+      content: [{ type: 'text', text: md }] as any,
+      status: 'completed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as any);
+  } catch {}
   ctx.bus.sendResponse(connectionId, request.id!, { ok: true });
 }
 
@@ -71,6 +86,20 @@ export async function handleSerpImages(ctx: SerpHandlersContext, connectionId: s
     },
   });
   ctx.bus.broadcastToolResult(room, runId, toolCallId, { ok: true });
+  // Persist image results to message history (as assistant message)
+  try {
+    await db.insert(messages as any).values({
+      id: crypto.randomUUID(),
+      conversationId: room,
+      authorId: room,
+      authorType: 'agent',
+      role: 'assistant',
+      content: [{ type: 'text', text: md }] as any,
+      status: 'completed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as any);
+  } catch {}
   ctx.bus.sendResponse(connectionId, request.id!, { ok: true });
 }
 
@@ -134,6 +163,36 @@ export async function handleSerpRun(ctx: SerpHandlersContext, connectionId: stri
   const toolCallId = crypto.randomUUID();
   ctx.bus.broadcastToolCall(roomId, runId, toolCallId, 'serpapi', 'run', { engine: engineUse, query, extra: params.extra });
   let messageMd = result.markdown || '';
+  // Derive and broadcast stable search.results (top 10) with resultId for deterministic picks
+  try {
+    const raw: any = (result as any).raw || {};
+    const urls: string[] = [];
+    if (engineUse === 'google_news' && Array.isArray(raw.news_results) && raw.news_results.length) {
+      for (const item of raw.news_results) {
+        if (typeof item?.link === 'string') {
+          urls.push(item.link);
+        } else if (item?.highlight && typeof item.highlight.link === 'string') {
+          urls.push(item.highlight.link);
+        }
+        if (urls.length >= 10) break;
+      }
+    }
+    if (!urls.length && typeof result.markdown === 'string' && result.markdown) {
+      const re = /\[View\]\((https?:\/\/[^)]+)\)/g;
+      const md = String(result.markdown);
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(md)) !== null) {
+        urls.push(m[1]);
+        if (urls.length >= 10) break;
+      }
+    }
+    if (urls.length) {
+      const items = urls.slice(0, 10).map((url, i) => ({ index: i + 1, url }));
+      const rid = createResults(roomId, items);
+      console.log('[serpapi.run:search.results] room=%s items=%d resultId=%s', roomId, items.length, rid);
+      ctx.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'search.results', params: { roomId, resultId: rid, items } });
+    }
+  } catch {}
   // If this is google_news and raw payload contains news_results, build rich cards with image + link
   try {
     const raw = (result as any).raw || {};
@@ -155,6 +214,20 @@ export async function handleSerpRun(ctx: SerpHandlersContext, connectionId: stri
     },
   });
   ctx.bus.broadcastToolResult(roomId, runId, toolCallId, { ok: true });
+  // Persist tool summary to message history
+  try {
+    await db.insert(messages as any).values({
+      id: crypto.randomUUID(),
+      conversationId: roomId,
+      authorId: roomId,
+      authorType: 'agent',
+      role: 'assistant',
+      content: [{ type: 'text', text: messageMd }] as any,
+      status: 'completed',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as any);
+  } catch {}
   ctx.bus.sendResponse(connectionId, request.id!, { ok: true, result });
 }
 

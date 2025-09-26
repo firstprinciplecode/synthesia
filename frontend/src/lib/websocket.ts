@@ -39,6 +39,8 @@ type OnAgentAnalysis = (content: string, authorId?: string, authorType?: string)
 type OnParticipantsUpdate = (payload: { roomId: string; participants: Array<{ id: string; type: 'user'|'agent'; name: string; avatar?: string | null; status?: string }>; updatedAt: string }) => void;
 type OnToolCall = (payload: { runId: string; toolCallId: string; tool: string; function: string; args: Record<string, any> }) => void;
 type OnToolResult = (payload: { runId: string; toolCallId: string; result?: any; error?: string }) => void;
+type OnTyping = (payload: { roomId: string; typing: Array<{ actorId: string; type?: 'user'|'agent' }>; updatedAt: string }) => void;
+type OnReceipts = (payload: { roomId: string; messageId: string; actorIds: string[]; updatedAt: string }) => void;
 
 interface JSONRPCRequest {
   jsonrpc: '2.0';
@@ -66,6 +68,8 @@ export class SuperAgentWebSocket {
   private connected = false;
   private requestResolvers: Map<string, { resolve: (v: any) => void; reject: (e: any) => void }> = new Map();
   private dedupeInFlight: Map<string, Promise<any>> = new Map();
+  private lastResultIdByRoom: Map<string, string> = new Map();
+  private pendingResultWaiters: Map<string, Array<(rid: string) => void>> = new Map();
 
   private onMessage: OnMessage;
   private onMessageDelta: OnMessageDelta;
@@ -76,6 +80,8 @@ export class SuperAgentWebSocket {
   private onParticipantsUpdate?: OnParticipantsUpdate;
   private onToolCall?: OnToolCall;
   private onToolResult?: OnToolResult;
+  private onTyping?: OnTyping;
+  private onReceipts?: OnReceipts;
 
   constructor(
     url: string,
@@ -89,6 +95,8 @@ export class SuperAgentWebSocket {
     onParticipantsUpdate?: OnParticipantsUpdate,
     onToolCall?: OnToolCall,
     onToolResult?: OnToolResult,
+    onTyping?: OnTyping,
+    onReceipts?: OnReceipts,
   ) {
     this.url = url;
     this.onMessage = onMessage;
@@ -100,6 +108,13 @@ export class SuperAgentWebSocket {
     this.onParticipantsUpdate = onParticipantsUpdate;
     this.onToolCall = onToolCall;
     this.onToolResult = onToolResult;
+    this.onTyping = onTyping;
+    this.onReceipts = onReceipts;
+  }
+
+  // Expose latest stable resultId for the given room, if known
+  getLastResultId(roomId: string): string | undefined {
+    return this.lastResultIdByRoom.get(roomId);
   }
 
   isConnected(): boolean {
@@ -189,7 +204,15 @@ export class SuperAgentWebSocket {
       const pending = this.requestResolvers.get(res.id);
       if (pending) {
         this.requestResolvers.delete(res.id);
-        if (res.error) pending.reject(new Error(res.error.message || 'JSON-RPC error'));
+        if (res.error) {
+          try {
+            const msg = String(res.error.message || '');
+            if (/No URL for index/i.test(msg)) {
+              console.warn('[tool] web.scrape.pick error:', msg);
+            }
+          } catch {}
+          pending.reject(new Error(res.error.message || 'JSON-RPC error'));
+        }
         else pending.resolve(res.result);
       }
       return;
@@ -220,8 +243,17 @@ export class SuperAgentWebSocket {
             timestamp: new Date(),
             authorId: params?.authorId,
             authorType: params?.authorType,
+            // passthrough user id so UI can label sender correctly in DMs
+            ...(params?.authorUserId ? { authorUserId: params.authorUserId } : {}),
+            ...(params?.authorName ? { userName: params.authorName } : {}),
+            ...(params?.authorAvatar ? { userAvatar: params.authorAvatar } : {}),
             streaming: false,
           };
+          // If this is a user-authored message and we have a friendly name/avatar, attach them
+          if (m.role === 'user') {
+            if (!('userName' in (m as any)) && typeof (params?.authorName) === 'string') (m as any).userName = params.authorName;
+            if (!('userAvatar' in (m as any)) && typeof (params?.authorAvatar) === 'string') (m as any).userAvatar = params.authorAvatar;
+          }
           this.onMessage(m);
           break;
         }
@@ -280,6 +312,29 @@ export class SuperAgentWebSocket {
           if (this.onToolResult) this.onToolResult(params);
           break;
         }
+        case 'room.typing': {
+          if (this.onTyping) this.onTyping(params);
+          break;
+        }
+        case 'message.receipts': {
+          if (this.onReceipts) this.onReceipts(params);
+          break;
+        }
+        case 'search.results': {
+          const rid = String(params?.resultId || '');
+          const roomId = String(params?.roomId || '');
+          if (rid && roomId) this.lastResultIdByRoom.set(roomId, rid);
+          if (rid && roomId) {
+            const arr = this.pendingResultWaiters.get(roomId);
+            if (arr && arr.length) {
+              this.pendingResultWaiters.set(roomId, []);
+              for (const fn of arr) {
+                try { fn(rid); } catch {}
+              }
+            }
+          }
+          break;
+        }
         default:
           // ignore unknown notifications
           break;
@@ -290,6 +345,18 @@ export class SuperAgentWebSocket {
   // Public API used by ChatInterface
   async joinRoom(roomId: string, userId?: string): Promise<any> {
     return this.sendRequestDedupe('room.join', { roomId, userId });
+  }
+
+  async markMessageRead(roomId: string, messageId: string, actorId?: string): Promise<any> {
+    return this.sendRequest('message.read', { roomId, messageId, ...(actorId ? { actorId } : {}) });
+  }
+
+  async typingStart(roomId: string, actorId?: string, ttlMs?: number): Promise<any> {
+    return this.sendRequest('typing.start', { roomId, ...(actorId ? { actorId } : {}), ...(ttlMs ? { ttlMs } : {}) });
+  }
+
+  async typingStop(roomId: string, actorId?: string): Promise<any> {
+    return this.sendRequest('typing.stop', { roomId, ...(actorId ? { actorId } : {}) });
   }
 
   async sendMessage(roomId: string, content: string, options?: Record<string, any>): Promise<any> {
@@ -317,7 +384,7 @@ export class SuperAgentWebSocket {
   }
 
   async executeAgentCommand(command: string, roomId: string, reason?: string): Promise<any> {
-    return this.sendRequest('agent.command', { roomId, command, reason });
+    return this.sendRequest('agent.execute', { roomId, command, reason });
   }
 
   // ElevenLabs
@@ -343,8 +410,21 @@ export class SuperAgentWebSocket {
     return this.sendRequest('tool.web.scrape', { roomId, url, ...(agentId ? { agentId } : {}) });
   }
 
-  async webScrapePick(index: number, roomId: string, agentId?: string): Promise<any> {
-    return this.sendRequest('tool.web.scrape.pick', { roomId, index, ...(agentId ? { agentId } : {}) });
+  async webScrapePick(index: number, roomId: string, agentId?: string, resultId?: string): Promise<any> {
+    const rid = resultId || this.lastResultIdByRoom.get(roomId);
+    return this.sendRequest('tool.web.scrape.pick', { roomId, index, ...(rid ? { resultId: rid } : {}), ...(agentId ? { agentId } : {}) });
+  }
+
+  // Code search
+  async codeSearch(
+    pattern: string,
+    roomId: string,
+    options?: { path?: string; glob?: string; maxResults?: number; caseInsensitive?: boolean; regex?: boolean },
+    agentId?: string,
+  ): Promise<any> {
+    const params: any = { roomId, pattern, ...(options || {}) };
+    if (agentId) params.agentId = agentId;
+    return this.sendRequest('tool.code.search', params);
   }
 
   // X/Twitter
@@ -715,10 +795,12 @@ export class SuperAgentWebSocketLegacy {
     });
   }
 
-  async webScrapePick(index: number, roomId: string, agentId?: string): Promise<any> {
+  async webScrapePick(index: number, roomId: string, agentId?: string, resultId?: string): Promise<any> {
+    // Do not depend on legacy internals here; only pass resultId if provided
     return this.sendRequestDedupe('tool.web.scrape.pick', {
       roomId,
       index,
+      ...(resultId ? { resultId } : {}),
       ...(agentId ? { agentId } : {}),
     });
   }

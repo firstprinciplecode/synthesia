@@ -24,8 +24,10 @@ import {
 } from "@/components/ui/sidebar";
 import { Upload, User, Mail, Phone, MapPin, Building, Globe, Save } from 'lucide-react';
 import { toast } from 'sonner';
+import { useSession } from 'next-auth/react';
 
 export default function ProfilePage() {
+  const { status, data: session } = useSession();
   const [profile, setProfile] = useState({
     name: '',
     email: '',
@@ -45,7 +47,10 @@ export default function ProfilePage() {
   useEffect(() => {
     const loadProfile = async () => {
       try {
-        const response = await fetch('http://localhost:3001/api/profile');
+        const headers: Record<string, string> = {};
+        const uid = (session as any)?.userId;
+        if (uid) headers['x-user-id'] = uid;
+        const response = await fetch('/api/profile', { headers });
         if (response.ok) {
           const data = await response.json();
           setProfile({
@@ -67,8 +72,12 @@ export default function ProfilePage() {
       }
     };
 
-    loadProfile();
-  }, []);
+    if (status === 'authenticated') {
+      loadProfile();
+    } else if (status === 'unauthenticated') {
+      setIsLoadingProfile(false);
+    }
+  }, [status, session]);
 
   const handleInputChange = (field: string, value: string) => {
     setProfile(prev => ({ ...prev, [field]: value }));
@@ -87,14 +96,14 @@ export default function ProfilePage() {
         const formData = new FormData();
         formData.append('file', file);
         
-        const response = await fetch('http://localhost:3001/api/uploads/avatar', {
+        const response = await fetch('/api/uploads/avatar', {
           method: 'POST',
           body: formData,
         });
         
         if (response.ok) {
           const data = await response.json();
-          const avatarUrl = `http://localhost:3001${data.url}`;
+          const avatarUrl = `${data.url}`;
           setProfile(prev => ({ ...prev, avatar: avatarUrl }));
           toast.success('Avatar uploaded successfully');
         } else {
@@ -112,11 +121,12 @@ export default function ProfilePage() {
   const handleSave = async () => {
     setIsLoading(true);
     try {
-      const response = await fetch('http://localhost:3001/api/profile', {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const uid = (session as any)?.userId;
+      if (uid) headers['x-user-id'] = uid;
+      const response = await fetch('/api/profile', {
         method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers,
         body: JSON.stringify(profile),
       });
       
@@ -164,6 +174,17 @@ export default function ProfilePage() {
               </CardContent>
             </Card>
           </div>
+        </SidebarInset>
+      </SidebarProvider>
+    );
+  }
+
+  if (status !== 'authenticated') {
+    return (
+      <SidebarProvider>
+        <AppSidebar />
+        <SidebarInset>
+          <div className="p-4 text-sm text-muted-foreground">Please sign in to edit your profile.</div>
         </SidebarInset>
       </SidebarProvider>
     );

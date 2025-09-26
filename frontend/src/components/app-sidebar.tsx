@@ -18,6 +18,7 @@ import { NavMain } from "@/components/nav-main"
 import { NavProjects } from "@/components/nav-projects"
 import { NavUser } from "@/components/nav-user"
 import { TeamSwitcher } from "@/components/team-switcher"
+import { useSession } from "next-auth/react"
 import {
   Sidebar,
   SidebarContent,
@@ -53,13 +54,13 @@ const data = {
   navMain: [
     {
       title: "Inbox",
-      url: "/",
+      url: "/inbox",
       icon: SquareTerminal,
       isActive: true,
       items: [
-        { title: "All Messages", url: "/" },
-        { title: "Unread", url: "/" },
-        { title: "Starred", url: "/" },
+        { title: "All Messages", url: "/inbox" },
+        { title: "Unread", url: "/inbox" },
+        { title: "Starred", url: "/inbox" },
       ],
     },
     {
@@ -69,6 +70,7 @@ const data = {
       items: [
         { title: "My Agents", url: "/agents" },
         { title: "Create Agent", url: "/agents/new" },
+        { title: "Connections", url: "/connections" },
       ],
     },
     {
@@ -101,19 +103,21 @@ const data = {
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const [user, setUser] = React.useState(data.user)
+  const { status, data: session } = useSession()
 
   React.useEffect(() => {
     let cancelled = false
     async function loadProfile() {
       try {
-        const res = await fetch("http://localhost:3001/api/profile", { cache: "no-store" })
+        const uid = (session as any)?.userId
+        const res = await fetch("/api/profile", { cache: "no-store", headers: uid ? { 'x-user-id': uid } : undefined })
         if (!res.ok) return
         const p = await res.json()
         if (cancelled) return
         const avatar = typeof p?.avatar === "string" && p.avatar.length
-          ? (p.avatar.startsWith("/") ? `http://localhost:3001${p.avatar}` : p.avatar)
+          ? (p.avatar.startsWith("/") ? `/uploads${p.avatar.replace(/^\/uploads/, "")}` : p.avatar)
           : (typeof p?.avatarUrl === "string" && p.avatarUrl.length
-              ? (p.avatarUrl.startsWith("/") ? `http://localhost:3001${p.avatarUrl}` : p.avatarUrl)
+              ? (p.avatarUrl.startsWith("/") ? p.avatarUrl : p.avatarUrl)
               : "")
         setUser({
           name: p?.name || p?.fullName || "User",
@@ -122,9 +126,13 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         })
       } catch {}
     }
-    loadProfile()
+    if (status === 'authenticated') {
+      loadProfile()
+    } else {
+      setUser({ name: "", email: "", avatar: "" })
+    }
     return () => { cancelled = true }
-  }, [])
+  }, [status])
 
   return (
     <Sidebar collapsible="icon" {...props}>
@@ -133,7 +141,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       </SidebarHeader>
       <SidebarContent>
         <NavMain items={data.navMain} />
-        <NavProjects />
+        {status === 'authenticated' ? <NavProjects /> : null}
       </SidebarContent>
       <SidebarFooter>
         <NavUser user={user} />

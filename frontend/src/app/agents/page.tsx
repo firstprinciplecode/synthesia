@@ -6,6 +6,8 @@ import { SidebarInset, SidebarProvider, SidebarTrigger } from '@/components/ui/s
 import { AppSidebar } from '@/components/app-sidebar';
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from '@/components/ui/breadcrumb';
 import { DataTableAgents, type AgentRow } from '@/components/data-table';
+import { useSession } from 'next-auth/react';
+
 
 type Agent = {
   id: string;
@@ -16,33 +18,22 @@ type Agent = {
 };
 
 export default function AgentsPage() {
+  const { status, data: session } = useSession();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  const getBackendHttpBase = () => {
-    // Prefer local dev default
-    try {
-      if (typeof window !== 'undefined') {
-        return 'http://localhost:3001';
-      }
-    } catch {}
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || '';
-    try {
-      const u = new URL(wsUrl);
-      const proto = u.protocol === 'wss:' ? 'https:' : 'http:';
-      return `${proto}//${u.host}`;
-    } catch {
-      return 'http://localhost:3001';
-    }
-  };
 
   useEffect(() => {
     async function load() {
       try {
         setError(null);
-        const base = getBackendHttpBase();
-        const res = await fetch(`${base}/api/agents`, { cache: 'no-store' });
+        const uid = (session as any)?.userId;
+        if (!uid) {
+          setAgents([]);
+          setLoading(false);
+          return;
+        }
+        const res = await fetch(`/api/agents`, { cache: 'no-store', headers: { 'x-user-id': uid } });
         if (!res.ok) {
           throw new Error(`${res.status} ${res.statusText}`);
         }
@@ -58,8 +49,13 @@ export default function AgentsPage() {
         setLoading(false);
       }
     }
-    load();
-  }, []);
+    if (status === 'authenticated') {
+      load();
+    } else if (status === 'unauthenticated') {
+      setAgents([]);
+      setLoading(false);
+    }
+  }, [status, session]);
 
   return (
     <SidebarProvider>
@@ -85,17 +81,21 @@ export default function AgentsPage() {
         <div className="p-4">
           <div className="flex items-center justify-between mb-3">
             <h1 className="text-base font-semibold">Agents</h1>
-            <Link href="/agents/new" className="text-sm font-semibold hover:underline">Create Agent</Link>
+            {status === 'authenticated' ? (
+              <Link href="/agents/new" className="text-sm font-semibold hover:underline">Create Agent</Link>
+            ) : null}
           </div>
-          {loading && <p className="text-sm text-muted-foreground">Loading…</p>}
-          {error && <p className="text-sm text-red-500">{error}</p>}
-          {!loading && !error && (
+          {status !== 'authenticated' && (
+            <div className="text-sm text-muted-foreground">
+              You must be signed in to view your agents. <Link href="/signin" className="underline">Sign in</Link>
+            </div>
+          )}
+          {status === 'authenticated' && loading && <p className="text-sm text-muted-foreground">Loading…</p>}
+          {status === 'authenticated' && error && <p className="text-sm text-red-500">{error}</p>}
+          {status === 'authenticated' && !loading && !error && (
             <DataTableAgents rows={agents.map((a): AgentRow => {
-              const base = getBackendHttpBase();
               const raw = (a as any).avatar as string | undefined;
-              const avatarUrl = raw
-                ? (raw.startsWith('/') ? `${base}${raw}` : raw)
-                : undefined;
+              const avatarUrl = raw ? (raw.startsWith('/') ? raw : raw) : undefined;
               return {
                 id: a.id,
                 name: a.name,

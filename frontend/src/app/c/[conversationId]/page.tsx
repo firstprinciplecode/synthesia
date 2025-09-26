@@ -8,27 +8,53 @@ import { ChatInterface } from '@/components/chat/ChatInterface';
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from '@/components/ui/breadcrumb';
 import { Separator } from '@/components/ui/separator';
 import { Users, PanelRight } from 'lucide-react';
+import { useSession } from 'next-auth/react';
 
 export default function ConversationPage() {
   const params = useParams();
-  const conversationId = (params?.conversationId as string) || 'default-room';
+  const conversationId = decodeURIComponent(((params?.conversationId as string) || 'default-room'));
   const [currentConversation, setCurrentConversation] = useState(conversationId);
   const [agentName, setAgentName] = useState<string>('');
+  const [agentAvatar, setAgentAvatar] = useState<string | undefined>(undefined);
+  const { data: session, status } = useSession();
 
   useEffect(() => {
-    setCurrentConversation(conversationId);
+    async function ensureRoom() {
+      setCurrentConversation(conversationId);
+      // If param looks like an agentId (uuid) and not an existing room, try to resolve per-user room
+      try {
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(conversationId);
+        if (!isUuid) return; // Only try for UUID-looking IDs
+        // Probe /api/rooms/:id; if 404, attempt /api/rooms/agent
+        const uid = (session as any)?.userId || (session as any)?.user?.email;
+        if (!uid) return;
+        const probe = await fetch(`/api/rooms/${conversationId}`, { cache: 'no-store', headers: { 'x-user-id': uid } });
+        if (probe.status === 404) {
+          const res = await fetch('/api/rooms/agent', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-user-id': uid }, body: JSON.stringify({ agentId: conversationId }) });
+          const json = await res.json();
+          const rid = json?.roomId;
+          if (rid && rid !== conversationId) {
+            window.location.replace(`/c/${rid}`);
+          }
+        }
+      } catch {}
+    }
+    ensureRoom();
   }, [conversationId]);
 
-  // Fetch agent name for breadcrumb
+  // Fetch agent/room name for breadcrumb (uses authenticated relative API with x-user-id)
   useEffect(() => {
     async function fetchAgentName() {
       try {
         if (!conversationId) return;
+        if (status !== 'authenticated') { setAgentName(''); return; }
+        const uid = (session as any)?.userId || (session as any)?.user?.email;
+        if (!uid) { setAgentName(''); return; }
         
         // Check if this is a compound conversation ID (contains multiple agent IDs)
         if (conversationId.includes('-') && conversationId.length > 36) {
           // This is likely a multi-agent conversation, try to fetch conversation details
-          const res = await fetch(`http://localhost:3001/api/conversations`);
+          const res = await fetch(`/api/conversations`, { cache: 'no-store', headers: { 'x-user-id': uid } });
           if (res.ok) {
             const data = await res.json();
             const conversation = data.conversations.find((c: any) => c.id === conversationId);
@@ -39,20 +65,34 @@ export default function ConversationPage() {
           }
         }
         
-        // Try to fetch as single agent
-        const res = await fetch(`http://localhost:3001/api/agents/${conversationId}`);
+        // Try to fetch room metadata first (dm or agent_chat)
+        const rm = await fetch(`/api/rooms/${conversationId}`, { cache: 'no-store', headers: { 'x-user-id': uid } });
+        if (rm.ok) {
+          const data = await rm.json();
+          if ((data?.room?.kind === 'dm' || data?.room?.kind === 'agent_chat')) {
+            if (data.dm?.title) setAgentName(data.dm.title);
+            else if (data?.room?.title) setAgentName(data.room.title);
+            if (data.dm?.avatar) setAgentAvatar(data.dm.avatar);
+            return;
+          }
+        }
+
+        // Fallback: treat as agent room
+        const res = await fetch(`/api/agents/${conversationId}`, { cache: 'no-store', headers: { 'x-user-id': uid } });
         if (res.ok) {
           const data = await res.json();
           setAgentName(data.name || conversationId);
+          setAgentAvatar(data.avatar || undefined);
         } else {
           setAgentName(conversationId);
+          setAgentAvatar(undefined);
         }
       } catch {
         setAgentName(conversationId);
       }
     }
     fetchAgentName();
-  }, [conversationId]);
+  }, [conversationId, status, session]);
 
   return (
     <SidebarProvider>

@@ -24,6 +24,7 @@ import { Input } from '@/components/ui/input';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useSidebar } from '@/components/ui/sidebar';
+import { useSession } from 'next-auth/react';
 
 const WEBSOCKET_URL = resolveWsUrl();
 
@@ -36,6 +37,7 @@ export function ChatInterface({
   currentConversation?: string;
   onConversationChange?: (conversationId: string) => void;
 }) {
+  const { data: session, status: sessionStatus } = useSession();
   const [messages, setMessages] = useState<ChatMessageType[]>([]);
   const [streamingMessages, setStreamingMessages] = useState<Map<string, string>>(new Map());
   const [isConnected, setIsConnected] = useState(false);
@@ -50,6 +52,11 @@ export function ChatInterface({
   const [executedEleven, setExecutedEleven] = useState<Set<string>>(new Set());
   const [participants, setParticipants] = useState<Array<{ id: string; type: 'user' | 'agent'; name: string; avatar?: string | null; status?: string }>>([]);
   const participantsRef = useRef<Array<{ id: string; type: 'user' | 'agent'; name: string; avatar?: string | null; status?: string }>>([]);
+  const [typing, setTyping] = useState<Array<{ actorId: string; type?: 'user'|'agent' }>>([]);
+  const typingDebounceRef = useRef<any>(null);
+  const [hasMore, setHasMore] = useState<boolean>(true);
+  const [receipts, setReceipts] = useState<Map<string, Set<string>>>(new Map()); // messageId -> actorIds
+  const loadingMoreRef = useRef<boolean>(false);
   const rightOpen = useUIStore(s => s.rightOpen);
   const rightTab = useUIStore(s => s.rightTab);
   const setRightOpen = useUIStore(s => s.setRightOpen);
@@ -58,6 +65,7 @@ export function ChatInterface({
   const [showAddAgent, setShowAddAgent] = useState(false);
   const [allAgents, setAllAgents] = useState<Array<{ id: string; name: string; avatar?: string }>>([]);
   const [agentSearch, setAgentSearch] = useState('');
+  const [roomKind, setRoomKind] = useState<'dm' | 'agent_chat' | 'multi' | undefined>(undefined);
   
   const { state: sidebarState } = useSidebar();
   const wsRef = useRef<WSClient | null>(null);
@@ -66,6 +74,7 @@ export function ChatInterface({
   const seenSuggestionIdsRef = useRef<Set<string>>(new Set());
   const streamBuffersRef = useRef<Map<string, string>>(new Map());
   const streamTimersRef = useRef<Map<string, any>>(new Map());
+  const handledSuggestionIdsRef = useRef<Set<string>>(new Set());
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -96,11 +105,12 @@ export function ChatInterface({
   }, [messages]);
 
   useEffect(() => {
+    if (sessionStatus !== 'authenticated') return;
     connectWebSocket();
     return () => {
       wsRef.current?.disconnect();
     };
-  }, []);
+  }, [sessionStatus]);
   // Load agents when opening the add-agent modal
   useEffect(() => {
     if (!showAddAgent) return;
@@ -169,40 +179,182 @@ export function ChatInterface({
       try {
         if (!currentRoom) return;
         const base = getHttpBaseFromWs(WEBSOCKET_URL);
-        const res = await fetch(`${base}/api/agents/${currentRoom}`);
+        const uid = (session as any)?.userId || (session as any)?.user?.email;
+        const headers = uid ? { 'x-user-id': uid } : undefined;
+        // Try DM metadata first (with auth header)
+        const rm = await fetch(`${base}/api/rooms/${encodeURIComponent(currentRoom)}`, { cache: 'no-store', ...(headers ? { headers } : {}) });
+        if (rm.ok) {
+          const data = await rm.json();
+          if ((data?.room?.kind === 'dm' || data?.room?.kind === 'agent_chat') && data.dm?.title) {
+            const avatar = data.dm.avatar as string | undefined;
+            const resolved = avatar ? (avatar.startsWith('/') ? `${base}${avatar}` : avatar) : undefined;
+            if (!cancelled) setAgentMeta({ name: data.dm.title, avatarUrl: resolved });
+            if (!cancelled) setRoomKind(data?.room?.kind === 'dm' ? 'dm' : 'agent_chat');
+            return;
+          }
+        }
+        // Fallback to agent metadata
+        const res = await fetch(`${base}/api/agents/${encodeURIComponent(currentRoom)}`, { cache: 'no-store', ...(headers ? { headers } : {}) });
         if (!res.ok) { if (!cancelled) setAgentMeta({}); return; }
         const data = await res.json();
         const avatar = data.avatar as string | undefined;
         const resolvedAvatar = avatar ? (avatar.startsWith('/') ? `${base}${avatar}` : avatar) : undefined;
         if (!cancelled) setAgentMeta({ name: data.name, avatarUrl: resolvedAvatar });
+        if (!cancelled) setRoomKind('agent_chat');
       } catch {
         if (!cancelled) setAgentMeta({});
       }
     }
     loadMeta();
     return () => { cancelled = true; };
-  }, [currentRoom]);
+  }, [currentRoom, session]);
 
-  // Load user profile data
+  // Load recent message history when room changes or connects
+  useEffect(() => {
+    let cancelled = false;
+    function normalizeApiMessage(m: any): any {
+      const content = Array.isArray(m.content)
+        ? m.content.map((c: any) => String(c?.text || '')).join('')
+        : (typeof m.content === 'string' ? m.content : '');
+      const msg: any = {
+        id: String(m.id || crypto.randomUUID()),
+        role: String(m.role || (m.authorType === 'user' ? 'user' : 'assistant')),
+        content,
+        timestamp: new Date(m.createdAt || m.updatedAt || Date.now()),
+        streaming: false,
+      };
+      if (m.authorId) msg.authorId = String(m.authorId);
+      if (m.authorType) msg.authorType = String(m.authorType);
+      if (m.authorName) msg.userName = String(m.authorName);
+      if (m.authorAvatar) {
+        const baseUrl = getHttpBaseFromWs(WEBSOCKET_URL);
+        msg.userAvatar = typeof m.authorAvatar === 'string' && m.authorAvatar.startsWith('/')
+          ? `${baseUrl}${m.authorAvatar}`
+          : m.authorAvatar;
+      }
+      if (m.authorUserId) msg.authorUserId = String(m.authorUserId);
+      return msg;
+    }
+    async function loadHistory() {
+      try {
+        if (!currentRoom) return;
+        const base = getHttpBaseFromWs(WEBSOCKET_URL);
+        const uid = (session as any)?.userId || (session as any)?.user?.email;
+        const headers = uid ? { 'x-user-id': uid } : undefined;
+        const limit = 50;
+        let res = await fetch(`${base}/api/rooms/${encodeURIComponent(currentRoom)}/messages?limit=${limit}`, { cache: 'no-store', ...(headers ? { headers } : {}) });
+        if (!res.ok && (res.status === 401 || res.status === 403)) {
+          // Retry once after a short delay in case session/header wasn’t ready
+          await new Promise(r => setTimeout(r, 400));
+          res = await fetch(`${base}/api/rooms/${encodeURIComponent(currentRoom)}/messages?limit=${limit}`, { cache: 'no-store', ...(headers ? { headers } : {}) });
+        }
+        if (!res.ok) return;
+        const data = await res.json();
+        const list = Array.isArray(data?.messages) ? data.messages : [];
+        const normalized = list.map(normalizeApiMessage);
+        // Oldest first from API? Ensure ascending order for rendering
+        normalized.sort((a: any, b: any) => a.timestamp.getTime() - b.timestamp.getTime());
+        if (!cancelled) setMessages(normalized);
+        if (!cancelled) setHasMore(list.length >= limit);
+      } catch {}
+    }
+    loadHistory();
+    return () => { cancelled = true; };
+  }, [currentRoom, session, sessionStatus]);
+
+  // Load older messages when scrolled to top
+  const loadOlderHistory = async () => {
+    if (loadingMoreRef.current || !hasMore) return;
+    loadingMoreRef.current = true;
+    try {
+      const base = getHttpBaseFromWs(WEBSOCKET_URL);
+      const uid = (session as any)?.userId || (session as any)?.user?.email;
+      const headers = uid ? { 'x-user-id': uid } : undefined;
+      // Find oldest timestamp
+      const oldest = messages.reduce<number | null>((min, m) => {
+        const t = (m.timestamp instanceof Date ? m.timestamp : new Date());
+        const ms = t.getTime();
+        return min === null || ms < min ? ms : min;
+      }, null);
+      if (!oldest) { loadingMoreRef.current = false; return; }
+      const before = new Date(oldest - 1).toISOString();
+      const limit = 50;
+      const res = await fetch(`${base}/api/rooms/${encodeURIComponent(currentRoom)}/messages?limit=${limit}&before=${encodeURIComponent(before)}`, { cache: 'no-store', ...(headers ? { headers } : {}) });
+      if (!res.ok) { loadingMoreRef.current = false; return; }
+      const data = await res.json();
+      const list = Array.isArray(data?.messages) ? data.messages : [];
+      if (list.length === 0) { setHasMore(false); loadingMoreRef.current = false; return; }
+      const normalized = list.map((m: any) => {
+        // reuse normalization logic defined above
+        const baseMsg: any = {
+          id: String(m.id || crypto.randomUUID()),
+          role: String(m.role || (m.authorType === 'user' ? 'user' : 'assistant')),
+          content: Array.isArray(m.content) ? m.content.map((c: any) => String(c?.text || '')).join('') : (typeof m.content === 'string' ? m.content : ''),
+          timestamp: new Date(m.createdAt || m.updatedAt || Date.now()),
+          streaming: false,
+        };
+        if (m.authorId) baseMsg.authorId = String(m.authorId);
+        if (m.authorType) baseMsg.authorType = String(m.authorType);
+        if (m.authorUserId) baseMsg.authorUserId = String(m.authorUserId);
+        if (m.authorName) baseMsg.userName = String(m.authorName);
+        if (m.authorAvatar) {
+          const baseUrl = getHttpBaseFromWs(WEBSOCKET_URL);
+          baseMsg.userAvatar = typeof m.authorAvatar === 'string' && m.authorAvatar.startsWith('/') ? `${baseUrl}${m.authorAvatar}` : m.authorAvatar;
+        }
+        return baseMsg;
+      });
+      normalized.sort((a: any, b: any) => a.timestamp.getTime() - b.timestamp.getTime());
+      setMessages(prev => {
+        const existingIds = new Set(prev.map(m => m.id));
+        const deduped = normalized.filter(m => !existingIds.has(m.id));
+        return [...deduped, ...prev];
+      });
+      setHasMore(list.length >= limit);
+    } catch {
+      // noop
+    } finally {
+      loadingMoreRef.current = false;
+    }
+  };
+
+  // Load user profile data (only after session is authenticated to avoid 401 noise)
   useEffect(() => {
     let cancelled = false;
     async function loadUserProfile() {
       try {
+        if (sessionStatus !== 'authenticated') return;
         const base = getHttpBaseFromWs(WEBSOCKET_URL);
-        const res = await fetch(`${base}/api/profile`);
-        if (!res.ok) { if (!cancelled) setUserMeta({}); return; }
-        const data = await res.json();
-        if (!cancelled) {
-          setUserMeta({ name: data.name, avatarUrl: data.avatar });
-          if (data?.id) setCurrentUserId(String(data.id));
+        const uid = (session as any)?.userId || (session as any)?.user?.email;
+        const headers = uid ? { 'x-user-id': uid } : undefined;
+        const res = await fetch(`${base}/api/profile`, { cache: 'no-store', ...(headers ? { headers } : {}) });
+        if (res.ok) {
+          const data = await res.json();
+          if (!cancelled) {
+            setUserMeta({ name: data.name, avatarUrl: data.avatar });
+            if (data?.id) setCurrentUserId(String(data.id));
+            try { (window as any).__superagent_uid = String(data.id); } catch {}
+          }
+          return;
         }
+        // Fallback if /api/profile fails
+        try {
+          const me = await fetch(`${base}/api/actors/me`, { cache: 'no-store', ...(headers ? { headers } : {}) });
+          if (me.ok) {
+            const m = await me.json();
+            if (!cancelled && m?.ownerUserId) {
+              setCurrentUserId(String(m.ownerUserId));
+              try { (window as any).__superagent_uid = String(m.ownerUserId); } catch {}
+            }
+          }
+        } catch {}
+        if (!cancelled) setUserMeta({});
       } catch {
         if (!cancelled) setUserMeta({});
       }
     }
     loadUserProfile();
     return () => { cancelled = true; };
-  }, []);
+  }, [sessionStatus, session]);
 
   // Backfill agent metadata onto any assistant messages missing it
   useEffect(() => {
@@ -219,6 +371,28 @@ export function ChatInterface({
       return changed ? next : prev;
     });
   }, [agentMeta]);
+
+  // After participants are set, backfill user labels for any user messages missing them
+  useEffect(() => {
+    setMessages(prev => {
+      let changed = false;
+      const updated = prev.map(m => {
+        if (m.role === 'user' && !((m as any).userName)) {
+          const auid = (m as any).authorUserId as string | undefined;
+          const aid = (m as any).authorId as string | undefined;
+          const p = participantsRef.current.find(p => p.type === 'user' && (p.id === auid || p.id === aid));
+          if (p) {
+            changed = true;
+            const base = getHttpBaseFromWs(WEBSOCKET_URL);
+            const avatar = p.avatar && typeof p.avatar === 'string' && p.avatar.startsWith('/') ? `${base}${p.avatar}` : p.avatar;
+            return { ...(m as any), userName: p.name, ...(avatar ? { userAvatar: avatar } : {}) };
+          }
+        }
+        return m;
+      });
+      return changed ? updated : prev;
+    });
+  }, [participants]);
 
   // Handle TTS execution after messages are stable
   useEffect(() => {
@@ -242,6 +416,21 @@ export function ChatInterface({
       getParticipants: () => participantsRef.current,
       getDefaults: () => ({ name: agentMeta.name, avatarUrl: agentMeta.avatarUrl }),
       onMessage: (message) => {
+        // Ensure user-authored messages carry a friendly name/avatar directly from participants
+        try {
+          if (message.role === 'user') {
+            const auid = (message as any).authorUserId as string | undefined;
+            const aid = (message as any).authorId as string | undefined;
+            const p = participantsRef.current.find(p => p.type === 'user' && (p.id === auid || p.id === aid));
+            if (p) {
+              if (!(message as any).userName && p.name) (message as any).userName = p.name;
+              if (!(message as any).userAvatar && p.avatar) {
+                const base = getHttpBaseFromWs(WEBSOCKET_URL);
+                (message as any).userAvatar = typeof p.avatar === 'string' && p.avatar.startsWith('/') ? `${base}${p.avatar}` : p.avatar as any;
+              }
+            }
+          }
+        } catch {}
         setMessages(prev => {
           // If a terminal result arrives, replace the latest placeholder instead of appending
           if (message.role === 'terminal' && (message as any).terminalResult) {
@@ -277,7 +466,9 @@ export function ChatInterface({
             const merged = upsertMessage(prev, messageWithIdentity as any);
             if (merged !== prev) {
               const suggestion = extractTerminalSuggestions(message.content);
-              if (suggestion) setPendingTerminalSuggestions(prevMap => { const map = new Map(prevMap); map.set(message.id, suggestion); return map; });
+              if (suggestion && !handledSuggestionIdsRef.current.has(message.id)) {
+                setPendingTerminalSuggestions(prevMap => { const map = new Map(prevMap); map.set(message.id, suggestion); return map; });
+              }
               return merged;
             }
           }
@@ -289,7 +480,7 @@ export function ChatInterface({
           // Check for terminal suggestions in assistant messages
           if (message.role === 'assistant') {
             const suggestion = extractTerminalSuggestions(message.content);
-            if (suggestion) {
+            if (suggestion && !handledSuggestionIdsRef.current.has(message.id)) {
               setPendingTerminalSuggestions(prev => {
                 const updated = new Map(prev);
                 updated.set(message.id, suggestion);
@@ -370,9 +561,11 @@ export function ChatInterface({
                   console.log('Delta: No matching participant found for authorId:', authorId);
                 }
               }
+              const preservedClientId = (updated[idx] as any).clientId || (updated[idx] as any).id;
               updated[idx] = { 
                 ...(updated[idx] as any), 
-                id: messageId, // Update the ID to match the streaming message
+                id: messageId, // Update server id
+                clientId: preservedClientId, // Preserve stable client id for UI keys
                 content: buffered, 
                 streaming: true,
                 agentName,
@@ -392,10 +585,12 @@ export function ChatInterface({
                 initialAgentAvatar = p.avatar || undefined;
               }
             }
+            const clientId = crypto.randomUUID();
             return [
               ...prev,
               {
                 id: messageId,
+                clientId,
                 role: 'assistant',
                 content: buffered,
                 timestamp: new Date(),
@@ -418,8 +613,18 @@ export function ChatInterface({
           let userId: string | undefined = undefined;
           try {
             const base = getHttpBaseFromWs(WEBSOCKET_URL);
-            const prof = await fetch(`${base}/api/profile`, { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
-            userId = prof?.id || 'default-user';
+            const uid = (session as any)?.userId || (session as any)?.user?.email;
+            const headers = uid ? { 'x-user-id': uid } : undefined;
+            const profRes = await fetch(`${base}/api/profile`, { cache: 'no-store', ...(headers ? { headers } : {}) });
+            if (profRes.ok) {
+              const prof = await profRes.json();
+              userId = prof?.id || 'default-user';
+            } else {
+              // Fallback to actors/me when profile is unauthorized or missing
+              const me = await fetch(`${base}/api/actors/me`, { cache: 'no-store', ...(headers ? { headers } : {}) }).then(r => r.ok ? r.json() : null);
+              if (me?.ownerUserId) userId = String(me.ownerUserId);
+            }
+            if (!userId) userId = 'default-user';
           } catch {}
 
           // Join the default room with userId (fire-and-forget)
@@ -496,6 +701,18 @@ export function ChatInterface({
           return next;
         });
       },
+      onTyping: (payload: { roomId: string; typing: Array<{ actorId: string; type?: 'user'|'agent' }>; updatedAt: string }) => {
+        if (payload.roomId !== currentRoom) return;
+        setTyping(payload.typing || []);
+      },
+      onReceipts: (payload: { roomId: string; messageId: string; actorIds: string[]; updatedAt: string }) => {
+        if (payload.roomId !== currentRoom) return;
+        setReceipts(prev => {
+          const next = new Map(prev);
+          next.set(payload.messageId, new Set(payload.actorIds || []));
+          return next;
+        });
+      },
     });
 
     try {
@@ -513,7 +730,7 @@ export function ChatInterface({
     // Support normal, smart, and single quotes around the text argument
     const patterns = [
       /elevenlabs\.tts\s+\"([^\"]+)\"(.*)$/i,
-      /elevenlabs\.tts\s+“([^”]+)”(.*)$/i,
+      /elevenlabs\.tts\s+“([^"]+)"(.*)$/i,
       /elevenlabs\.tts\s+'([^']+)'(.*)$/i,
     ];
     let match: RegExpMatchArray | null = null;
@@ -870,11 +1087,12 @@ export function ChatInterface({
           temp: true,
         };
         
-        // Only add assistant placeholder if we have agent meta (single-agent room) or no agent mentions (generic response)
-        // For multi-agent rooms with mentions, wait for the actual agent response to avoid placeholder
+        // DM rooms or rooms without agents: do NOT add assistant placeholder
+        const agentCount = participantsRef.current.filter(p => p.type === 'agent').length;
+        const isAgentless = agentCount === 0;
         const hasMentions = /@\w+/.test(content);
-        const isMultiAgent = participantsRef.current.filter(p => p.type === 'agent').length > 1;
-        const shouldShowPlaceholder = !isMultiAgent || !hasMentions || agentMeta.name;
+        const isMultiAgent = agentCount > 1;
+        const shouldShowPlaceholder = !isAgentless && (!isMultiAgent || !hasMentions || !!agentMeta.name);
         
         let assistantLoader = null;
         if (shouldShowPlaceholder) {
@@ -1062,11 +1280,35 @@ export function ChatInterface({
       return;
     }
     // Web scraper tools
-    const wsPick = normalized.match(/^tool\.web\.scrape\.pick\s*\{\s*index:\s*(\d+)\s*\}$/i) || normalized.match(/^tool\.web\.scrape\.pick\s+(\d+)$/i);
-    if (wsPick) {
-      const idx = parseInt(wsPick[1], 10);
+    const wsPickJson = normalized.match(/^tool\.web\.scrape\.pick\s*\{\s*index:\s*(\d+)\s*(?:,\s*resultId:\s*\"([^\"]+)\")?\s*\}$/i);
+    const wsPickSimple = normalized.match(/^tool\.web\.scrape\.pick\s+(\d+)$/i);
+    if (wsPickJson) {
+      const idx = parseInt(wsPickJson[1], 10);
+      const rid = wsPickJson[2];
       if (!Number.isNaN(idx)) {
-        await wsRef.current!.webScrapePick(idx, currentRoom, attributedAgentId);
+        await wsRef.current!.webScrapePick(idx, currentRoom, attributedAgentId, rid);
+        return;
+      }
+    }
+    if (wsPickSimple) {
+      const idx = parseInt(wsPickSimple[1], 10);
+      if (!Number.isNaN(idx)) {
+        // If we don't yet have a resultId cached, wait briefly for search.results
+        let rid = wsRef.current?.getLastResultId?.(currentRoom) as any;
+        if (!rid) {
+          rid = await new Promise<string | undefined>((resolve) => {
+            const timeout = setTimeout(() => resolve(undefined), 1000);
+            try {
+              // Hook into websocket client internal waiter list
+              const anyClient = wsRef.current as any;
+              anyClient.client?.pendingResultWaiters?.set?.(currentRoom, [ (r: string) => { clearTimeout(timeout); resolve(r); } ]);
+            } catch {
+              clearTimeout(timeout);
+              resolve(undefined);
+            }
+          });
+        }
+        await wsRef.current!.webScrapePick(idx, currentRoom, attributedAgentId, rid);
         return;
       }
     }
@@ -1074,6 +1316,20 @@ export function ChatInterface({
     if (wsScrape) {
       const url = wsScrape[1];
       await wsRef.current!.webScrape(url, currentRoom, attributedAgentId);
+      return;
+    }
+    // Code search: accept JSON-like or simple form
+    const codeJson = normalized.match(/^tool\.code\.search\s*\{\s*pattern:\s*\"([^\"]+)\"(,\s*path:\s*\"([^\"]+)\")?[^}]*\}$/i);
+    const codeSimple = normalized.match(/^tool\.code\.search\s+\"([^\"]+)\"$/i) || normalized.match(/^tool\.code\.search\s+(.+)$/i);
+    if (codeJson) {
+      const pattern = codeJson[1];
+      const path = codeJson[3];
+      await wsRef.current!.codeSearch(pattern, currentRoom, path ? { path } : undefined, attributedAgentId);
+      return;
+    }
+    if (codeSimple) {
+      const pattern = (codeSimple[1] || '').trim();
+      await wsRef.current!.codeSearch(pattern, currentRoom, undefined, attributedAgentId);
       return;
     }
     await handleApproveTerminalCommand(normalized);
@@ -1101,17 +1357,17 @@ export function ChatInterface({
       prev = result;
       result = result.trim();
       // Strip surrounding backticks/quotes repeatedly
-      result = result.replace(/^[`\"'“”‘’]+/, '').replace(/[`\"'“”‘’]+$/, '');
+      result = result.replace(/^[`\"'“"']+/, '').replace(/[`\"'“"']+$/, '');
       // Remove any number of leading prompt tokens like $, #, > with spaces
       result = result.replace(/^(?:[$#>]+\s*)+/, '');
     }
     // Remove trailing code fences/punctuation
-    result = result.replace(/[`\"'“”‘’\s]*[\?\.!`]*$/, '').trim();
+    result = result.replace(/[`\"'“"'\s]*[\?\.!`]*$/, '').trim();
     // Heuristic: strip trailing natural-language clause starting with " to "
     const toIdx = result.toLowerCase().indexOf(' to ');
     if (toIdx > -1) {
       const tail = result.slice(toIdx + 4);
-      if (/^[a-z\s.,'“”‘’`-]+$/.test(tail)) {
+      if (/^[a-z\s.,'"'']`-]+$/.test(tail)) {
         result = result.slice(0, toIdx).trim();
       }
     }
@@ -1176,6 +1432,7 @@ export function ChatInterface({
         return { command, reason };
       }
     }
+    // Disable auto-synthesized scrape approvals from generic assistant phrasing
     return null;
   };
 
@@ -1231,6 +1488,15 @@ export function ChatInterface({
     return 0;
   });
 
+  // Mark most recent assistant message as read when we become focused/connected
+  useEffect(() => {
+    if (!wsRef.current?.isConnected() || !currentUserId) return;
+    if (!allMessages.length) return;
+    const last = allMessages[allMessages.length - 1];
+    if (!last || !last.id) return;
+    try { (wsRef.current as any).markRead?.(currentRoom, last.id, currentUserId); } catch {}
+  }, [allMessages.length, currentRoom, currentUserId, isConnected]);
+
   return (
     <div className="relative h-full flex flex-col overflow-hidden">
       <div className={cn(
@@ -1249,6 +1515,11 @@ export function ChatInterface({
           participantsRef={participantsRef}
           routeApprovedCommand={routeApprovedCommand}
           handleRejectTerminalCommand={handleRejectTerminalCommand}
+          currentUserId={currentUserId}
+          onLoadMore={loadOlderHistory}
+          hasMore={hasMore}
+          loadingMore={loadingMoreRef.current}
+          receipts={receipts}
         />
       </div>
 
@@ -1261,6 +1532,13 @@ export function ChatInterface({
         toolRuns={toolRuns}
         participants={participants}
         agentMeta={agentMeta}
+        currentRoomId={currentRoom}
+        onInvite={async (value) => {
+          try {
+            const base = getHttpBaseFromWs(WEBSOCKET_URL);
+            await fetch(`${base}/api/rooms/${currentRoom}/invite`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+          } catch (e) { /* noop */ }
+        }}
       />
 
       {/* Footer input fixed to viewport bottom, responsive to both sidebars */}
@@ -1270,6 +1548,21 @@ export function ChatInterface({
         disabled={!isConnected}
         availableProviders={availableProviders}
         availableModels={availableModels}
+        onTyping={(ev) => {
+          if (!wsRef.current?.isConnected()) return;
+          if (ev === 'start') {
+            if (typingDebounceRef.current) clearTimeout(typingDebounceRef.current);
+            // send start immediately and then debounce stop
+            try { (wsRef.current as any)?.typingStart?.(currentRoom, undefined, 3000); } catch {}
+            typingDebounceRef.current = setTimeout(() => {
+              try { (wsRef.current as any)?.typingStop?.(currentRoom); } catch {}
+            }, 1500);
+          } else {
+            if (typingDebounceRef.current) clearTimeout(typingDebounceRef.current);
+            try { (wsRef.current as any)?.typingStop?.(currentRoom); } catch {}
+          }
+        }}
+        placeholder={(roomKind === 'dm' || roomKind === 'agent_chat') && agentMeta.name ? `Message @${agentMeta.name}` : undefined}
       />
     </div>
   );
