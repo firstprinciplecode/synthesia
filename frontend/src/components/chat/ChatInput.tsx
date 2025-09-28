@@ -1,10 +1,10 @@
+
 'use client';
 
-import { useRef, useState } from 'react';
+import { useRef, useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
-import { Card } from '@/components/ui/card';
-import { Send, Settings, Mic, ArrowUp, MoreHorizontal, Plus, Terminal } from 'lucide-react';
+import { ArrowUp, Plus, Terminal } from 'lucide-react';
 import {
   Select,
   SelectContent,
@@ -52,6 +52,7 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [], av
   const [mentionQuery, setMentionQuery] = useState('');
   const [mentionIndex, setMentionIndex] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [mentionPos, setMentionPos] = useState<{ left: number; top: number }>({ left: 0, top: 0 });
   
   // Keep the textarea one-line by default and auto-grow when needed
   const resizeTextarea = () => {
@@ -129,6 +130,46 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [], av
     }
   };
 
+  // Compute caret coordinates relative to the input container
+  const updateMentionPosition = () => {
+    const el = textareaRef.current;
+    if (!el) return;
+    try {
+      const pos = el.selectionStart ?? el.value.length;
+      // Mirror element technique
+      const div = document.createElement('div');
+      const style = window.getComputedStyle(el);
+      const props = [
+        'boxSizing','width','paddingTop','paddingRight','paddingBottom','paddingLeft',
+        'borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth',
+        'fontFamily','fontSize','fontWeight','fontStyle','letterSpacing','textTransform',
+        'lineHeight','textAlign','whiteSpace','wordBreak','wordSpacing','wordWrap','overflowWrap'
+      ] as const;
+      div.style.position = 'absolute';
+      div.style.visibility = 'hidden';
+      div.style.whiteSpace = 'pre-wrap';
+      div.style.wordWrap = 'break-word';
+      for (const p of props) {
+        (div.style as unknown as Record<string, string>)[p] = (style as unknown as Record<string, string>)[p];
+      }
+      div.style.width = style.width;
+      div.textContent = el.value.substring(0, pos);
+      const span = document.createElement('span');
+      span.textContent = el.value.substring(pos) || '.';
+      div.appendChild(span);
+      document.body.appendChild(div);
+      const spanRect = span.getBoundingClientRect();
+      const divRect = div.getBoundingClientRect();
+      const elRect = el.getBoundingClientRect();
+      const container = el.parentElement; // our relative wrapper
+      const contRect = container ? container.getBoundingClientRect() : elRect;
+      const left = spanRect.left - divRect.left + elRect.left - contRect.left - el.scrollLeft;
+      const top = spanRect.top - divRect.top + elRect.top - contRect.top - el.scrollTop;
+      setMentionPos({ left: Math.max(0, left), top: Math.max(0, top) });
+      document.body.removeChild(div);
+    } catch {}
+  };
+
   const onChangeMessage = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     setMessage(val);
@@ -151,12 +192,15 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [], av
         setShowMentionMenu(shouldShow);
         setMentionQuery(query);
         setMentionIndex(0);
+        if (shouldShow) updateMentionPosition();
         return;
       }
     }
     setShowMentionMenu(false);
     setMentionQuery('');
   };
+
+  useEffect(() => { if (showMentionMenu) updateMentionPosition(); }, [showMentionMenu]);
 
   const providerModels = availableModels
     .filter(m => m.provider === selectedProvider)
@@ -172,6 +216,7 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [], av
               value={message}
               onChange={onChangeMessage}
               onKeyDown={handleKeyDown}
+              onScroll={() => { if (showMentionMenu) updateMentionPosition(); }}
               placeholder={placeholderOverride || (terminalMode ? "Enter terminal command..." : "Ask anything")}
               rows={1}
               className="min-h-[40px] resize-none pr-20 pl-20 py-2 rounded-xl border border-border focus:border-ring focus:ring-0 text-[15px] leading-6 bg-background animate-glow"
@@ -179,7 +224,10 @@ export function ChatInput({ onSendMessage, disabled, availableProviders = [], av
             />
 
             {showMentionMenu && filteredMentions.length > 0 && (
-              <div className="absolute left-20 bottom-12 z-20 w-56 rounded-md border bg-popover text-popover-foreground shadow-md">
+              <div
+                className="absolute z-20 w-56 rounded-md border bg-popover text-popover-foreground shadow-md"
+                style={{ left: mentionPos.left + 20, top: mentionPos.top, transform: 'translateY(calc(-100% - 8px))' }}
+              >
                 <ul className="max-h-60 overflow-auto py-1 text-sm">
                   {filteredMentions.map((item, i) => (
                     <li

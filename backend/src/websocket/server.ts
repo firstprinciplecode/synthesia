@@ -1169,7 +1169,21 @@ ${personaBlock}${memoryContext}`,
             return result;
           },
           onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: (primaryAgentId || roomId), authorType: 'agent' } }),
-          onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' } } as MessageDeltaNotification),
+          onDelta: async (delta) => {
+            const aid = (primaryAgentId || roomId);
+            let authorName: string | undefined;
+            let authorAvatar: string | undefined;
+            try {
+              if (primaryAgentId) {
+                const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+                if (arows && arows.length) {
+                  authorName = (arows[0] as any).name || undefined;
+                  authorAvatar = (arows[0] as any).avatar || undefined;
+                }
+              }
+            } catch {}
+            this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } } as MessageDeltaNotification);
+          },
           getCatalog: () => this.toolRegistry.catalog(),
           getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
         });
@@ -1226,7 +1240,21 @@ ${personaBlock}${memoryContext}`,
           responseText = approvedText;
         }
         
-        this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: responseText }] }, authorId: (primaryAgentId || roomId), authorType: 'agent' } });
+        {
+          const aid = (primaryAgentId || roomId);
+          let authorName: string | undefined;
+          let authorAvatar: string | undefined;
+          try {
+            if (primaryAgentId) {
+              const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+              if (arows && arows.length) {
+                authorName = (arows[0] as any).name || undefined;
+                authorAvatar = (arows[0] as any).avatar || undefined;
+              }
+            }
+          } catch {}
+          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: responseText }] }, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } });
+        }
       } else {
         const { fullResponse } = await this.orchestrator.streamPrimaryAgentResponse({
           roomId,
@@ -1236,20 +1264,38 @@ ${personaBlock}${memoryContext}`,
           userProfile,
           userMessage,
           runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
-          onDelta: (delta: string) => {
-            this.bus.broadcastToRoom(roomId, {
-              jsonrpc: '2.0',
-              method: 'message.delta',
-              params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' },
-            } as MessageDeltaNotification);
+          onDelta: async (delta: string) => {
+            const aid = (primaryAgentId || roomId);
+            let authorName: string | undefined;
+            let authorAvatar: string | undefined;
+            try {
+              if (primaryAgentId) {
+                const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+                if (arows && arows.length) {
+                  authorName = (arows[0] as any).name || undefined;
+                  authorAvatar = (arows[0] as any).avatar || undefined;
+                }
+              }
+            } catch {}
+            this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } } as MessageDeltaNotification);
           },
         });
         responseText = fullResponse;
-        this.bus.broadcastToRoom(roomId, {
-          jsonrpc: '2.0',
-          method: 'message.complete',
-          params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] }, authorId: (primaryAgentId || roomId), authorType: 'agent' },
-        });
+        {
+          const aid = (primaryAgentId || roomId);
+          let authorName: string | undefined;
+          let authorAvatar: string | undefined;
+          try {
+            if (primaryAgentId) {
+              const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+              if (arows && arows.length) {
+                authorName = (arows[0] as any).name || undefined;
+                authorAvatar = (arows[0] as any).avatar || undefined;
+              }
+            }
+          } catch {}
+          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] }, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } });
+        }
       }
 
       // Persist assistant final message for primary agent responses (single-agent rooms)

@@ -64,6 +64,10 @@ tmp/
 temp/
 backups/
 
+# Yarn (do not commit bundled Yarn releases/config)
+.yarn/
+.yarnrc
+
 # Runtime uploads and generated assets (do not commit)
 backend/uploads/
 frontend/public/uploads/

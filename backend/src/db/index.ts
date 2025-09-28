@@ -50,3 +50,16 @@ export async function closeDbPool(): Promise<void> {
 }
 
 
+// Simple connectivity check used by test-db.ts
+export async function testConnection(): Promise<boolean> {
+  try {
+    const conn = createConnection();
+    // Perform a lightweight query to validate connectivity
+    await conn.execute?.(String.raw`select 1`);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+

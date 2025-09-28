@@ -26,6 +26,7 @@ export function NavMain({
     url: string
     icon?: LucideIcon
     isActive?: boolean
+    badge?: string
     items?: {
       title: string
       url: string
@@ -37,35 +38,46 @@ export function NavMain({
       <SidebarGroupLabel>Platform</SidebarGroupLabel>
       <SidebarMenu>
         {items.map((item) => (
-          <Collapsible
-            key={item.title}
-            asChild
-            defaultOpen={item.isActive}
-            className="group/collapsible"
-          >
-            <SidebarMenuItem>
-              <CollapsibleTrigger asChild>
-                <SidebarMenuButton tooltip={item.title}>
+          <SidebarMenuItem key={item.title}>
+            {item.items && item.items.length > 0 ? (
+              <Collapsible asChild defaultOpen={item.isActive} className="group/collapsible">
+                <div>
+                  <CollapsibleTrigger asChild>
+                    <SidebarMenuButton tooltip={item.title}>
+                      {item.icon && <item.icon />}
+                      <span>{item.title}</span>
+                      <ChevronRight className="ml-auto transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+                    </SidebarMenuButton>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent>
+                    <SidebarMenuSub>
+                      {item.items.map((subItem) => (
+                        <SidebarMenuSubItem key={subItem.title}>
+                          <SidebarMenuSubButton asChild>
+                            <a href={subItem.url}>
+                              <span>{subItem.title}</span>
+                            </a>
+                          </SidebarMenuSubButton>
+                        </SidebarMenuSubItem>
+                      ))}
+                    </SidebarMenuSub>
+                  </CollapsibleContent>
+                </div>
+              </Collapsible>
+            ) : (
+              <SidebarMenuButton asChild tooltip={item.title}>
+                <a href={item.url} className="relative">
                   {item.icon && <item.icon />}
                   <span>{item.title}</span>
-                  <ChevronRight className="ml-auto transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
-                </SidebarMenuButton>
-              </CollapsibleTrigger>
-              <CollapsibleContent>
-                <SidebarMenuSub>
-                  {item.items?.map((subItem) => (
-                    <SidebarMenuSubItem key={subItem.title}>
-                      <SidebarMenuSubButton asChild>
-                        <a href={subItem.url}>
-                          <span>{subItem.title}</span>
-                        </a>
-                      </SidebarMenuSubButton>
-                    </SidebarMenuSubItem>
-                  ))}
-                </SidebarMenuSub>
-              </CollapsibleContent>
-            </SidebarMenuItem>
-          </Collapsible>
+                  {item.badge ? (
+                    <span className="ml-auto inline-flex items-center justify-center rounded-full bg-green-500 text-[10px] font-medium text-white px-1.5 py-0.5">
+                      {item.badge}
+                    </span>
+                  ) : null}
+                </a>
+              </SidebarMenuButton>
+            )}
+          </SidebarMenuItem>
         ))}
       </SidebarMenu>
     </SidebarGroup>

@@ -109,7 +109,6 @@ export function RightPanel({
               <div key={`${p.type}-${p.id}`} className="group flex items-center gap-2">
                 <div className="h-7 w-7 rounded-full bg-muted overflow-hidden flex items-center justify-center">
                   {p.avatar ? (
-                    // eslint-disable-next-line @next/next/no-img-element
                     <img src={p.avatar} alt={p.name} className="h-full w-full object-cover" />
                   ) : (
                     <span className="text-xs font-medium">{p.name?.charAt(0)?.toUpperCase() || '?'}</span>
@@ -136,11 +135,22 @@ export function RightPanel({
                     {userList
                       .filter(u => (u.name || '').toLowerCase().includes(userSearch.toLowerCase()) || u.id.includes(userSearch))
                       .map(u => (
-                        <CommandItem key={`u-${u.id}`} value={`user:${u.id}`} onSelect={() => { const next = new Set(selectedUsers); next.has(u.id) ? next.delete(u.id) : next.add(u.id); setSelectedUsers(next); }}>
-                          <Checkbox checked={selectedUsers.has(u.id)} readOnly />
+                        <CommandItem
+                          key={`u-${u.id}`}
+                          value={`user:${u.id}`}
+                          onSelect={() => {
+                            const next = new Set(selectedUsers);
+                            if (next.has(u.id)) {
+                              next.delete(u.id);
+                            } else {
+                              next.add(u.id);
+                            }
+                            setSelectedUsers(next);
+                          }}
+                        >
+                          <Checkbox checked={selectedUsers.has(u.id)} />
                           <div className="h-6 w-6 rounded-full overflow-hidden bg-muted flex items-center justify-center">
                             {u.avatar ? (
-                              // eslint-disable-next-line @next/next/no-img-element
                               <img src={resolveAvatarUrl(u.avatar)} alt={u.name} className="h-full w-full object-cover" />
                             ) : (
                               <span className="text-[10px] font-medium">{u.name?.charAt(0)?.toUpperCase() || 'U'}</span>
@@ -155,11 +165,22 @@ export function RightPanel({
                     {agentList
                       .filter(a => (a.name || '').toLowerCase().includes(agentSearch.toLowerCase()) || a.id.includes(agentSearch))
                       .map(a => (
-                        <CommandItem key={`a-${a.id}`} value={`agent:${a.id}`} onSelect={() => { const next = new Set(selectedAgents); next.has(a.id) ? next.delete(a.id) : next.add(a.id); setSelectedAgents(next); }}>
-                          <Checkbox checked={selectedAgents.has(a.id)} readOnly />
+                        <CommandItem
+                          key={`a-${a.id}`}
+                          value={`agent:${a.id}`}
+                          onSelect={() => {
+                            const next = new Set(selectedAgents);
+                            if (next.has(a.id)) {
+                              next.delete(a.id);
+                            } else {
+                              next.add(a.id);
+                            }
+                            setSelectedAgents(next);
+                          }}
+                        >
+                          <Checkbox checked={selectedAgents.has(a.id)} />
                           <div className="h-6 w-6 rounded-full overflow-hidden bg-muted flex items-center justify-center">
                             {a.avatar ? (
-                              // eslint-disable-next-line @next/next/no-img-element
                               <img src={resolveAvatarUrl(a.avatar)} alt={a.name} className="h-full w-full object-cover" />
                             ) : (
                               <span className="text-[10px] font-medium">{a.name?.charAt(0)?.toUpperCase() || 'A'}</span>
@@ -251,5 +272,3 @@ export function RightPanel({
     </div>
   );
 }
-
-

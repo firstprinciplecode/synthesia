@@ -42,6 +42,7 @@ class SerpApiService {
     const staticMap: Record<string, string> = {
       google: 'q',
       google_images: 'q',
+      google_finance: 'q',
       bing_images: 'q',
       youtube: 'search_query',
       ebay: '_nkw',
@@ -133,30 +134,48 @@ class SerpApiService {
   formatAsMarkdown(items: SerpApiResultItem[], query: string): string {
     if (!items.length) return `No results for "${query}".`;
     const lines = items.map((it, idx) => `- ${idx + 1}. [${it.title}](${it.link})${it.snippet ? ` — ${it.snippet}` : ''}`);
-    return `SERPAPI results for "${query}":\n\n${lines.join('\n')}`;
+    return lines.join('\n');
   }
 
   formatImagesAsMarkdown(items: { title: string; image: string; source: string; }[], query: string): string {
     if (!items.length) return `No images found for "${query}".`;
     const lines = items.map((it, idx) => `- ${idx + 1}. ${it.title}\n\n![${it.title}](${it.image})\n\n[Source](${it.source})`);
-    return `SERPAPI image results for "${query}":\n\n${lines.join('\n\n')}`;
+    return lines.join('\n\n');
   }
 
   private formatGoogleFinanceMarkdown(raw: any, query: string): string | null {
     try {
-      const markets: any[] = Array.isArray(raw?.markets) ? raw.markets : [];
+      const buckets = raw?.markets;
+      let markets: any[] = [];
+      if (Array.isArray(buckets)) {
+        markets = buckets;
+      } else if (buckets && typeof buckets === 'object') {
+        // Flatten region/category buckets like { us: [...], crypto: [...], ... }
+        for (const val of Object.values(buckets)) {
+          if (Array.isArray(val)) markets.push(...val);
+          else if (val && typeof val === 'object') {
+            for (const v of Object.values(val)) {
+              if (Array.isArray(v)) markets.push(...v);
+            }
+          }
+        }
+      }
       if (!markets.length) return null;
       // Pick the first market block that matches query loosely
       const m = markets.find((mk: any) => {
         const n = (mk?.name || mk?.ticker || mk?.title || '').toLowerCase();
-        return n.includes('nvidia') || n.includes('nvda') || n.includes(query.toLowerCase());
+        const ql = String(query || '').toLowerCase();
+        return n.includes(ql) || /\bbtc\b|bitcoin/.test(ql) && (n.includes('btc') || n.includes('bitcoin'))
+          || /\beth\b|ethereum/.test(ql) && (n.includes('eth') || n.includes('ethereum'))
+          || /solana|\bsol\b/.test(ql) && (n.includes('sol') || n.includes('solana'))
+          || /doge|dogecoin/.test(ql) && (n.includes('doge') || n.includes('dogecoin'));
       }) || markets[0];
       const name = m?.name || m?.title || 'Instrument';
-      const ticker = m?.ticker || m?.symbol || '';
-      const price = m?.price || m?.last || m?.regular_market_price || m?.current_price || m?.price_last || '';
+      const ticker = m?.ticker || m?.symbol || m?.stock || '';
+      const price = m?.price || m?.last || m?.regular_market_price || m?.current_price || m?.price_last || m?.price_now || '';
       const currency = m?.currency || m?.price_currency || '';
-      const change = m?.change || m?.price_change || m?.regular_market_change || '';
-      const changePct = m?.change_percent || m?.price_change_percent || m?.regular_market_change_percent || '';
+      const change = m?.change || m?.price_change || m?.regular_market_change || m?.price_movement?.value || '';
+      const changePct = m?.change_percent || m?.price_change_percent || m?.regular_market_change_percent || (m?.price_movement?.percentage != null ? (m.price_movement.percentage*100).toFixed(2) + '%' : '');
       const time = m?.price_time || m?.timestamp || m?.updated || m?.last_trade_time || '';
 
       const fmt = (v: any) => (v === undefined || v === null || v === '') ? '-' : String(v);
@@ -218,12 +237,35 @@ class SerpApiService {
     let q = query;
     const localParams: Record<string, string> = {};
     if (engine === 'yelp') {
-      // Yelp often needs `find_loc`. Try to infer with a simple "in <location>" or "near <location>" suffix.
-      const m = q.match(/\s(?:in|near)\s+([A-Za-z0-9 ,.'\-]+)$/i);
+      // Yelp needs `find_loc`. Try to infer location from phrasing or final capitalized tokens.
+      // Normalize trailing punctuation for matching.
+      const qTrim = q.trim();
+      const qNoPunctEnd = qTrim.replace(/[?!.,]+\s*$/,'');
+      // Support "in|near|for <location>" at end
+      const m = qNoPunctEnd.match(/\s(?:in|near|for)\s+([A-Za-z0-9 ,.'\-]+)$/i);
       if (m && !String(extra?.find_loc || '').trim()) {
-        localParams['find_loc'] = m[1].trim();
-        q = q.slice(0, m.index).trim();
+        const loc = m[1].trim();
+        if (loc) {
+          localParams['find_loc'] = loc;
+          q = qNoPunctEnd.slice(0, m.index).trim();
+        }
       }
+      // If still no location, try naive city extraction by last capitalized token(s), allowing punctuation at end
+      if (!localParams['find_loc']) {
+        const m2 = qNoPunctEnd.match(/([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)$/);
+        const cityGuess = m2 ? m2[1] : undefined;
+        if (cityGuess) {
+          localParams['find_loc'] = cityGuess;
+          q = qNoPunctEnd.replace(cityGuess, '').trim();
+        }
+      }
+    } else if (engine === 'google_finance') {
+      // Normalize common crypto names to tickers to improve hit rate
+      const ql = q.toLowerCase();
+      if (/\bbitcoin\b|\bbtc\b/.test(ql)) q = 'BTC';
+      else if (/\bethereum\b|\beth\b/.test(ql)) q = 'ETH';
+      else if (/solana|\bsol\b/.test(ql)) q = 'SOL';
+      else if (/dogecoin|\bdoge\b/.test(ql)) q = 'DOGE';
     }
 
     const params = new URLSearchParams({ engine, api_key: key });
@@ -239,9 +281,12 @@ class SerpApiService {
       }
     }
     const url = `https://serpapi.com/search.json?${params.toString()}`;
-    // Console output: show final request URL and parameters for debugging parity with HTML
-    console.log('[serpapi] URL:', url);
-    console.log('[serpapi] Params:', Object.fromEntries(params.entries()));
+    // Console output: mask api_key in logs
+    const safeUrl = url.replace(/(api_key=)[^&]+/i, '$1***');
+    const safeParams = Object.fromEntries(params.entries());
+    if (safeParams.api_key) safeParams.api_key = '***';
+    console.log('[serpapi] URL:', safeUrl);
+    console.log('[serpapi] Params:', safeParams);
     const res = await fetch(url);
     if (!res.ok) {
       const text = await res.text();
@@ -272,6 +317,38 @@ class SerpApiService {
       }
     } catch {}
     let markdown = '';
+    // Yelp-specific normalization (local results) with optional images
+    if (engine === 'yelp') {
+      const pools: any[] = [];
+      if (Array.isArray(json.search_results)) pools.push(...json.search_results);
+      if (Array.isArray(json.local_results)) pools.push(...json.local_results);
+      if (Array.isArray(json.results)) pools.push(...json.results);
+      if (json.local_results && Array.isArray(json.local_results.places)) pools.push(...json.local_results.places);
+      const rich = pools
+        .filter(Boolean)
+        .map((r: any) => {
+          const title = r.title || r.name || r.business_name || r.alias || 'Result';
+          const link = r.link || r.url || r.website || r.share_link || '';
+          const parts: string[] = [];
+          const rating = r.rating || r.rating_score || r.stars;
+          const reviews = r.reviews || r.review_count;
+          const price = r.price || r.price_level;
+          const address = r.address || r.address_full || r.location || r.address_line || '';
+          if (rating) parts.push(`${rating}★${reviews ? ` (${reviews})` : ''}`);
+          if (price) parts.push(String(price));
+          if (address) parts.push(String(address));
+          const snippet = parts.join(' · ');
+          const image = r.thumbnail || r.image || r.photo || (Array.isArray(r.photos) ? (r.photos[0]?.thumbnail || r.photos[0]?.image) : undefined) || '';
+          return link ? { title, link, snippet, image } : null;
+        })
+        .filter(Boolean) as Array<{ title: string; link: string; snippet?: string; image?: string }>;
+      if (rich.length) {
+        const n = Number(extra?.num ?? 5);
+        const lines = rich.slice(0, n).map((it, idx) => `- ${idx + 1}. [${it.title}](${it.link})${it.snippet ? ` — ${it.snippet}` : ''}${it.image ? `\n\n![${it.title}](${it.image})` : ''}`);
+        markdown = lines.join('\n');
+        return { markdown, raw: json };
+      }
+    }
     // Engine-specific product formatting (eBay, shopping, etc.)
     if (engine.includes('ebay') || Array.isArray(json.shopping_results)) {
       const md = this.formatProductsMarkdown(json, query);

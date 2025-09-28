@@ -333,11 +333,12 @@ function SidebarInput({
 }
 
 function SidebarHeader({ className, ...props }: React.ComponentProps<"div">) {
+  const { state } = useSidebar()
   return (
     <div
       data-slot="sidebar-header"
       data-sidebar="header"
-      className={cn("flex flex-col gap-2 p-2 pt-4", className)}
+      className={cn("flex flex-col gap-2 pt-4", state === 'collapsed' ? 'p-0' : 'p-2', className)}
       {...props}
     />
   )

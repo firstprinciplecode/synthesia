@@ -12,7 +12,7 @@ export function parseInput(text: string): Intent {
   const content = text.trim();
   if (content.startsWith('$')) return { type: 'terminal', command: content };
 
-  let m = content.match(/^serpapi\.(\w+)\s+"([^"]+)"$/i) || content.match(/^serpapi\.(\w+)\s+(.+)$/i);
+  const m = content.match(/^serpapi\.(\w+)\s+"([^"]+)"$/i) || content.match(/^serpapi\.(\w+)\s+(.+)$/i);
   if (m && m[1].toLowerCase() !== 'run') {
     return { type: 'serpapi', engine: m[1].toLowerCase(), query: (m[2] || '').trim() };
   }
@@ -39,5 +39,4 @@ export function parseInput(text: string): Intent {
 
   return { type: 'message', content };
 }
-
 

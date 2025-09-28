@@ -7,12 +7,24 @@ import {
   Bot,
   Command,
   Frame,
-  GalleryVerticalEnd,
+  // GalleryVerticalEnd,
   Map,
   PieChart,
   Settings2,
   SquareTerminal,
 } from "lucide-react"
+import Image from "next/image"
+
+// Custom Goose Icon Component
+const GooseIcon = ({ className }: { className?: string }) => (
+  <Image
+    src="/goose.svg"
+    alt="Goose"
+    width={16}
+    height={16}
+    className={`${className} brightness-0`}
+  />
+)
 
 import { NavMain } from "@/components/nav-main"
 import { NavProjects } from "@/components/nav-projects"
@@ -37,7 +49,7 @@ const data = {
   teams: [
     {
       name: "Acme Inc",
-      logo: GalleryVerticalEnd,
+      logo: GooseIcon,
       plan: "Enterprise",
     },
     {
@@ -53,10 +65,16 @@ const data = {
   ],
   navMain: [
     {
+      title: "Feed",
+      url: "/feed",
+      icon: BookOpen,
+      isActive: true
+    },
+    {
       title: "Inbox",
       url: "/inbox",
       icon: SquareTerminal,
-      isActive: true,
+      isActive: false,
       items: [
         { title: "All Messages", url: "/inbox" },
         { title: "Unread", url: "/inbox" },
@@ -69,7 +87,6 @@ const data = {
       icon: Bot,
       items: [
         { title: "My Agents", url: "/agents" },
-        { title: "Create Agent", url: "/agents/new" },
         { title: "Connections", url: "/connections" },
       ],
     },
@@ -103,13 +120,14 @@ const data = {
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const [user, setUser] = React.useState(data.user)
+  const [unread, setUnread] = React.useState<number>(0)
   const { status, data: session } = useSession()
 
   React.useEffect(() => {
     let cancelled = false
     async function loadProfile() {
       try {
-        const uid = (session as any)?.userId
+        const uid = (session as unknown as { userId?: string })?.userId
         const res = await fetch("/api/profile", { cache: "no-store", headers: uid ? { 'x-user-id': uid } : undefined })
         if (!res.ok) return
         const p = await res.json()
@@ -132,7 +150,26 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       setUser({ name: "", email: "", avatar: "" })
     }
     return () => { cancelled = true }
-  }, [status])
+  }, [status, session])
+
+  // Poll inbox summary
+  React.useEffect(() => {
+    let t: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+    async function poll() {
+      try {
+        const res = await fetch('/api/inbox?summary=1', { cache: 'no-store' })
+        if (cancelled) return
+        if (res.ok) {
+          const j = await res.json()
+          setUnread(Number(j?.unread || 0))
+        }
+      } catch {}
+      t = setTimeout(poll, 60000)
+    }
+    poll()
+    return () => { cancelled = true; if (t) clearTimeout(t) }
+  }, [])
 
   return (
     <Sidebar collapsible="icon" {...props}>
@@ -140,7 +177,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         <TeamSwitcher teams={data.teams} />
       </SidebarHeader>
       <SidebarContent>
-        <NavMain items={data.navMain} />
+        <NavMain items={data.navMain.map(it => it.title === 'Inbox' ? { ...it, badge: unread > 0 ? String(unread) : undefined } : it)} />
         {status === 'authenticated' ? <NavProjects /> : null}
       </SidebarContent>
       <SidebarFooter>

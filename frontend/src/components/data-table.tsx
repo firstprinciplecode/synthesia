@@ -25,7 +25,6 @@ export function DataTableAgents({ rows }: { rows: AgentRow[] }) {
             <tr key={r.id} className="border-t">
               <td className="p-2">
                 {r.avatarUrl ? (
-                  // eslint-disable-next-line @next/next/no-img-element
                   <img src={r.avatarUrl} alt={r.name} className="h-8 w-8 rounded-full object-cover" />
                 ) : (
                   <div className="h-8 w-8 rounded-full bg-muted" />
@@ -49,5 +48,4 @@ export function DataTableAgents({ rows }: { rows: AgentRow[] }) {
     </div>
   );
 }
-
 

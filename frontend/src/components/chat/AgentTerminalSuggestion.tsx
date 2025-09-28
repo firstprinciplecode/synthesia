@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 
 interface AgentTerminalSuggestionProps {
@@ -15,15 +15,15 @@ export function AgentTerminalSuggestion({ command, reason, onApprove, onReject }
   const [isRejected, setIsRejected] = useState(false);
   const [selectedOption, setSelectedOption] = useState<'yes' | 'no'>('yes');
 
-  const handleApprove = () => {
+  const handleApprove = useCallback(() => {
     setIsApproved(true);
     onApprove(command);
-  };
+  }, [command, onApprove]);
 
-  const handleReject = () => {
+  const handleReject = useCallback(() => {
     setIsRejected(true);
     onReject();
-  };
+  }, [onReject]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -47,7 +47,7 @@ export function AgentTerminalSuggestion({ command, reason, onApprove, onReject }
 
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
-  }, [isApproved, isRejected, selectedOption]);
+  }, [isApproved, isRejected, selectedOption, handleApprove, handleReject]);
 
   if (isApproved) {
     return (
