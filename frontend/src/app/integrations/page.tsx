@@ -62,7 +62,7 @@ export default function IntegrationsPage() {
               ))}
             </div>
             <p className="text-xs text-muted-foreground mt-3">
-              Tip: Use <code className="px-1 py-0.5 rounded bg-muted">serpapi.&lt;engine&gt; "query"</code> or <code className="px-1 py-0.5 rounded bg-muted">@serpapi …</code> in chat.
+              Tip: Use <code className="px-1 py-0.5 rounded bg-muted">serpapi.&lt;engine&gt; &quot;query&quot;</code> or <code className="px-1 py-0.5 rounded bg-muted">@serpapi …</code> in chat.
             </p>
           </section>)}
 
@@ -77,10 +77,10 @@ export default function IntegrationsPage() {
               <div className="text-xs text-muted-foreground">
                 Examples:
                 <div className="mt-1">
-                  <code className="px-1 py-0.5 rounded bg-muted">elevenlabs.tts "Hello world" voice=Rachel format=mp3</code>
+                  <code className="px-1 py-0.5 rounded bg-muted">elevenlabs.tts &quot;Hello world&quot; voice=Rachel format=mp3</code>
                 </div>
                 <div className="mt-1">
-                  <code className="px-1 py-0.5 rounded bg-muted">@elevenlabs "Read this aloud" voice=Rachel</code>
+                  <code className="px-1 py-0.5 rounded bg-muted">@elevenlabs &quot;Read this aloud&quot; voice=Rachel</code>
                 </div>
               </div>
               <div className="text-xs text-muted-foreground">Requires ELEVENLAB_API_KEY in backend .env</div>
@@ -179,5 +179,4 @@ function XIntegrationCard() {
     </div>
   );
 }
-
 

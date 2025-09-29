@@ -60,8 +60,7 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
       setAssistFrameIdx((i) => (i + 1) % assistFrames.length);
     }, 120);
     return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isUser, isTerminal, isStreaming, message.content]);
+  }, [isUser, isTerminal, isStreaming, message.content, assistFrames.length]);
 
   // Simple streaming display without fade effects
   const [displayContent, setDisplayContent] = useState(message.content || '');
@@ -107,7 +106,6 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
   
   const markdownComponents = {
     img: (props: any) => (
-      // eslint-disable-next-line @next/next/no-img-element
       <img
         {...props}
         alt={props.alt || ''}
@@ -140,6 +138,29 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
       return null;
     } catch { return null; }
   }, [displayContent]);
+
+  // Preprocess markdown for inline cards and image-grid extraction
+  type ImgItem = { src: string; alt: string; caption?: string };
+  const raw = boldMentionsInMarkdown(displayContent) || '';
+  const isInlineCards = /^(X search for|Google News for)/m.test(raw);
+  const lines = raw.split('\n');
+  const imgRegex = /!\[([^\]]*)\]\(([^\)]+)\)/;
+  const imgs: ImgItem[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(imgRegex);
+    if (m) {
+      const alt = (m[1] || '').trim();
+      const src = (m[2] || '').trim();
+      let caption = '';
+      for (let j = i - 1; j >= 0 && j >= i - 3; j--) {
+        const lj = lines[j]?.trim();
+        if (lj && !imgRegex.test(lj) && !/^\[Source\]/i.test(lj)) { caption = lj; break; }
+      }
+      imgs.push({ src, alt, caption });
+    }
+  }
+  const nonImageText = lines.filter(l => !imgRegex.test(l)).join('\n');
+  const [selected, setSelected] = React.useState<null | ImgItem>(null);
 
   return (
     <div className="flex gap-3 p-3 hover:bg-muted/50 group">
@@ -202,86 +223,52 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
           ) : (
             <div>
               {/* grid + lightbox render */}
-              {(() => {
-                const raw = boldMentionsInMarkdown(displayContent) || '';
-                const isInlineCards = /^(X search for|Google News for)/m.test(raw);
-                const lines = raw.split('\n');
-                const imgRegex = /!\[([^\]]*)\]\(([^\)]+)\)/;
-                type ImgItem = { src: string; alt: string; caption?: string };
-                const imgs: ImgItem[] = [];
-                for (let i = 0; i < lines.length; i++) {
-                  const m = lines[i].match(imgRegex);
-                  if (m) {
-                    const alt = (m[1] || '').trim();
-                    const src = (m[2] || '').trim();
-                    let caption = '';
-                    for (let j = i - 1; j >= 0 && j >= i - 3; j--) {
-                      const lj = lines[j]?.trim();
-                      if (lj && !imgRegex.test(lj) && !/^\[Source\]/i.test(lj)) { caption = lj; break; }
-                    }
-                    imgs.push({ src, alt, caption });
-                  }
-                }
-                const nonImageText = lines.filter(l => !imgRegex.test(l)).join('\n');
-
-                const [selected, setSelected] = React.useState<null | ImgItem>(null);
-
-                return (
-                  <>
-                    {isInlineCards ? (
-                      <div className="mt-0">
-                        <JsonMarkdownRenderer content={raw} />
+              {isInlineCards ? (
+                <div className="mt-0">
+                  <JsonMarkdownRenderer content={raw} />
+                </div>
+              ) : (
+                imgs.length > 0 && (
+                <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2">
+                  {imgs.map((it, i) => (
+                    <div key={i} className="group cursor-zoom-in" onClick={() => setSelected(it)}>
+                      <div className="w-full h-36 sm:h-40 md:h-48 bg-muted rounded overflow-hidden">
+                        <img src={it.src} alt={it.alt} className="w-full h-full object-cover" />
                       </div>
-                    ) : (
-                      imgs.length > 0 && (
-                      <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2">
-                        {imgs.map((it, i) => (
-                          <div key={i} className="group cursor-zoom-in" onClick={() => setSelected(it)}>
-                            <div className="w-full h-36 sm:h-40 md:h-48 bg-muted rounded overflow-hidden">
-                              {/* eslint-disable-next-line @next/next/no-img-element */}
-                              <img src={it.src} alt={it.alt} className="w-full h-full object-cover" />
-                            </div>
-                            {(it.caption || it.alt) && (
-                              <div className="mt-1 text-xs text-muted-foreground line-clamp-2" title={`${it.caption || it.alt}`}>
-                                {it.caption || it.alt}
-                              </div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                      )
-                    )}
-                    {!isInlineCards && nonImageText && (
-                      <div className="mt-0">
-                        <JsonMarkdownRenderer content={nonImageText} />
-                      </div>
-                    )}
-                    {!isInlineCards && firstUrlForPreview && (
-                      <LinkPreview url={firstUrlForPreview} />
-                    )}
-                    {selected && (
-                      <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={() => setSelected(null)}>
-                        <div className="max-w-screen-md w-full">
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img src={selected.src} alt={selected.alt} className="w-full h-auto rounded shadow" />
-                          {(selected.caption || selected.alt) && (
-                            <div className="mt-2 text-sm text-white/90">{selected.caption || selected.alt}</div>
-                          )}
+                      {(it.caption || it.alt) && (
+                        <div className="mt-1 text-xs text-muted-foreground line-clamp-2" title={`${it.caption || it.alt}`}>
+                          {it.caption || it.alt}
                         </div>
-                      </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                )
+              )}
+              {!isInlineCards && nonImageText && (
+                <div className="mt-0">
+                  <JsonMarkdownRenderer content={nonImageText} />
+                </div>
+              )}
+              {!isInlineCards && firstUrlForPreview && (
+                <LinkPreview url={firstUrlForPreview} />
+              )}
+              {selected && (
+                <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={() => setSelected(null)}>
+                  <div className="max-w-screen-md w-full">
+                    <img src={selected.src} alt={selected.alt} className="w-full h-auto rounded shadow" />
+                    {(selected.caption || selected.alt) && (
+                      <div className="mt-2 text-sm text-white/90">{selected.caption || selected.alt}</div>
                     )}
-                  </>
-                );
-              })()}
+                  </div>
+                </div>
+              )}
               {isStreaming && (
                 <span className="inline-block w-1 h-4 bg-current animate-pulse ml-1" />
               )}
             </div>
           )}
-          {/* Read receipts: show only for your own messages when others have read */}
-          {isUser && isSelf && !!readByOthers && (
-            <div className="mt-1 text-[10px] text-muted-foreground">{readByCount && readByCount > 1 ? `Read by ${readByCount}` : 'Read'}</div>
-          )}
+          {/* Read receipts removed */}
         </div>
       </div>
     </div>

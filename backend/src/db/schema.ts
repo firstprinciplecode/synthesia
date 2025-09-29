@@ -9,6 +9,7 @@ import {
   boolean,
   numeric,
   index,
+  primaryKey,
 } from 'drizzle-orm/pg-core';
 
 // === USERS AND ORGANIZATIONS ===
@@ -82,6 +83,9 @@ export const agents = pgTable('agents', {
   confidenceThreshold: numeric('confidence_threshold', { precision: 3, scale: 2 }).default('0.70'), // 0.00 - 1.00
   cooldownSec: integer('cooldown_sec').default(20),
   successScore: numeric('success_score', { precision: 5, scale: 2 }).default('0.00'),
+  // Public participation
+  isPublic: boolean('is_public').default(false),
+  publicMatchThreshold: numeric('public_match_threshold', { precision: 3, scale: 2 }).default('0.70'),
   
   // Limits and budgets
   maxTokensPerRequest: integer('max_tokens_per_request').default(4000),
@@ -326,6 +330,7 @@ export const conversationsRelations = relations(conversations, ({ one, many }) =
   }),
   messages: many(messages),
   runs: many(runs),
+  roomReads: many(roomReads),
 }));
 
 export const messagesRelations = relations(messages, ({ one }) => ({
@@ -546,6 +551,33 @@ export const conversationSummaries = pgTable('conversation_summaries', {
   createdAtIdx: index('conversation_summaries_created_at_idx').on(table.createdAt),
 }));
 
+// === PUBLIC FEED ===
+export const publicFeedPosts = pgTable('public_feed_posts', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  authorType: varchar('author_type', { length: 32 }).notNull(), // 'user' | 'agent'
+  authorId: varchar('author_id', { length: 191 }).notNull(),
+  text: text('text').notNull(),
+  media: jsonb('media'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  authorIdx: index('public_feed_posts_author_idx').on(table.authorId),
+  createdIdx: index('public_feed_posts_created_idx').on(table.createdAt),
+}));
+
+export const publicFeedReplies = pgTable('public_feed_replies', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  postId: varchar('post_id', { length: 191 }).notNull(),
+  authorType: varchar('author_type', { length: 32 }).notNull(), // 'user' | 'agent'
+  authorId: varchar('author_id', { length: 191 }).notNull(),
+  text: text('text').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  postIdx: index('public_feed_replies_post_idx').on(table.postId),
+  authorIdx: index('public_feed_replies_author_idx').on(table.authorId),
+  createdIdx: index('public_feed_replies_created_idx').on(table.createdAt),
+}));
+
 // === MEMORY RELATIONS ===
 
 export const agentProfilesRelations = relations(agentProfiles, ({ one }) => ({
@@ -583,6 +615,33 @@ export const conversationSummariesRelations = relations(conversationSummaries, (
   }),
   conversation: one(conversations, {
     fields: [conversationSummaries.conversationId],
+    references: [conversations.id],
+  }),
+}));
+
+// Public feed relations (optional minimal)
+export const publicFeedRelations = relations(publicFeedReplies, ({ one }) => ({
+  post: one(publicFeedPosts, {
+    fields: [publicFeedReplies.postId],
+    references: [publicFeedPosts.id],
+  }),
+}));
+
+export const roomReads = pgTable('room_reads', {
+  roomId: varchar('room_id', { length: 191 }).notNull(),
+  actorId: varchar('actor_id', { length: 191 }).notNull(),
+  lastReadMessageId: varchar('last_read_message_id', { length: 191 }),
+  lastReadAt: timestamp('last_read_at').defaultNow().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  pk: primaryKey(table.roomId, table.actorId),
+  idxUpdated: index('room_reads_updated_idx').on(table.updatedAt),
+}));
+
+export const roomReadsRelations = relations(roomReads, ({ one }) => ({
+  room: one(conversations, {
+    fields: [roomReads.roomId],
     references: [conversations.id],
   }),
 }));

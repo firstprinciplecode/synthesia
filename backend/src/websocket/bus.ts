@@ -48,6 +48,17 @@ export class WebSocketBus {
     }
   }
 
+  // Broadcast to every connected client
+  broadcastToAll(notification: JSONRPCNotification) {
+    try {
+      for (const [connectionId] of this.connections.entries()) {
+        this.sendToConnection(connectionId, notification);
+      }
+    } catch (e) {
+      console.error('broadcastToAll failed', e);
+    }
+  }
+
   broadcastToolCall(roomId: string, runId: string, toolCallId: string, tool: string, func: string, args: Record<string, any>) {
     this.broadcastToRoom(roomId, {
       jsonrpc: '2.0',

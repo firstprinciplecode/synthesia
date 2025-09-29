@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { Bot, User, Circle, Users } from "lucide-react"
+import { useUnreadStore } from '@/stores/unread-store'
 
 import {
   SidebarGroup,
@@ -41,11 +42,16 @@ export function NavConversations({
     }
   }
 
+  const unreadByRoom = useUnreadStore((state) => state.unreadByRoom)
+
   return (
     <SidebarGroup>
-      <SidebarGroupLabel>Conversations</SidebarGroupLabel>
+      <SidebarGroupLabel>
+        Conversations
+      </SidebarGroupLabel>
       <SidebarMenu>
         {conversations.map((conversation) => {
+          const unreadCount = unreadByRoom[conversation.id] ?? 0
           const isActive = currentConversation === conversation.id;
           return (
             <SidebarMenuItem key={conversation.id}>
@@ -70,6 +76,9 @@ export function NavConversations({
                         className={`absolute -bottom-1 -right-1 h-3 w-3 ${getStatusColor(conversation.status)}`}
                         fill="currentColor"
                       />
+                      {unreadCount > 0 && !isActive ? (
+                        <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-rose-500" aria-hidden />
+                      ) : null}
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between">

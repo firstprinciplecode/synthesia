@@ -333,11 +333,12 @@ function SidebarInput({
 }
 
 function SidebarHeader({ className, ...props }: React.ComponentProps<"div">) {
+  const { state } = useSidebar()
   return (
     <div
       data-slot="sidebar-header"
       data-sidebar="header"
-      className={cn("flex flex-col gap-2 p-2 pt-4", className)}
+      className={cn("flex flex-col gap-2 pt-4", state === 'collapsed' ? 'p-0' : 'p-2', className)}
       {...props}
     />
   )
@@ -586,8 +587,8 @@ function SidebarMenuBadge({
       data-slot="sidebar-menu-badge"
       data-sidebar="menu-badge"
       className={cn(
-        "text-sidebar-foreground pointer-events-none absolute right-1 flex h-5 min-w-5 items-center justify-center rounded-md px-1 text-xs font-medium tabular-nums select-none",
-        "peer-hover/menu-button:text-sidebar-accent-foreground peer-data-[active=true]/menu-button:text-sidebar-accent-foreground",
+        "pointer-events-none absolute right-1 flex h-5 min-w-5 items-center justify-center rounded-md bg-sidebar-primary/10 px-1 text-[10px] font-semibold uppercase tracking-wide text-sidebar-foreground tabular-nums select-none transition-colors",
+        "peer-hover/menu-button:bg-sidebar-accent/80 peer-hover/menu-button:text-sidebar-accent-foreground peer-data-[active=true]/menu-button:bg-sidebar-accent peer-data-[active=true]/menu-button:text-sidebar-accent-foreground",
         "peer-data-[size=sm]/menu-button:top-1",
         "peer-data-[size=default]/menu-button:top-1.5",
         "peer-data-[size=lg]/menu-button:top-2.5",

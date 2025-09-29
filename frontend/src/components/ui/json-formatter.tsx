@@ -7,8 +7,10 @@ import { Badge } from '@/components/ui/badge';
 import { Copy, ChevronDown, ChevronRight, Eye, EyeOff } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
+type JSONValue = string | number | boolean | null | JSONValue[] | { [key: string]: JSONValue };
+
 interface JsonFormatterProps {
-  data: any;
+  data: JSONValue;
   title?: string;
   className?: string;
   defaultExpanded?: boolean;
@@ -29,7 +31,7 @@ export function JsonFormatter({
     navigator.clipboard.writeText(JSON.stringify(data, null, 2));
   };
 
-  const renderValue = (value: any, key?: string): React.ReactNode => {
+  const renderValue = (value: JSONValue, key?: string): React.ReactNode => {
     if (value === null) return <span className="text-muted-foreground">null</span>;
     if (value === undefined) return <span className="text-muted-foreground">undefined</span>;
     if (typeof value === 'boolean') return <span className="text-blue-500">{value.toString()}</span>;
@@ -43,13 +45,13 @@ export function JsonFormatter({
           </a>
         );
       }
-      return <span className="text-orange-500">"{value}"</span>;
+      return <span className="text-orange-500">&quot;{value}&quot;</span>;
     }
     if (Array.isArray(value)) {
       return (
         <div className="ml-2">
           <div className="text-muted-foreground">[</div>
-          {value.map((item, index) => (
+          {(value as JSONValue[]).map((item, index) => (
             <div key={index} className="ml-2">
               {renderValue(item, index.toString())}
               {index < value.length - 1 && <span className="text-muted-foreground">,</span>}
@@ -63,9 +65,9 @@ export function JsonFormatter({
       return (
         <div className="ml-2">
           <div className="text-muted-foreground">{'{'}</div>
-          {Object.entries(value).map(([k, v], index, arr) => (
+          {Object.entries(value as { [key: string]: JSONValue }).map(([k, v], index, arr) => (
             <div key={k} className="ml-2">
-              <span className="text-purple-500">"{k}"</span>
+              <span className="text-purple-500">&quot;{k}&quot;</span>
               <span className="text-muted-foreground">: </span>
               {renderValue(v, k)}
               {index < arr.length - 1 && <span className="text-muted-foreground">,</span>}
@@ -78,12 +80,12 @@ export function JsonFormatter({
     return <span className="text-foreground">{String(value)}</span>;
   };
 
-  const renderTable = (data: any): React.ReactNode => {
+  const renderTable = (data: JSONValue): React.ReactNode => {
     if (!data || typeof data !== 'object') return null;
 
     // If it's an array of objects, render as table
     if (Array.isArray(data) && data.length > 0 && typeof data[0] === 'object') {
-      const keys = Object.keys(data[0]);
+      const keys = Object.keys(data[0] as Record<string, JSONValue>);
       return (
         <div className="overflow-x-auto rounded border">
           <table className="w-full text-xs">
@@ -97,7 +99,7 @@ export function JsonFormatter({
               </tr>
             </thead>
             <tbody>
-              {data.map((row, index) => (
+              {(data as Array<Record<string, JSONValue>>).map((row, index) => (
                 <tr key={index} className="border-t border-border/30 hover:bg-muted/20 transition-colors">
                   {keys.map(key => (
                     <td key={key} className="px-2 py-1 border-r border-border/30 last:border-r-0 max-w-xs truncate">

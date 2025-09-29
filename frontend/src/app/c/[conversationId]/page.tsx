@@ -40,7 +40,7 @@ export default function ConversationPage() {
       } catch {}
     }
     ensureRoom();
-  }, [conversationId]);
+  }, [conversationId, session]);
 
   // Fetch agent/room name for breadcrumb (uses authenticated relative API with x-user-id)
   useEffect(() => {
@@ -65,16 +65,15 @@ export default function ConversationPage() {
           }
         }
         
-        // Try to fetch room metadata first (dm or agent_chat)
+        // Try to fetch room metadata first (any kind)
         const rm = await fetch(`/api/rooms/${conversationId}`, { cache: 'no-store', headers: { 'x-user-id': uid } });
         if (rm.ok) {
           const data = await rm.json();
-          if ((data?.room?.kind === 'dm' || data?.room?.kind === 'agent_chat')) {
-            if (data.dm?.title) setAgentName(data.dm.title);
-            else if (data?.room?.title) setAgentName(data.room.title);
-            if (data.dm?.avatar) setAgentAvatar(data.dm.avatar);
-            return;
-          }
+          const title = data?.dm?.title || data?.room?.title;
+          const avatar = data?.dm?.avatar || undefined;
+          if (title) setAgentName(title);
+          if (avatar) setAgentAvatar(avatar);
+          if (title || avatar) return;
         }
 
         // Fallback: treat as agent room
@@ -139,5 +138,4 @@ export default function ConversationPage() {
     </SidebarProvider>
   );
 }
-
 

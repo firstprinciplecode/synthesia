@@ -25,6 +25,9 @@ export default function AgentNewPage() {
   const [personality, setPersonality] = useState('');
   const [extra, setExtra] = useState('');
   const [autoExecuteTools, setAutoExecuteTools] = useState(false);
+  const [isPublic, setIsPublic] = useState(false);
+  const [publicThreshold, setPublicThreshold] = useState(0.7);
+  const [interests, setInterests] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -44,10 +47,11 @@ export default function AgentNewPage() {
         avatarToSave = avatarToSave.replace('http://localhost:3001', '');
       }
     } catch {}
+    const interestsArr = interests.split(',').map(s => s.trim()).filter(Boolean).slice(0, 32);
     const res = await fetch(`/api/agents`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-user-id': uid },
-      body: JSON.stringify({ name, description, instructions, avatar: avatarToSave, autoExecuteTools }),
+      body: JSON.stringify({ name, description, instructions, avatar: avatarToSave, autoExecuteTools, isPublic, publicMatchThreshold: publicThreshold, interests: interestsArr }),
     });
     if (!res.ok) {
       setError('Failed to create agent');
@@ -167,12 +171,34 @@ export default function AgentNewPage() {
                 <Switch id="auto-execute-tools" checked={autoExecuteTools} onCheckedChange={setAutoExecuteTools} />
                 <Label htmlFor="auto-execute-tools" className="text-sm">Auto-execute tools without asking for permission</Label>
               </div>
-              <div className="flex justify-end gap-2 pt-2">
-                <Button variant="outline" asChild><Link href="/agents">Cancel</Link></Button>
-                <Button onClick={onCreate}>Create Agent</Button>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Public Participation</CardTitle>
+              <CardDescription>Enable public feed replies based on interests.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex items-center space-x-2">
+                <Switch id="is-public" checked={isPublic} onCheckedChange={setIsPublic} />
+                <Label htmlFor="is-public" className="text-sm">Public agent (can reply in the public feed)</Label>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="interests">Interests (comma-separated)</Label>
+                <Input id="interests" value={interests} onChange={(e) => setInterests(e.target.value)} placeholder="food, wine, dining, michelin, restaurants" />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="threshold">Match threshold ({publicThreshold.toFixed(2)})</Label>
+                <input id="threshold" type="range" min={0.3} max={0.95} step={0.01} value={publicThreshold} onChange={(e) => setPublicThreshold(parseFloat(e.target.value))} className="w-full" />
               </div>
             </CardContent>
           </Card>
+
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" asChild><Link href="/agents">Cancel</Link></Button>
+            <Button onClick={onCreate}>Save</Button>
+          </div>
         </div>
       </SidebarInset>
     </SidebarProvider>

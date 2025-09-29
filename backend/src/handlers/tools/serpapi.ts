@@ -32,6 +32,21 @@ export async function handleSerpSearch(ctx: SerpHandlersContext, connectionId: s
     conversationId: room,
     agentId: connectionId,
   };
+  // Resolve agent identity for labeling
+  let authorName: string | undefined;
+  let authorAvatar: string | undefined;
+  try {
+    const id = (agentId || connectionId) as string;
+    if (id && id.length > 0) {
+      const { db, agents } = await import('../../db/index.js');
+      const { eq } = await import('drizzle-orm');
+      const rows = await db.select().from(agents).where(eq(agents.id as any, id as any));
+      if (rows && rows.length) {
+        authorName = (rows[0] as any).name || undefined;
+        authorAvatar = (rows[0] as any).avatar || undefined;
+      }
+    }
+  } catch {}
   ctx.bus.broadcastToRoom(room, {
     jsonrpc: '2.0',
     method: 'message.received',
@@ -40,6 +55,8 @@ export async function handleSerpSearch(ctx: SerpHandlersContext, connectionId: s
       messageId: crypto.randomUUID(),
       authorId: (agentId || connectionId || 'agent') as any,
       authorType: 'agent',
+      ...(authorName ? { authorName } : {}),
+      ...(authorAvatar ? { authorAvatar } : {}),
       message: md,
     },
   });
@@ -202,6 +219,20 @@ export async function handleSerpRun(ctx: SerpHandlersContext, connectionId: stri
   } catch {}
   if (!messageMd) messageMd = `SERPAPI ${engineUse} for "${query}": (no markdown available)`;
 
+  // Resolve agent identity for labeling
+  let authorName2: string | undefined; let authorAvatar2: string | undefined;
+  try {
+    const id = (attributedAgentId || connectionId) as string;
+    if (id && id.length > 0) {
+      const { db, agents } = await import('../../db/index.js');
+      const { eq } = await import('drizzle-orm');
+      const rows = await db.select().from(agents).where(eq(agents.id as any, id as any));
+      if (rows && rows.length) {
+        authorName2 = (rows[0] as any).name || undefined;
+        authorAvatar2 = (rows[0] as any).avatar || undefined;
+      }
+    }
+  } catch {}
   ctx.bus.broadcastToRoom(roomId, {
     jsonrpc: '2.0',
     method: 'message.received',
@@ -210,6 +241,8 @@ export async function handleSerpRun(ctx: SerpHandlersContext, connectionId: stri
       messageId: crypto.randomUUID(),
       authorId: attributedAgentId || connectionId || 'agent',
       authorType: 'agent',
+      ...(authorName2 ? { authorName: authorName2 } : {}),
+      ...(authorAvatar2 ? { authorAvatar: authorAvatar2 } : {}),
       message: messageMd,
     },
   });

@@ -50,7 +50,6 @@ export function JsonMarkdownRenderer({ content, className }: JsonMarkdownRendere
   
   const markdownComponents = {
     img: (props: any) => (
-      // eslint-disable-next-line @next/next/no-img-element
       <img
         {...props}
         alt={props.alt || ''}

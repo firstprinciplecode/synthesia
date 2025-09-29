@@ -19,9 +19,9 @@ import { terminalService } from '../terminal/terminal-service.js';
 import { serpapiService } from '../tools/serpapi-service.js';
 import { elevenLabsService } from '../tools/elevenlabs-service.js';
 import { memoryService } from '../memory/memory-service.js';
-import { db, users, agents } from '../db/index.js';
+import { db, users, agents, roomReads } from '../db/index.js';
 import * as DBSchema from '../db/schema.js';
-import { eq } from 'drizzle-orm';
+import { and, eq, gt, inArray, ne, count } from 'drizzle-orm';
 import { randomUUID } from 'crypto';
 import { webScraperService } from '../tools/web-scraper-service.js';
 import { ToolRegistry } from '../tools/tool-registry.js';
@@ -56,6 +56,9 @@ export class WebSocketServer {
   private roomCooldownUntil: Map<string, Map<string, number>> = new Map();
   private roomTyping: Map<string, Map<string, number>> = new Map(); // roomId -> actorId -> expiresAtMs
   private roomReceipts: Map<string, Map<string, Set<string>>> = new Map(); // roomId -> messageId -> Set<actorId>
+  private lastUnreadBroadcast: Map<string, Map<string, number>> = new Map(); // roomId -> actorId -> unreadCount
+  private connectionActorId: Map<string, string> = new Map();
+  private actorConnections: Map<string, Set<string>> = new Map();
   private bus: WebSocketBus;
   private roomsRegistry: RoomRegistry;
   private orchestrator: AgentOrchestrator;
@@ -258,6 +261,14 @@ export class WebSocketServer {
     }
   }
 
+  private async safeCanonicalizeActorId(identifier: string): Promise<string | undefined> {
+    try {
+      return await this.canonicalizeActorId(identifier);
+    } catch {
+      return undefined;
+    }
+  }
+
   private async resolvePrimaryUserActorId(userId: string): Promise<string> {
     try {
       const canonical = await this.canonicalizeUserId(userId);
@@ -267,6 +278,224 @@ export class WebSocketServer {
       if (sorted.length) return sorted[0].id as string;
     } catch {}
     return userId;
+  }
+
+  private async canonicalizeActorId(identifier: string): Promise<string> {
+    const raw = String(identifier || '').trim();
+    if (!raw) return raw;
+    try {
+      const match = await db
+        .select({ id: DBSchema.actors.id })
+        .from(DBSchema.actors)
+        .where(eq(DBSchema.actors.id as any, raw as any))
+        .limit(1);
+      if (match.length) return raw;
+    } catch {}
+    try {
+      const canonicalUserId = await this.canonicalizeUserId(raw);
+      return await this.resolvePrimaryUserActorId(canonicalUserId);
+    } catch {}
+    return raw;
+  }
+
+  private registerActorConnection(connectionId: string, actorId: string) {
+    const current = this.connectionActorId.get(connectionId);
+    if (current && current !== actorId) this.unregisterActorConnection(connectionId, current);
+    this.connectionActorId.set(connectionId, actorId);
+    if (!this.actorConnections.has(actorId)) this.actorConnections.set(actorId, new Set());
+    this.actorConnections.get(actorId)!.add(connectionId);
+  }
+
+  private unregisterActorConnection(connectionId: string, actorId?: string) {
+    const resolved = actorId || this.connectionActorId.get(connectionId);
+    if (!resolved) return;
+    const set = this.actorConnections.get(resolved);
+    if (set) {
+      set.delete(connectionId);
+      if (set.size === 0) this.actorConnections.delete(resolved);
+    }
+    this.connectionActorId.delete(connectionId);
+  }
+
+  private async getMemberActorIds(roomId: string): Promise<string[]> {
+    try {
+      const members = await db.select().from(DBSchema.roomMembers).where(eq(DBSchema.roomMembers.roomId as any, roomId as any));
+      return members.map((m: any) => String(m.actorId)).filter(Boolean);
+    } catch (error) {
+      console.error('[getMemberActorIds] failed', error);
+      return [];
+    }
+  }
+
+  private async recordMessageRead(roomId: string, actorId: string, messageId: string, readAt: Date): Promise<void> {
+    try {
+      const resolvedActorId = await this.canonicalizeActorId(actorId);
+      await db
+        .insert(roomReads)
+        .values({
+          roomId,
+          actorId: resolvedActorId,
+          lastReadMessageId: messageId,
+          lastReadAt: readAt,
+          updatedAt: readAt,
+        } as any)
+        .onConflictDoUpdate({
+          target: [roomReads.roomId, roomReads.actorId],
+          set: {
+            lastReadMessageId: messageId,
+            lastReadAt: readAt,
+            updatedAt: readAt,
+          },
+        });
+    } catch (error) {
+      console.error('[recordMessageRead] failed', error);
+    }
+  }
+
+  private async computeUnreadCounts(roomId: string): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    try {
+      const messages = await db
+        .select({
+          id: DBSchema.messages.id,
+          authorId: DBSchema.messages.authorId,
+          createdAt: DBSchema.messages.createdAt,
+        })
+        .from(DBSchema.messages)
+        .where(eq(DBSchema.messages.conversationId as any, roomId as any));
+
+      const timestamps = new Map<string, Date>();
+      for (const row of messages as any[]) {
+        const id = String(row.id);
+        const ts = row.createdAt ? new Date(row.createdAt) : undefined;
+        if (!ts) continue;
+        timestamps.set(id, ts);
+      }
+
+      if (!timestamps.size) return counts;
+
+      const actorIds = new Set<string>();
+      for (const row of messages as any[]) {
+        const authorId = String(row.authorId || '');
+        if (authorId) actorIds.add(authorId);
+      }
+
+      // Include any known room members even if they haven't posted yet
+      try {
+        const memberActorIds = await this.getMemberActorIds(roomId);
+        for (const id of memberActorIds) {
+          if (id) actorIds.add(String(id));
+        }
+      } catch (error) {
+        console.error('[computeUnreadCounts] failed to load room members', error);
+      }
+
+      const reads = await db
+        .select()
+        .from(roomReads)
+        .where(eq(roomReads.roomId, roomId));
+
+      const messageReadByActor = new Map<string, Set<string>>();
+      for (const row of reads as any[]) {
+        const actorId = await this.canonicalizeActorId(String(row.actorId || ''));
+        if (!actorId) continue;
+        actorIds.add(actorId);
+        const msgId = row.lastReadMessageId ? String(row.lastReadMessageId) : null;
+        const readAt = row.lastReadAt ? new Date(row.lastReadAt) : null;
+        if (msgId && timestamps.has(msgId)) {
+          if (!messageReadByActor.has(actorId)) messageReadByActor.set(actorId, new Set());
+          messageReadByActor.get(actorId)!.add(msgId);
+        } else if (readAt) {
+          for (const [id, ts] of timestamps.entries()) {
+            if (ts <= readAt) {
+              if (!messageReadByActor.has(actorId)) messageReadByActor.set(actorId, new Set());
+              messageReadByActor.get(actorId)!.add(id);
+            }
+          }
+        }
+      }
+
+      for (const actorId of actorIds) {
+        let unread = 0;
+        const readSet = messageReadByActor.get(actorId) || new Set();
+        for (const msg of messages as any[]) {
+          if (String(msg.authorId || '') === actorId) continue;
+          const id = String(msg.id);
+          if (!readSet.has(id)) unread += 1;
+        }
+        counts.set(actorId, unread);
+      }
+    } catch (error) {
+      console.error('[computeUnreadCounts] failed', error);
+    }
+
+    return counts;
+  }
+
+  private broadcastUnread(roomId: string, counts: Map<string, number>) {
+    const cached = this.lastUnreadBroadcast.get(roomId) || new Map();
+    for (const [actorId, count] of counts.entries()) {
+      const previous = cached.get(actorId);
+      if (previous === count) continue;
+      cached.set(actorId, count);
+      const connections = this.roomsRegistry.listConnections(roomId);
+      try { console.log('[broadcastUnread] room', roomId, 'actor', actorId, 'count', count, 'roomConns', connections); } catch {}
+      for (const connectionId of connections) {
+        const connActor = this.connectionActorId.get(connectionId);
+        if (connActor && connActor !== actorId) continue;
+        try { console.log('[broadcastUnread] send to roomConn', connectionId, 'connActor', connActor); } catch {}
+        this.bus.sendToConnection(connectionId, {
+          jsonrpc: '2.0',
+          method: 'room.unread',
+          params: {
+            roomId,
+            actorId,
+            unreadCount: count,
+            updatedAt: new Date().toISOString(),
+          },
+        });
+      }
+      const actorSockets = this.actorConnections.get(actorId);
+      if (actorSockets) {
+        const roomConnSet = new Set(connections);
+        for (const connectionId of actorSockets) {
+          if (roomConnSet.has(connectionId)) continue;
+          try { console.log('[broadcastUnread] send to actorConn', connectionId, 'for actor', actorId); } catch {}
+          this.bus.sendToConnection(connectionId, {
+            jsonrpc: '2.0',
+            method: 'room.unread',
+            params: {
+              roomId,
+              actorId,
+              unreadCount: count,
+              updatedAt: new Date().toISOString(),
+            },
+          });
+        }
+      }
+    }
+    this.lastUnreadBroadcast.set(roomId, cached);
+  }
+
+  private broadcastDmPing(fromActorId: string, toActorId: string, roomId: string) {
+    try {
+      const sockets = this.actorConnections.get(toActorId);
+      if (!sockets || sockets.size === 0) return;
+      for (const connectionId of sockets) {
+        this.bus.sendToConnection(connectionId, {
+          jsonrpc: '2.0',
+          method: 'dm.ping',
+          params: {
+            roomId,
+            fromActorId,
+            toActorId,
+            updatedAt: new Date().toISOString(),
+          },
+        });
+      }
+    } catch (e) {
+      console.error('[broadcastDmPing] failed', e);
+    }
   }
 
   register(fastify: FastifyInstance) {
@@ -297,6 +526,17 @@ export class WebSocketServer {
 
     console.log(`WebSocket connection established: ${connectionId}`);
 
+    let hintedUser = String((request.headers['x-user-id'] as string) || '').trim();
+    try {
+      const rawUrl = String((request as any).url || '');
+      const host = String(((request as any).headers && (request as any).headers.host) || 'localhost');
+      const u = new URL(rawUrl, `http://${host}`);
+      const qp = u.searchParams.get('uid');
+      if (qp && !hintedUser) hintedUser = String(qp).trim();
+    } catch {}
+    const hintedActor = hintedUser ? await this.safeCanonicalizeActorId(hintedUser) : undefined;
+    if (hintedActor) this.registerActorConnection(connectionId, hintedActor);
+
     ws.on('message', (data: Buffer) => {
       this.handleMessage(connectionId, data);
     });
@@ -304,8 +544,8 @@ export class WebSocketServer {
     ws.on('close', () => {
       console.log(`WebSocket connection closed: ${connectionId}`);
       this.connections.delete(connectionId);
+      this.unregisterActorConnection(connectionId);
       const affectedRooms = this.removeFromAllRooms(connectionId);
-      // Broadcast updated participants for any affected rooms
       for (const roomId of affectedRooms) {
         this.broadcastParticipants(roomId).catch((e) => console.error('broadcastParticipants on close failed', e));
       }
@@ -749,7 +989,7 @@ export class WebSocketServer {
 
   private async handleMessageCreate(connectionId: string, request: MessageCreateRequest) {
     try {
-      const { roomId, message, runOptions } = request.params;
+    const { roomId, message, runOptions } = request.params;
       
       // Validate user is in room (simplified for MVP)
       if (!this.isUserInRoom(connectionId, roomId)) {
@@ -787,12 +1027,14 @@ export class WebSocketServer {
       } catch {}
 
       // Echo the user message to the room
+      const messageId = randomUUID();
+
       this.bus.broadcastToRoom(roomId, {
         jsonrpc: '2.0',
         method: 'message.received',
         params: {
           roomId,
-          messageId: randomUUID(),
+          messageId,
           authorId: myActorId,
           authorType: 'user',
           authorUserId: activeUserId,
@@ -803,19 +1045,45 @@ export class WebSocketServer {
       });
 
       // Persist user message to DB
+      let createdAt = new Date();
       try {
+        const now = new Date();
         await db.insert(DBSchema.messages as any).values({
-          id: randomUUID(),
+          id: messageId,
           conversationId: roomId,
           authorId: String(myActorId),
           authorType: 'user',
           role: 'user',
           content: Array.isArray(message?.content) ? (message.content as any) : [{ type: 'text', text: String(message || '') }] as any,
           status: 'completed',
-          createdAt: new Date(),
-          updatedAt: new Date(),
+          createdAt: now,
+          updatedAt: now,
         } as any);
-      } catch {}
+
+        createdAt = now;
+        await this.recordMessageRead(roomId, String(myActorId), messageId, now);
+      } catch (error) {
+        console.error('[handleMessageCreate] failed to persist message', error);
+      }
+
+      try {
+        const unread = await this.computeUnreadCounts(roomId);
+        this.broadcastUnread(roomId, unread);
+      } catch (error) {
+        console.error('[handleMessageCreate] failed to broadcast unread', error);
+      }
+
+      // For DM rooms, also emit an immediate actor-based ping to the receiver so their sidebar can show a dot without room mapping
+      try {
+        if (isDmRoom) {
+          // Identify the receiver actor (any user member other than the sender)
+          const memberActorIds = await this.getMemberActorIds(roomId);
+          const receiver = (memberActorIds || []).find((a) => String(a) !== String(myActorId));
+          if (receiver) this.broadcastDmPing(String(myActorId), String(receiver), roomId);
+        }
+      } catch (e) {
+        console.error('[handleMessageCreate] dm.ping failed', e);
+      }
 
       // For DM rooms, do not trigger agent routing or system fallback; store only the user message and return
       if (isDmRoom) {
@@ -848,7 +1116,7 @@ export class WebSocketServer {
 
       // Start agent run
       const runId = randomUUID();
-      const messageId = randomUUID();
+      const runMessageId = randomUUID();
       
       // Send run started notification
       this.bus.broadcastToRoom(roomId, {
@@ -865,7 +1133,7 @@ export class WebSocketServer {
       if ((request as any).id) {
         this.bus.sendResponse(connectionId, (request as any).id, {
           runId,
-          messageId,
+          messageId: runMessageId,
           status: 'running',
         });
       }
@@ -1169,7 +1437,21 @@ ${personaBlock}${memoryContext}`,
             return result;
           },
           onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: (primaryAgentId || roomId), authorType: 'agent' } }),
-          onDelta: (delta) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' } } as MessageDeltaNotification),
+          onDelta: async (delta) => {
+            const aid = (primaryAgentId || roomId);
+            let authorName: string | undefined;
+            let authorAvatar: string | undefined;
+            try {
+              if (primaryAgentId) {
+                const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+                if (arows && arows.length) {
+                  authorName = (arows[0] as any).name || undefined;
+                  authorAvatar = (arows[0] as any).avatar || undefined;
+                }
+              }
+            } catch {}
+            this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } } as MessageDeltaNotification);
+          },
           getCatalog: () => this.toolRegistry.catalog(),
           getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
         });
@@ -1226,7 +1508,21 @@ ${personaBlock}${memoryContext}`,
           responseText = approvedText;
         }
         
-        this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: responseText }] }, authorId: (primaryAgentId || roomId), authorType: 'agent' } });
+        {
+          const aid = (primaryAgentId || roomId);
+          let authorName: string | undefined;
+          let authorAvatar: string | undefined;
+          try {
+            if (primaryAgentId) {
+              const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+              if (arows && arows.length) {
+                authorName = (arows[0] as any).name || undefined;
+                authorAvatar = (arows[0] as any).avatar || undefined;
+              }
+            }
+          } catch {}
+          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: responseText }] }, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } });
+        }
       } else {
         const { fullResponse } = await this.orchestrator.streamPrimaryAgentResponse({
           roomId,
@@ -1236,20 +1532,38 @@ ${personaBlock}${memoryContext}`,
           userProfile,
           userMessage,
           runOptions: { model, temperature: runOptions?.temperature, budget: runOptions?.budget },
-          onDelta: (delta: string) => {
-            this.bus.broadcastToRoom(roomId, {
-              jsonrpc: '2.0',
-              method: 'message.delta',
-              params: { roomId, messageId, delta, authorId: (primaryAgentId || roomId), authorType: 'agent' },
-            } as MessageDeltaNotification);
+          onDelta: async (delta: string) => {
+            const aid = (primaryAgentId || roomId);
+            let authorName: string | undefined;
+            let authorAvatar: string | undefined;
+            try {
+              if (primaryAgentId) {
+                const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+                if (arows && arows.length) {
+                  authorName = (arows[0] as any).name || undefined;
+                  authorAvatar = (arows[0] as any).avatar || undefined;
+                }
+              }
+            } catch {}
+            this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } } as MessageDeltaNotification);
           },
         });
         responseText = fullResponse;
-        this.bus.broadcastToRoom(roomId, {
-          jsonrpc: '2.0',
-          method: 'message.complete',
-          params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] }, authorId: (primaryAgentId || roomId), authorType: 'agent' },
-        });
+        {
+          const aid = (primaryAgentId || roomId);
+          let authorName: string | undefined;
+          let authorAvatar: string | undefined;
+          try {
+            if (primaryAgentId) {
+              const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+              if (arows && arows.length) {
+                authorName = (arows[0] as any).name || undefined;
+                authorAvatar = (arows[0] as any).avatar || undefined;
+              }
+            }
+          } catch {}
+          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] }, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } });
+        }
       }
 
       // Persist assistant final message for primary agent responses (single-agent rooms)
@@ -1771,7 +2085,7 @@ ${personaBlock}${memoryContext}`,
       }
       const roomId = this.getRoomForConnection(connectionId) || 'default-room';
       console.log('[web.scrape] url=', url);
-      const { result } = await this.toolRunner.run('web', 'scrape', { url }, { roomId, connectionId });
+    const { result } = await this.toolRunner.run('web', 'scrape', { url }, { roomId, connectionId });
 
       // Build a compact markdown summary for the chat
       const title = result.title ? `**${result.title}**` : '';
@@ -1894,26 +2208,37 @@ ${personaBlock}${memoryContext}`,
     const { roomId } = request.params as { roomId: string; userId?: string };
     // Derive userId from request params, then headers fallback
     let userId: string | undefined = (request.params as any)?.userId;
-    try {
-      // @ts-ignore internal
-      const conn: any = this.connections.get(connectionId);
-      const req: any = (conn && conn.req) || null;
-      // In Fastify WS, original HTTP request is on connection.request
-      const hdrs = (req && req.headers) || (conn && conn.request && conn.request.headers) || {};
-      const hinted = String(hdrs['x-user-id'] || '').trim();
-      if (!userId && hinted) userId = hinted;
-    } catch {}
-    // Canonicalize to UUID for stable identity mapping
-    if (userId) {
-      try { userId = await this.canonicalizeUserId(userId) } catch {}
+    if (!userId) {
+      userId = this.connectionUserId.get(connectionId);
     }
+
+    let connectionActorId: string | undefined = this.connectionActorId.get(connectionId);
+    if (!connectionActorId && userId) {
+      try {
+        connectionActorId = await this.canonicalizeActorId(userId);
+      } catch {
+        connectionActorId = userId;
+      }
+      if (connectionActorId) this.registerActorConnection(connectionId, connectionActorId);
+    }
+
     this.roomsRegistry.addConnection(roomId, connectionId, userId);
     
-    this.bus.sendResponse(connectionId, request.id, { 
-      roomId, 
+    this.bus.sendResponse(connectionId, request.id, {
+      roomId,
       status: 'joined',
       participants: Array.from(this.rooms.get(roomId)!),
     });
+
+    // After join, compute unread state for this actor
+    if (connectionActorId) {
+      const unread = await this.computeUnreadCounts(roomId);
+      const count = unread.get(connectionActorId) ?? 0;
+      this.broadcastUnread(roomId, new Map([[connectionActorId, count]]));
+    }
+
+    // Cache resolved actor id for this connection to simplify unread bookkeeping
+    if (connectionActorId) this.registerActorConnection(connectionId, connectionActorId);
 
     // Notify room with enriched participants list
     await this.broadcastParticipants(roomId);
@@ -1923,6 +2248,7 @@ ${personaBlock}${memoryContext}`,
     const { roomId } = request.params;
     
     this.roomsRegistry.removeConnection(roomId, connectionId);
+    this.connectionActorId.delete(connectionId);
     
     this.bus.sendResponse(connectionId, request.id, { 
       roomId, 
@@ -2244,15 +2570,23 @@ ${personaBlock}${memoryContext}`,
     }
     let actorId = String(request?.params?.actorId || '');
     if (!actorId) {
-      actorId = this.connectionUserId.get(connectionId) || 'default-user';
+      actorId = this.connectionActorId.get(connectionId) || this.connectionUserId.get(connectionId) || 'default-user';
     }
+    actorId = await this.canonicalizeActorId(actorId);
+    this.registerActorConnection(connectionId, actorId);
     if (!this.roomReceipts.has(roomId)) this.roomReceipts.set(roomId, new Map());
     const byMessage = this.roomReceipts.get(roomId)!;
     if (!byMessage.has(messageId)) byMessage.set(messageId, new Set());
     byMessage.get(messageId)!.add(actorId);
     this.roomReceipts.set(roomId, byMessage);
+    const readAt = new Date();
+    await this.recordMessageRead(roomId, actorId, messageId, readAt);
+
     this.bus.sendResponse(connectionId, request?.id, { ok: true });
     this.broadcastReceipts(roomId, messageId);
+
+    const unread = await this.computeUnreadCounts(roomId);
+    this.broadcastUnread(roomId, unread);
   }
 
   // Public method to get router info
@@ -2313,7 +2647,7 @@ ${personaBlock}${memoryContext}`,
     } catch {}
 
     const runId = randomUUID();
-    const messageId = randomUUID();
+    const runMessageId = randomUUID();
     this.broadcastToRoom(roomId, {
       jsonrpc: '2.0',
       method: 'run.status',
@@ -2370,7 +2704,7 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
           this.broadcastToRoom(roomId, {
             jsonrpc: '2.0',
             method: 'message.delta',
-            params: { roomId, messageId, delta: chunk.delta, authorId: nextAgentId, authorType: 'agent' },
+            params: { roomId, messageId: runMessageId, delta: chunk.delta, authorId: nextAgentId, authorType: 'agent' },
           } as MessageDeltaNotification);
         }
         if (chunk.finishReason) {
@@ -2379,7 +2713,7 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
             method: 'message.complete',
             params: {
               runId,
-              messageId,
+              messageId: runMessageId,
               finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] },
               usage: chunk.usage,
               authorId: nextAgentId,
@@ -2389,7 +2723,7 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
           // Persist assistant final message
           try {
             await db.insert(DBSchema.messages as any).values({
-              id: messageId,
+              id: runMessageId,
               conversationId: roomId,
               authorId: String(nextAgentId),
               authorType: 'agent',

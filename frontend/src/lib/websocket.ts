@@ -16,6 +16,9 @@ export interface ChatMessage {
   // Optional identity for assistant
   agentName?: string;
   agentAvatar?: string;
+  // Optional identity for user
+  userName?: string;
+  userAvatar?: string;
   // Raw author identity passthrough from server
   authorId?: string;
   authorType?: string;
@@ -28,19 +31,20 @@ export interface ChatMessage {
   };
 }
 
-type JSONValue = any;
+type JSONValue = unknown;
 
 type OnMessage = (message: ChatMessage) => void;
 type OnMessageDelta = (messageId: string, delta: string, authorId?: string, authorType?: string) => void;
 type OnConnect = () => void;
 type OnDisconnect = () => void;
-type OnError = (err: any) => void;
+type OnError = (err: unknown) => void;
 type OnAgentAnalysis = (content: string, authorId?: string, authorType?: string) => void;
 type OnParticipantsUpdate = (payload: { roomId: string; participants: Array<{ id: string; type: 'user'|'agent'; name: string; avatar?: string | null; status?: string }>; updatedAt: string }) => void;
-type OnToolCall = (payload: { runId: string; toolCallId: string; tool: string; function: string; args: Record<string, any> }) => void;
-type OnToolResult = (payload: { runId: string; toolCallId: string; result?: any; error?: string }) => void;
+type OnToolCall = (payload: { runId: string; toolCallId: string; tool: string; function: string; args: Record<string, JSONValue> }) => void;
+type OnToolResult = (payload: { runId: string; toolCallId: string; result?: JSONValue; error?: string }) => void;
 type OnTyping = (payload: { roomId: string; typing: Array<{ actorId: string; type?: 'user'|'agent' }>; updatedAt: string }) => void;
 type OnReceipts = (payload: { roomId: string; messageId: string; actorIds: string[]; updatedAt: string }) => void;
+type OnUnreadUpdate = (payload: { roomId: string; unreadCount: number; updatedAt: string; actorId?: string }) => void;
 
 interface JSONRPCRequest {
   jsonrpc: '2.0';
@@ -53,21 +57,21 @@ interface JSONRPCResponse {
   jsonrpc: '2.0';
   id: string;
   result?: JSONValue;
-  error?: { code: number; message: string; data?: any };
+  error?: { code: number; message: string; data?: unknown };
 }
 
 interface JSONRPCNotification {
   jsonrpc: '2.0';
   method: string;
-  params?: Record<string, any>;
+  params?: Record<string, JSONValue>;
 }
 
 export class SuperAgentWebSocket {
   private url: string;
   private ws: WebSocket | null = null;
   private connected = false;
-  private requestResolvers: Map<string, { resolve: (v: any) => void; reject: (e: any) => void }> = new Map();
-  private dedupeInFlight: Map<string, Promise<any>> = new Map();
+  private requestResolvers: Map<string, { resolve: (v: unknown) => void; reject: (e: unknown) => void }> = new Map();
+  private dedupeInFlight: Map<string, Promise<unknown>> = new Map();
   private lastResultIdByRoom: Map<string, string> = new Map();
   private pendingResultWaiters: Map<string, Array<(rid: string) => void>> = new Map();
 
@@ -82,6 +86,7 @@ export class SuperAgentWebSocket {
   private onToolResult?: OnToolResult;
   private onTyping?: OnTyping;
   private onReceipts?: OnReceipts;
+  private onUnreadUpdate?: OnUnreadUpdate;
 
   constructor(
     url: string,
@@ -90,13 +95,14 @@ export class SuperAgentWebSocket {
     onConnect?: OnConnect,
     onDisconnect?: OnDisconnect,
     onError?: OnError,
-    _onMessageReceived?: (payload: any) => void, // reserved, not used currently
+    _onMessageReceived?: (payload: unknown) => void, // reserved, not used currently
     onAgentAnalysis?: OnAgentAnalysis,
     onParticipantsUpdate?: OnParticipantsUpdate,
     onToolCall?: OnToolCall,
     onToolResult?: OnToolResult,
     onTyping?: OnTyping,
     onReceipts?: OnReceipts,
+    onUnreadUpdate?: OnUnreadUpdate,
   ) {
     this.url = url;
     this.onMessage = onMessage;
@@ -110,6 +116,7 @@ export class SuperAgentWebSocket {
     this.onToolResult = onToolResult;
     this.onTyping = onTyping;
     this.onReceipts = onReceipts;
+    this.onUnreadUpdate = onUnreadUpdate;
   }
 
   // Expose latest stable resultId for the given room, if known
@@ -136,7 +143,7 @@ export class SuperAgentWebSocket {
           if (this.onDisconnect) this.onDisconnect();
         };
         this.ws.onerror = (ev: Event) => {
-          const err: any = (ev as any)?.error || new Error(`WebSocket error (${this.url})`);
+          const err: unknown = (ev as unknown as { error?: unknown })?.error || new Error(`WebSocket error (${this.url})`);
           if (this.onError) this.onError(err);
           try { this.ws?.close(); } catch {}
           this.connected = false;
@@ -146,7 +153,7 @@ export class SuperAgentWebSocket {
           this.handleIncoming(evt.data);
         };
       } catch (e) {
-        reject(e);
+        reject(e as unknown);
       }
     });
   }
@@ -162,21 +169,21 @@ export class SuperAgentWebSocket {
 
   private nextId(): string {
     try {
-      // @ts-ignore
+      // @ts-expect-error - crypto may be undefined in some environments
       if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
     } catch {}
     return `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   }
 
-  private sendRaw(obj: any): void {
+  private sendRaw(obj: unknown): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('WebSocket is not connected');
     this.ws.send(JSON.stringify(obj));
   }
 
-  private async sendRequest(method: string, params?: Record<string, JSONValue>): Promise<any> {
+  private async sendRequest(method: string, params?: Record<string, JSONValue>): Promise<unknown> {
     const id = this.nextId();
     const req: JSONRPCRequest = { jsonrpc: '2.0', id, method, params };
-    const promise = new Promise<any>((resolve, reject) => {
+    const promise = new Promise<unknown>((resolve, reject) => {
       this.requestResolvers.set(id, { resolve, reject });
     });
     this.sendRaw(req);
@@ -184,7 +191,7 @@ export class SuperAgentWebSocket {
   }
 
   // Dedupe by (method, params) key while an identical request is in flight
-  private async sendRequestDedupe(method: string, params?: Record<string, JSONValue>): Promise<any> {
+  private async sendRequestDedupe(method: string, params?: Record<string, JSONValue>): Promise<unknown> {
     const key = `${method}:${JSON.stringify(params || {})}`;
     const existing = this.dedupeInFlight.get(key);
     if (existing) return existing;
@@ -195,11 +202,11 @@ export class SuperAgentWebSocket {
 
   // Handle inbound JSON-RPC messages
   private handleIncoming(data: string): void {
-    let obj: any;
+    let obj: unknown;
     try { obj = JSON.parse(data); } catch { return; }
 
     // Response
-    if (obj && obj.jsonrpc === '2.0' && (obj.result !== undefined || obj.error)) {
+    if (typeof obj === 'object' && obj && (obj as { jsonrpc?: string }).jsonrpc === '2.0' && (obj as { result?: unknown; error?: unknown }).result !== undefined || (obj as { error?: unknown }).error) {
       const res = obj as JSONRPCResponse;
       const pending = this.requestResolvers.get(res.id);
       if (pending) {
@@ -219,19 +226,19 @@ export class SuperAgentWebSocket {
     }
 
     // Notification
-    if (obj && obj.jsonrpc === '2.0' && obj.method) {
-      const { method, params } = obj as { method: string; params?: any };
-      const extractText = (m: any): string => {
+    if (typeof obj === 'object' && obj && (obj as { jsonrpc?: string }).jsonrpc === '2.0' && (obj as { method?: string }).method) {
+      const { method, params } = obj as { method: string; params?: Record<string, JSONValue> };
+      const extractText = (m: JSONValue): string => {
         if (!m) return '';
         if (typeof m === 'string') return m;
         // OpenAI-style content array
-        if (Array.isArray(m.content)) {
+        if (typeof (m as { content?: unknown }).content !== 'undefined' && Array.isArray((m as { content?: unknown[] }).content)) {
           try {
-            return m.content.map((c: any) => (typeof c?.text === 'string' ? c.text : '')).join('');
+            return ((m as { content: Array<{ text?: string }> }).content).map((c) => (typeof c?.text === 'string' ? c.text : '')).join('');
           } catch { return ''; }
         }
         // Fallback: try common fields
-        if (typeof m.text === 'string') return m.text;
+        if (typeof (m as { text?: string }).text === 'string') return (m as { text?: string }).text as string;
         return '';
       };
       switch (method) {
@@ -244,16 +251,13 @@ export class SuperAgentWebSocket {
             authorId: params?.authorId,
             authorType: params?.authorType,
             // passthrough user id so UI can label sender correctly in DMs
-            ...(params?.authorUserId ? { authorUserId: params.authorUserId } : {}),
-            ...(params?.authorName ? { userName: params.authorName } : {}),
-            ...(params?.authorAvatar ? { userAvatar: params.authorAvatar } : {}),
+            ...(params?.authorUserId ? { authorUserId: params.authorUserId as string } : {}),
+            ...(params?.authorName && params?.authorType === 'user' ? { userName: params.authorName as string } : {}),
+            ...(params?.authorAvatar && params?.authorType === 'user' ? { userAvatar: params.authorAvatar as string } : {}),
+            ...(params?.authorName && params?.authorType === 'agent' ? { agentName: params.authorName as string } : {}),
+            ...(params?.authorAvatar && params?.authorType === 'agent' ? { agentAvatar: params.authorAvatar as string } : {}),
             streaming: false,
           };
-          // If this is a user-authored message and we have a friendly name/avatar, attach them
-          if (m.role === 'user') {
-            if (!('userName' in (m as any)) && typeof (params?.authorName) === 'string') (m as any).userName = params.authorName;
-            if (!('userAvatar' in (m as any)) && typeof (params?.authorAvatar) === 'string') (m as any).userAvatar = params.authorAvatar;
-          }
           this.onMessage(m);
           break;
         }
@@ -275,6 +279,13 @@ export class SuperAgentWebSocket {
             authorType: params?.authorType,
             streaming: false,
           };
+          if (params?.authorType === 'user') {
+            if (typeof params?.authorName === 'string') m.userName = params.authorName;
+            if (typeof params?.authorAvatar === 'string') m.userAvatar = params.authorAvatar;
+          } else if (params?.authorType === 'agent') {
+            if (typeof params?.authorName === 'string') m.agentName = params.authorName;
+            if (typeof params?.authorAvatar === 'string') m.agentAvatar = params.authorAvatar;
+          }
           this.onMessage(m);
           break;
         }
@@ -320,6 +331,17 @@ export class SuperAgentWebSocket {
           if (this.onReceipts) this.onReceipts(params);
           break;
         }
+        case 'room.unread': {
+          if (this.onUnreadUpdate) this.onUnreadUpdate(params as any);
+          break;
+        }
+        case 'dm.ping': {
+          // Fan out to any listeners via a CustomEvent as well
+          try {
+            window.dispatchEvent(new CustomEvent('dm-ping', { detail: params }));
+          } catch {}
+          break;
+        }
         case 'search.results': {
           const rid = String(params?.resultId || '');
           const roomId = String(params?.roomId || '');
@@ -343,23 +365,23 @@ export class SuperAgentWebSocket {
   }
 
   // Public API used by ChatInterface
-  async joinRoom(roomId: string, userId?: string): Promise<any> {
+  async joinRoom(roomId: string, userId?: string): Promise<unknown> {
     return this.sendRequestDedupe('room.join', { roomId, userId });
   }
 
-  async markMessageRead(roomId: string, messageId: string, actorId?: string): Promise<any> {
+  async markMessageRead(roomId: string, messageId: string, actorId?: string): Promise<unknown> {
     return this.sendRequest('message.read', { roomId, messageId, ...(actorId ? { actorId } : {}) });
   }
 
-  async typingStart(roomId: string, actorId?: string, ttlMs?: number): Promise<any> {
+  async typingStart(roomId: string, actorId?: string, ttlMs?: number): Promise<unknown> {
     return this.sendRequest('typing.start', { roomId, ...(actorId ? { actorId } : {}), ...(ttlMs ? { ttlMs } : {}) });
   }
 
-  async typingStop(roomId: string, actorId?: string): Promise<any> {
+  async typingStop(roomId: string, actorId?: string): Promise<unknown> {
     return this.sendRequest('typing.stop', { roomId, ...(actorId ? { actorId } : {}) });
   }
 
-  async sendMessage(roomId: string, content: string, options?: Record<string, any>): Promise<any> {
+  async sendMessage(roomId: string, content: string, options?: Record<string, JSONValue>): Promise<unknown> {
     // Send as notification and rely on message.delta/message.complete for UI updates
     const message = {
       role: 'user',
@@ -373,17 +395,17 @@ export class SuperAgentWebSocket {
         params: { roomId, message, runOptions: options },
       });
       return Promise.resolve({ status: 'queued' });
-    } catch (e) {
+    } catch {
       // Fallback to request if needed
       return this.sendRequest('message.create', { roomId, message, runOptions: options });
     }
   }
 
-  async executeTerminalCommand(command: string, roomId: string): Promise<any> {
+  async executeTerminalCommand(command: string, roomId: string): Promise<unknown> {
     return this.sendRequest('terminal.execute', { roomId, command });
   }
 
-  async executeAgentCommand(command: string, roomId: string, reason?: string): Promise<any> {
+  async executeAgentCommand(command: string, roomId: string, reason?: string): Promise<unknown> {
     return this.sendRequest('agent.execute', { roomId, command, reason });
   }
 
@@ -393,24 +415,24 @@ export class SuperAgentWebSocket {
   }
 
   // SerpAPI helpers
-  async serpapiSearch(query: string, roomId: string, num = 5, agentId?: string): Promise<any> {
+  async serpapiSearch(query: string, roomId: string, num = 5, agentId?: string): Promise<unknown> {
     return this.sendRequestDedupe('tool.serpapi.search', { roomId, query, num, ...(agentId ? { agentId } : {}) });
   }
 
-  async serpapiImages(query: string, roomId: string, num = 6, agentId?: string): Promise<any> {
+  async serpapiImages(query: string, roomId: string, num = 6, agentId?: string): Promise<unknown> {
     return this.sendRequestDedupe('tool.serpapi.images', { roomId, query, num, ...(agentId ? { agentId } : {}) });
   }
 
-  async serpapiRun(engine: string, query: string, roomId: string, extra?: Record<string, any>, agentId?: string): Promise<any> {
+  async serpapiRun(engine: string, query: string, roomId: string, extra?: Record<string, JSONValue>, agentId?: string): Promise<unknown> {
     return this.sendRequestDedupe('tool.serpapi.run', { roomId, engine, query, extra, ...(agentId ? { agentId } : {}) });
   }
 
   // Web scraper
-  async webScrape(url: string, roomId: string, agentId?: string): Promise<any> {
+  async webScrape(url: string, roomId: string, agentId?: string): Promise<unknown> {
     return this.sendRequest('tool.web.scrape', { roomId, url, ...(agentId ? { agentId } : {}) });
   }
 
-  async webScrapePick(index: number, roomId: string, agentId?: string, resultId?: string): Promise<any> {
+  async webScrapePick(index: number, roomId: string, agentId?: string, resultId?: string): Promise<unknown> {
     const rid = resultId || this.lastResultIdByRoom.get(roomId);
     return this.sendRequest('tool.web.scrape.pick', { roomId, index, ...(rid ? { resultId: rid } : {}), ...(agentId ? { agentId } : {}) });
   }
@@ -421,26 +443,26 @@ export class SuperAgentWebSocket {
     roomId: string,
     options?: { path?: string; glob?: string; maxResults?: number; caseInsensitive?: boolean; regex?: boolean },
     agentId?: string,
-  ): Promise<any> {
-    const params: any = { roomId, pattern, ...(options || {}) };
+  ): Promise<unknown> {
+    const params: Record<string, JSONValue> = { roomId, pattern, ...(options || {}) };
     if (agentId) params.agentId = agentId;
     return this.sendRequest('tool.code.search', params);
   }
 
   // X/Twitter
-  async xSearch(query: string, roomId: string, num = 5, agentId?: string): Promise<any> {
+  async xSearch(query: string, roomId: string, num = 5, agentId?: string): Promise<unknown> {
     return this.sendRequest('tool.x.search', { roomId, query, extra: { num }, ...(agentId ? { agentId } : {}) });
   }
 
-  async xLists(handle: string, roomId: string, agentId?: string): Promise<any> {
+  async xLists(handle: string, roomId: string, agentId?: string): Promise<unknown> {
     return this.sendRequest('tool.x.lists', { roomId, handle, ...(agentId ? { agentId } : {}) });
   }
 
-  async xTweet(text: string, roomId: string, media?: { url: string }[], agentId?: string): Promise<any> {
+  async xTweet(text: string, roomId: string, media?: { url: string }[], agentId?: string): Promise<unknown> {
     return this.sendRequest('tool.x.tweet', { roomId, text, media, ...(agentId ? { agentId } : {}) });
   }
 
-  async xDm(handle: string, text: string, roomId: string, agentId?: string): Promise<any> {
+  async xDm(handle: string, text: string, roomId: string, agentId?: string): Promise<unknown> {
     return this.sendRequest('tool.x.dm', { roomId, handle, text, ...(agentId ? { agentId } : {}) });
   }
 }
@@ -462,6 +484,7 @@ export interface MessageContent {
  
 
 // Legacy client below (kept for reference). Disable duplicate export by renaming.
+/* eslint-disable @typescript-eslint/no-explicit-any */
 export class SuperAgentWebSocketLegacy {
   private ws: WebSocket | null = null;
   private reconnectAttempts = 0;

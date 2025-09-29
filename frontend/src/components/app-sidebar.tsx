@@ -7,12 +7,24 @@ import {
   Bot,
   Command,
   Frame,
-  GalleryVerticalEnd,
+  // GalleryVerticalEnd,
   Map,
   PieChart,
   Settings2,
   SquareTerminal,
 } from "lucide-react"
+import Image from "next/image"
+
+// Custom Goose Icon Component
+const GooseIcon = ({ className }: { className?: string }) => (
+  <Image
+    src="/goose.svg"
+    alt="Goose"
+    width={16}
+    height={16}
+    className={`${className} brightness-0`}
+  />
+)
 
 import { NavMain } from "@/components/nav-main"
 import { NavProjects } from "@/components/nav-projects"
@@ -26,6 +38,7 @@ import {
   SidebarHeader,
   SidebarRail,
 } from "@/components/ui/sidebar"
+import { useUnreadStore } from "@/stores/unread-store"
 
 // Defaults; user will be loaded from backend profile
 const data = {
@@ -37,7 +50,7 @@ const data = {
   teams: [
     {
       name: "Acme Inc",
-      logo: GalleryVerticalEnd,
+      logo: GooseIcon,
       plan: "Enterprise",
     },
     {
@@ -53,10 +66,16 @@ const data = {
   ],
   navMain: [
     {
+      title: "Feed",
+      url: "/feed",
+      icon: BookOpen,
+      isActive: true
+    },
+    {
       title: "Inbox",
       url: "/inbox",
       icon: SquareTerminal,
-      isActive: true,
+      isActive: false,
       items: [
         { title: "All Messages", url: "/inbox" },
         { title: "Unread", url: "/inbox" },
@@ -69,7 +88,6 @@ const data = {
       icon: Bot,
       items: [
         { title: "My Agents", url: "/agents" },
-        { title: "Create Agent", url: "/agents/new" },
         { title: "Connections", url: "/connections" },
       ],
     },
@@ -103,13 +121,22 @@ const data = {
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const [user, setUser] = React.useState(data.user)
+  const totalUnread = useUnreadStore((state) => state.totalUnread())
   const { status, data: session } = useSession()
+  const hasMounted = React.useRef(false)
+
+  React.useEffect(() => {
+    hasMounted.current = true
+    return () => {
+      hasMounted.current = false
+    }
+  }, [])
 
   React.useEffect(() => {
     let cancelled = false
     async function loadProfile() {
       try {
-        const uid = (session as any)?.userId
+        const uid = (session as unknown as { userId?: string })?.userId
         const res = await fetch("/api/profile", { cache: "no-store", headers: uid ? { 'x-user-id': uid } : undefined })
         if (!res.ok) return
         const p = await res.json()
@@ -132,7 +159,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       setUser({ name: "", email: "", avatar: "" })
     }
     return () => { cancelled = true }
-  }, [status])
+  }, [status, session])
 
   return (
     <Sidebar collapsible="icon" {...props}>
@@ -140,7 +167,19 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         <TeamSwitcher teams={data.teams} />
       </SidebarHeader>
       <SidebarContent>
-        <NavMain items={data.navMain} />
+        <NavMain
+          items={data.navMain.map((item) =>
+            item.title === 'Inbox'
+              ? {
+                  ...item,
+                  badge:
+                    hasMounted.current && totalUnread > 0 ?
+                      (totalUnread > 99 ? '99+' : String(totalUnread))
+                      : undefined,
+                }
+              : item,
+          )}
+        />
         {status === 'authenticated' ? <NavProjects /> : null}
       </SidebarContent>
       <SidebarFooter>

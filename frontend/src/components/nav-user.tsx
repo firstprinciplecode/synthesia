@@ -46,7 +46,7 @@ export function NavUser({
   }
 }) {
   const { data: session, status } = useSession()
-  const { isMobile } = useSidebar()
+  const { isMobile, state } = useSidebar()
   const { theme, setTheme } = useTheme()
 
   return (
@@ -55,18 +55,18 @@ export function NavUser({
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <SidebarMenuButton
-              size="lg"
+              size={state === 'collapsed' ? 'default' : 'lg'}
               className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
             >
-              <Avatar className="h-8 w-8 rounded-lg">
+              <Avatar className={state === 'collapsed' ? 'h-6 w-6 rounded-lg' : 'h-8 w-8 rounded-lg'}>
                 <AvatarImage src={status === 'authenticated' ? (user.avatar || (session as any)?.user?.image || '') : ''} alt={status === 'authenticated' ? (user.name || 'User') : 'Guest'} />
                 <AvatarFallback className="rounded-lg">{(status === 'authenticated' ? (user.name || 'U') : 'G').charAt(0).toUpperCase()}</AvatarFallback>
               </Avatar>
-              <div className="grid flex-1 text-left text-sm leading-tight">
+              <div className="grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden">
                 <span className="truncate font-medium">{status === 'authenticated' ? user.name : 'Not signed in'}</span>
                 <span className="truncate text-xs">{status === 'authenticated' ? user.email : ''}</span>
               </div>
-              <ChevronsUpDown className="ml-auto size-4" />
+              <ChevronsUpDown className="ml-auto size-4 group-data-[collapsible=icon]:hidden" />
             </SidebarMenuButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent

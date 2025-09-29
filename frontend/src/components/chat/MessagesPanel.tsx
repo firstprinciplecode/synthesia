@@ -23,7 +23,6 @@ export function MessagesPanel({
   onLoadMore,
   hasMore,
   loadingMore,
-  receipts,
 }: {
   allMessages: ChatMessageType[];
   pendingTerminalSuggestions: Map<string, { command: string; reason: string }>;
@@ -39,7 +38,6 @@ export function MessagesPanel({
   onLoadMore?: () => void;
   hasMore?: boolean;
   loadingMore?: boolean;
-  receipts?: Map<string, Set<string>>;
 }) {
   const [hasMounted, setHasMounted] = useState(false);
   useEffect(() => {
@@ -78,19 +76,7 @@ export function MessagesPanel({
               const headerKey = stableKey;
               const animateHeader = message.role === 'assistant' && !seenHeaderKeysRef.current.has(headerKey);
               if (animateHeader) seenHeaderKeysRef.current.add(headerKey);
-              // Compute read receipts for this message
-              let readByOthers = false;
-              let readByCount = 0;
-              try {
-                const actorIds = receipts?.get(message.id);
-                if (actorIds && actorIds.size > 0) {
-                  // Map user participants (by id) and exclude the sender themself
-                  const senderUserId = (message as any).authorUserId as string | undefined;
-                  const others = [...actorIds].filter(id => !senderUserId || id !== senderUserId);
-                  readByCount = others.length;
-                  readByOthers = others.length > 0;
-                }
-              } catch {}
+              // Read receipts removed
               return (
                 <div
                   key={stableKey}
@@ -112,8 +98,8 @@ export function MessagesPanel({
                           || (participantsRef.current as any)?.find?.((p: any) => p.type === 'user' && (p.id === (message as any).authorId || p.id === (message as any).authorUserId))?.avatar)
                       : userMeta.avatarUrl}
                     currentUserId={currentUserId}
-                    readByOthers={readByOthers}
-                    readByCount={readByCount}
+                    readByOthers={false}
+                    readByCount={0}
                   />
                   {message.role === 'assistant' && pendingTerminalSuggestions.has(message.id) && (
                     (() => {

@@ -15,6 +15,13 @@
       "when": 1758315288267,
       "tag": "0001_add_social_core",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1759071335082,
+      "tag": "0002_glossy_zemo",
+      "breakpoints": true
     }
   ]
 }

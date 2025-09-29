@@ -1,6 +1,7 @@
 import './globals.css';
 import React from 'react';
 import { Providers } from '@/components/Providers';
+import WsNotifier from '@/components/WsNotifier';
 
 export const metadata = {
   title: 'SuperAgent',
@@ -12,6 +13,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en" suppressHydrationWarning>
       <body>
         <Providers>
+          <WsNotifier />
           {children}
         </Providers>
       </body>
