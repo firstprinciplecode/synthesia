@@ -268,10 +268,7 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
               )}
             </div>
           )}
-          {/* Read receipts: show only for your own messages when others have read */}
-          {isUser && isSelf && !!readByOthers && (
-            <div className="mt-1 text-[10px] text-muted-foreground">{readByCount && readByCount > 1 ? `Read by ${readByCount}` : 'Read'}</div>
-          )}
+          {/* Read receipts removed */}
         </div>
       </div>
     </div>

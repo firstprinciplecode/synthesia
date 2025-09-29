@@ -694,6 +694,10 @@ fastify.post('/api/feed', async (request, reply) => {
               request.server.log.info({ agentId: ag.id, name: ag.name, reason }, 'public-match:will-reply');
               const replyId = randomUUID();
                 let replyText = `@${ag.name || 'Agent'}: I can help with this.`;
+                // Variables hoisted so they can be used after retrieval (e.g., for monitor creation)
+                let engineUse: string | undefined;
+                let res: any = undefined;
+                let markdown: string = '';
               // Try Yelp via SerpAPI when relevant
               try {
                 const { serpapiService } = await import('./tools/serpapi-service.js');
@@ -709,7 +713,8 @@ fastify.post('/api/feed', async (request, reply) => {
                   }
                   wsServer['bus']?.broadcastToAll?.({ jsonrpc: '2.0', method: 'feed.typing', params: { postId: id, authorType: 'agent', authorId: ag.id, authorName: ag.name, authorAvatar: typingAvatar, typing: true } } as any);
                 } catch {}
-                let engineUse: string | undefined = Array.isArray(pcfg?.allowedEngines) && pcfg.allowedEngines.length ? String(pcfg.allowedEngines[0]) : undefined;
+                // Select initial engine from config
+                engineUse = Array.isArray(pcfg?.allowedEngines) && pcfg.allowedEngines.length ? String(pcfg.allowedEngines[0]) : undefined;
                 // Heuristic fallback if none selected, constrained by agent interests
                 if (!engineUse) {
                   const foodish = /\b(food|restaurant|dining|michelin|wine|drinks|bistro|eatery|yelp)\b/i.test(String(text));
@@ -722,8 +727,6 @@ fastify.post('/api/feed', async (request, reply) => {
                 }
                 request.server.log.info({ agentId: ag.id, engine: engineUse }, 'public-match:engine-selected');
                 // Run retrieval with optional Yelp normalization; compose will run regardless of retrieval outcome
-                let res: any = undefined;
-                let markdown: string = '';
                 try {
                   // LLM-normalize Yelp params (find_desc/cflt/sortby/attrs) when applicable
                   let queryForEngine = String(text);
@@ -877,7 +880,7 @@ fastify.post('/api/feed', async (request, reply) => {
                     // Fallback to heuristic intro if LLM unavailable
                     const fmtList = (arr: string[]) => arr.length === 0 ? '' : (arr.length === 1 ? arr[0] : (arr.length === 2 ? `${arr[0]} and ${arr[1]}` : `${arr[0]}, ${arr[1]} and ${arr[2]}`));
                     if (lowerName.includes('gordon')) {
-                      composedIntro = topTitles.length ? `Oi! Proper eats: ${fmtList(topTitles)} — I’d book one of these tonight.` : 'Oi! Here are top picks:';
+                      composedIntro = topTitles.length ? `Oi! Proper eats: ${fmtList(topTitles)} — I'd book one of these tonight.` : 'Oi! Here are top picks:';
                     } else if (lowerName.includes('david') && lowerName.includes('deutsch')) {
                       composedIntro = topTitles.length ? `In brief: ${fmtList(topTitles)}. Explanatory reach matters; see sources below.` : (engineUse === 'google_scholar' ? 'Key scholarly references:' : 'Relevant sources:');
                     } else {
@@ -910,12 +913,14 @@ fastify.post('/api/feed', async (request, reply) => {
                 if (pcfgFull?.isPublic) {
                   const monitorId = randomUUID();
                   // Choose engine we actually used (engineUse may be undefined if retrieval failed); default to first allowed engine
-                  let monitorEngine = engineUse || (Array.isArray(pcfgFull?.allowedEngines) && pcfgFull.allowedEngines.length ? String(pcfgFull.allowedEngines[0]) : 'google');
+                  let monitorEngine: string = (typeof engineUse === 'string' && engineUse.length)
+                    ? engineUse
+                    : (Array.isArray(pcfgFull?.allowedEngines) && pcfgFull.allowedEngines.length ? String(pcfgFull.allowedEngines[0]) : 'google');
                   // Build normalized query/params from what we sent to serpapiService
                   const paramsForMonitor: any = {};
                   if (monitorEngine === 'yelp') {
                     // Persist our last known Yelp params if available
-                    try { paramsForMonitor.find_loc = (res as any)?.raw?.search_parameters?.find_loc || undefined; } catch {}
+                    try { paramsForMonitor.find_loc = (res && (res as any).raw && (res as any).raw.search_parameters ? (res as any).raw.search_parameters.find_loc : undefined); } catch {}
                   }
                   const jitterMinutes = Math.floor(Math.random() * 60);
                   const now = new Date();
@@ -983,7 +988,9 @@ fastify.get('/api/feed/:id', async (request, reply) => {
     const agentRows: any[] = await db
       .select({ id: agents.id, name: agents.name, avatar: agents.avatar })
       .from(agents);
-    const resolveUser = (idOrEmail: string) => userRows.find(u => u.id === idOrEmail) || userRows.find(u => (u.email && u.email === idOrEmail));
+    const resolveUser = (idOrEmail: string) => {
+      return userRows.find(u => u.id === idOrEmail) || userRows.find(u => (u.email && u.email === idOrEmail));
+    };
     const resolveAgent = (aid: string) => agentRows.find(a => a.id === aid);
     const fixAvatar = (v?: string) => typeof v === 'string' ? (v.includes('/uploads/') ? v : (v.startsWith('http://localhost:3001') ? v.replace('http://localhost:3001','') : v)) : undefined;
     const enrich = (it: any) => {
@@ -1820,22 +1827,40 @@ if (SOCIAL_CORE) {
     }
   });
 
-  // List rooms for current user (group rooms only; hide dm/agent_chat from Rooms list)
+  // List rooms for current user (includes group and dm) with participants for client-side mapping
   fastify.get('/api/rooms', async (request, reply) => {
     try {
       const uid = getUserIdFromRequest(request);
       // Include ALL user-actors for this owner to avoid missing rooms created with older actor ids
       const myActorIds = await getMyActorIdsForUser(uid);
-      // Fetch memberships for all my actors (drizzle simple filter, fallback to app-layer filter)
-      const allMemberships = await db.select().from(roomMembers);
+      // Prefetch tables needed
+      const [allMemberships, allRooms, allActors] = await Promise.all([
+        db.select().from(roomMembers),
+        db.select().from(rooms),
+        db.select().from(actors),
+      ]);
+      const actorById: Record<string, any> = {};
+      for (const a of allActors as any[]) actorById[a.id] = a;
+
       const memberships = (allMemberships as any[]).filter(m => myActorIds.has(m.actorId));
       const roomIds = Array.from(new Set(memberships.map((m: any) => m.roomId)));
-      const rows = [] as any[];
+      const out: any[] = [];
       for (const rid of roomIds) {
-        const r = await db.select().from(rooms).where(eq(rooms.id as any, rid));
-        if (r?.length && String((r[0] as any).kind) === 'group') rows.push(r[0]);
+        const r = (allRooms as any[]).find(rr => rr.id === rid);
+        if (!r) continue;
+        const members = (allMemberships as any[]).filter(m => m.roomId === rid);
+        const participants = members.map((m: any) => {
+          const a = actorById[m.actorId];
+          return {
+            actorId: m.actorId,
+            type: a?.type || 'user',
+            isSelf: myActorIds.has(m.actorId),
+            actor: a ? { id: a.id, type: a.type, displayName: a.displayName, handle: a.handle, email: a.email, avatarUrl: a.avatarUrl } : undefined,
+          };
+        });
+        out.push({ ...r, participants });
       }
-      return { rooms: rows };
+      return { rooms: out };
     } catch (e: any) {
       request.server.log.error(e);
       reply.code(500);
@@ -2575,105 +2600,87 @@ if (SOCIAL_CORE) {
   fastify.get('/api/connections', async (request, reply) => {
     try {
       const uid = getUserIdFromRequest(request);
-      const all = await db.select().from(relationships);
-      const actorRows = await db.select().from(actors);
-      const userRows = await db.select().from(users);
       const myActorIds = await getMyActorIdsForUser(uid);
 
-      // Accepted edges only
-      const isAccepted = (r: any) => (r?.metadata?.status || 'accepted') === 'accepted';
-      const outgoing = (all as any[]).filter(r => r.kind === 'follow' && isAccepted(r) && myActorIds.has(r.fromActorId));
-      const incoming = (all as any[]).filter(r => r.kind === 'follow' && isAccepted(r) && myActorIds.has(r.toActorId));
+      const actorRows = await db.select().from(actors);
+      const userRows = await db.select().from(users);
+      const relRows = await db.select().from(relationships);
+      const roomsRows = await db.select().from(rooms);
+      const membersRows = await db.select().from(roomMembers);
 
-      // Owner lookup helpers with canonicalization (convert email owners to users.id)
-      const actorById: Record<string, any> = {};
-      for (const a of actorRows as any[]) actorById[a.id] = a;
-      const usersByEmail: Record<string, string> = {};
-      for (const u of userRows as any[]) { if (u?.email) usersByEmail[String(u.email)] = String(u.id); }
       const ownerOf = (actorId: string) => {
-        const raw = actorById[actorId]?.ownerUserId as string | undefined;
-        if (!raw) return undefined;
-        if (raw.includes && raw.includes('@')) return usersByEmail[raw] || raw; // resolve email->uuid if possible
-        return raw;
+        const row = (actorRows as any[]).find(a => a.id === actorId);
+        return row?.ownerUserId ? String(row.ownerUserId) : null;
       };
 
-      // Determine my owner id
-      let myOwnerId: string | undefined;
-      for (const id of myActorIds) {
-        const own = ownerOf(id);
-        if (own) { myOwnerId = own; break; }
-      }
-      if (!myOwnerId) {
-        try { myOwnerId = await normalizeUserId(uid); } catch {}
-      }
+      const outgoing = (relRows as any[]).filter(r => r.kind === 'follow' && myActorIds.has(String(r.fromActorId)));
+      const incoming = (relRows as any[]).filter(r => r.kind === 'follow' && myActorIds.has(String(r.toActorId)));
+      const isAccepted = (r: any) => (r?.metadata?.status || 'accepted') === 'accepted';
+      const acceptedOutgoing = outgoing.filter(isAccepted);
+      const acceptedIncoming = incoming.filter(isAccepted);
+      const outgoingIds = new Set(acceptedOutgoing.map(r => String(r.toActorId)));
+      const incomingIds = new Set(acceptedIncoming.map(r => String(r.fromActorId)));
+      const mutual = new Set<string>();
+      for (const id of outgoingIds) if (incomingIds.has(id)) mutual.add(id);
 
-      // Build set of owners who have an accepted edge to any of my actors
-      const incomingOwnerSet = new Set<string>();
-      for (const i of incoming) {
-        const owner = ownerOf(i.fromActorId);
-        if (owner && owner !== myOwnerId) incomingOwnerSet.add(owner);
-      }
+      const candidateActorIds = mutual.size > 0 ? mutual : outgoingIds;
+      const connections = (actorRows as any[]).filter(a => candidateActorIds.has(a.id));
 
-      // Choose a representative actor per owner (most recently updated), canonicalizing owner ids
-      const ownerToActors: Record<string, any[]> = {};
-      for (const a of actorRows as any[]) {
-        if (a.type === 'user' && a.ownerUserId) {
-          const key = (String(a.ownerUserId).includes('@') ? (usersByEmail[String(a.ownerUserId)] || String(a.ownerUserId)) : String(a.ownerUserId));
-          if (!ownerToActors[key]) ownerToActors[key] = [];
-          ownerToActors[key].push(a);
-        }
-      }
-      const ownerRepActorId: Record<string, string> = {};
-      for (const [owner, list] of Object.entries(ownerToActors)) {
-        const sorted = list.sort((x: any, y: any) => new Date(y.updatedAt || y.createdAt || 0).getTime() - new Date(x.updatedAt || x.createdAt || 0).getTime());
-        ownerRepActorId[owner] = sorted[0]?.id;
-      }
-
-      const mutualRepIds = new Set<string>();
-      for (const o of outgoing) {
-        const tgtOwner = ownerOf(o.toActorId);
-        if (tgtOwner && tgtOwner !== myOwnerId && incomingOwnerSet.has(tgtOwner)) {
-          const repId = ownerRepActorId[tgtOwner] || o.toActorId;
-          mutualRepIds.add(repId);
-        }
-      }
-
-      // If no mutuals resolved, fall back to accepted one-way follows (either direction)
-      const eitherOwnerSet = new Set<string>();
-      for (const o of outgoing) { const ow = ownerOf(o.toActorId); if (ow && ow !== myOwnerId) eitherOwnerSet.add(ow); }
-      for (const i of incoming) { const ow = ownerOf(i.fromActorId); if (ow && ow !== myOwnerId) eitherOwnerSet.add(ow); }
-      const fallbackRepIds = new Set<string>();
-      for (const owner of eitherOwnerSet) {
-        const repId = ownerRepActorId[owner];
-        if (repId) fallbackRepIds.add(repId);
-      }
-
-      const chosenIds = mutualRepIds.size > 0 ? mutualRepIds : fallbackRepIds;
-      let connections = (actorRows as any[]).filter(a => chosenIds.has(a.id));
-
-      // Enrich user actors with profile name/avatar
       const usersById: Record<string, any> = {};
       for (const u of userRows as any[]) usersById[u.id] = u;
-      connections = connections.map((a: any) => {
-        const out = { ...a };
-        if (out.type === 'user' && out.ownerUserId && usersById[out.ownerUserId]) {
-          const u = usersById[out.ownerUserId];
-          if (!out.displayName) out.displayName = u.name || u.email || out.handle || out.id;
-          if (!out.avatarUrl) out.avatarUrl = u.avatar || null;
+
+      const dmRoomsByActorId = new Map<string, string>();
+      const dmRoomsByOwnerId = new Map<string, string>();
+      // Resolve my owner id(s)
+      const myOwnerIdsSet = new Set<string>();
+      for (const aid of Array.from(myActorIds)) {
+        const own = ownerOf(aid);
+        if (own) myOwnerIdsSet.add(own);
+      }
+      for (const room of roomsRows as any[]) {
+        if (room.kind !== 'dm') continue;
+        const members = (membersRows as any[]).filter(m => m.roomId === room.id);
+        for (const member of members) {
+          if (member?.actorId) dmRoomsByActorId.set(String(member.actorId), room.id);
         }
-        return out;
-      });
-      // Filter out any orphan user-actors without a resolvable owner (prevents raw UUID rows like ca47f8...)
-      connections = connections.filter((a: any) => {
-        if (a.type !== 'user') return true;
-        const own = ownerOf(a.id);
-        return !!own && own !== myOwnerId;
-      });
-      request.server.log.info({ uid, outgoingCount: outgoing.length, incomingCount: incoming.length, mutualCount: mutualRepIds.size, returnedCount: connections.length }, 'connections.list');
-      return { connections };
-    } catch (e: any) {
-      request.server.log.error(e);
-      reply.code(500); return { error: 'Failed to list connections' };
+        // Also map by the non-self owner's id so any of their user-actors resolve to this DM
+        if (members.length === 2) {
+          const aOwner = ownerOf(String(members[0]?.actorId || ''));
+          const bOwner = ownerOf(String(members[1]?.actorId || ''));
+          if (aOwner && bOwner) {
+            if (myOwnerIdsSet.has(aOwner) && !myOwnerIdsSet.has(bOwner)) dmRoomsByOwnerId.set(bOwner, room.id);
+            if (myOwnerIdsSet.has(bOwner) && !myOwnerIdsSet.has(aOwner)) dmRoomsByOwnerId.set(aOwner, room.id);
+          }
+        }
+      }
+
+      // Compute my owner userIds from my actors to filter out self
+      const myOwnerIds = myOwnerIdsSet;
+
+      const enriched = connections
+        .filter((a: any) => {
+          if (a.type !== 'user') return true;
+          const owner = ownerOf(a.id);
+          // Drop orphan user-actors and any that belong to me
+          return !!owner && !myOwnerIds.has(owner);
+        })
+        .map((a: any) => {
+          const out = { ...a };
+          if (out.type === 'user' && out.ownerUserId && usersById[out.ownerUserId]) {
+            const u = usersById[out.ownerUserId];
+            if (!out.displayName) out.displayName = u.name || u.email || out.handle || out.id;
+            if (!out.avatarUrl) out.avatarUrl = u.avatar || null;
+          }
+          const ownerId = ownerOf(out.id);
+          const dmRoomId = dmRoomsByActorId.get(out.id) || (ownerId ? dmRoomsByOwnerId.get(ownerId) : undefined);
+          if (dmRoomId) out.dmRoomId = dmRoomId;
+          return out;
+        });
+
+      reply.send({ connections: enriched });
+    } catch (error) {
+      request.server.log.error(error);
+      reply.code(500).send({ error: 'Failed to list connections' });
     }
   });
 
@@ -3567,3 +3574,4 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 start();
+

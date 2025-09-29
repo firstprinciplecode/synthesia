@@ -9,6 +9,7 @@ import {
   boolean,
   numeric,
   index,
+  primaryKey,
 } from 'drizzle-orm/pg-core';
 
 // === USERS AND ORGANIZATIONS ===
@@ -329,6 +330,7 @@ export const conversationsRelations = relations(conversations, ({ one, many }) =
   }),
   messages: many(messages),
   runs: many(runs),
+  roomReads: many(roomReads),
 }));
 
 export const messagesRelations = relations(messages, ({ one }) => ({
@@ -622,5 +624,24 @@ export const publicFeedRelations = relations(publicFeedReplies, ({ one }) => ({
   post: one(publicFeedPosts, {
     fields: [publicFeedReplies.postId],
     references: [publicFeedPosts.id],
+  }),
+}));
+
+export const roomReads = pgTable('room_reads', {
+  roomId: varchar('room_id', { length: 191 }).notNull(),
+  actorId: varchar('actor_id', { length: 191 }).notNull(),
+  lastReadMessageId: varchar('last_read_message_id', { length: 191 }),
+  lastReadAt: timestamp('last_read_at').defaultNow().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  pk: primaryKey(table.roomId, table.actorId),
+  idxUpdated: index('room_reads_updated_idx').on(table.updatedAt),
+}));
+
+export const roomReadsRelations = relations(roomReads, ({ one }) => ({
+  room: one(conversations, {
+    fields: [roomReads.roomId],
+    references: [conversations.id],
   }),
 }));

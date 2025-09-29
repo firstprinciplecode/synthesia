@@ -1,7 +1,7 @@
 "use client"
 
 import { MoreHorizontal, Bot, Users, Trash2 } from "lucide-react"
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { useSession } from "next-auth/react"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
@@ -23,10 +23,12 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { useUnreadStore } from "@/stores/unread-store"
 
 type Agent = { id: string; name: string; avatar?: string | null }
 type Conversation = { id: string; title: string; type: string; participants: any[] }
 type Room = { id: string; title?: string | null; kind?: string | null }
+type Connection = { id: string; name?: string; displayName?: string; handle?: string; email?: string; avatar?: string; avatarUrl?: string; type?: string; dmRoomId?: string; ownerUserId?: string }
 
 export function NavProjects() {
   const { isMobile } = useSidebar()
@@ -35,7 +37,7 @@ export function NavProjects() {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [agentMap, setAgentMap] = useState<Map<string, Agent>>(new Map())
   const [rooms, setRooms] = useState<Room[]>([])
-  const [connections, setConnections] = useState<any[]>([])
+  const [connections, setConnections] = useState<Connection[]>([])
   const [createOpen, setCreateOpen] = useState(false)
   const [createTitle, setCreateTitle] = useState("")
   const [selectedUsers, setSelectedUsers] = useState<Set<string>>(new Set())
@@ -88,32 +90,30 @@ export function NavProjects() {
         const cr = await fetch('/api/connections', { cache: 'no-store', headers })
         if (cr.ok) {
           const cj = await cr.json()
-          setConnections(Array.isArray(cj?.connections) ? cj.connections : [])
-        } else {
-          // Temporary workaround: hardcode known connected users until API endpoint is fixed
-          const hardcodedConnections = [
-            {
-              id: 'thomas-petersen-gmail',
-              name: 'Thomas Petersen',
-              email: 'thomas.petersen@gmail.com',
-              avatar: '/uploads/default-avatar.png',
-              type: 'user'
+          const rawConnections: any[] = Array.isArray(cj?.connections) ? cj.connections : []
+          let normalized: Connection[] = rawConnections.map((c) => {
+            const id = String(c.id || c.actorId || c.email || c.handle || '').trim()
+            const dmRoomId = c.dmRoomId || c.roomId || (Array.isArray(c.rooms) ? c.rooms.find((room: any) => room?.kind === 'dm')?.id : undefined)
+            return {
+              id,
+              name: c.name,
+              displayName: c.displayName,
+              handle: c.handle,
+              email: c.email,
+              avatar: c.avatar,
+              avatarUrl: c.avatarUrl,
+              type: c.type,
+              dmRoomId,
+              ownerUserId: c.ownerUserId,
             }
-          ]
-          setConnections(hardcodedConnections)
+          }).filter((c) => c.id)
+          setConnections(normalized)
+        } else {
+          // Absolute fallback to preserve sidebar UX
+          setConnections([])
         }
-      } catch { 
-        // Temporary workaround: hardcode known connected users until API endpoint is fixed
-        const hardcodedConnections = [
-          {
-            id: 'thomas-petersen-gmail',
-            name: 'Thomas Petersen',
-            email: 'thomas.petersen@gmail.com',
-            avatar: '/uploads/default-avatar.png',
-            type: 'user'
-          }
-        ]
-        setConnections(hardcodedConnections)
+      } catch {
+        setConnections([])
       }
     } catch {}
   }, [status, session])
@@ -217,6 +217,98 @@ export function NavProjects() {
     
     return { firstTwoAgents, remainingCount }
   }
+
+  const dmRoomsByConnectionId = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const room of rooms) {
+      if ((room as any)?.kind !== 'dm') continue
+      const myEntry = Array.isArray((room as any)?.participants)
+        ? (room as any).participants.find((p: any) => p?.actorId && p?.isSelf)
+        : null
+      const myActorId = myEntry?.actorId
+      const participants = Array.isArray((room as any)?.participants) ? (room as any).participants : []
+      for (const participant of participants) {
+        if (participant?.type !== 'user') continue
+        if (participant?.actorId && participant.actorId === myActorId) continue
+        const identifiers: Array<string | undefined> = [
+          participant?.actorId,
+          participant?.actor?.id,
+          participant?.id,
+          participant?.userId,
+          participant?.handle,
+          participant?.email,
+          participant?.name,
+          (participant as any)?.displayName,
+          (participant as any)?.ownerUserId,
+          (participant as any)?.actor?.ownerUserId,
+        ]
+        for (const identifier of identifiers) {
+          if (!identifier) continue
+          map.set(String(identifier).trim(), room.id)
+        }
+      }
+    }
+    // Expose for debugging
+    if (typeof window !== 'undefined') {
+      try { (window as any).__dmMap = Object.fromEntries(map.entries()) } catch {}
+    }
+    return map
+  }, [rooms])
+  console.debug('[nav-projects] dmRoomsByConnectionId', Array.from(dmRoomsByConnectionId.entries()))
+
+  const actorAliasesByConnectionId = useMemo(() => {
+    // Build reverse lookup from any connection key → connection.id
+    const keyToConnId = new Map<string, string>()
+    for (const c of connections) {
+      const keys = [c.id, c.handle, c.email, c.displayName, c.name, c.ownerUserId]
+        .filter(Boolean)
+        .map((v) => String(v).trim())
+      for (const k of keys) keyToConnId.set(k, c.id)
+    }
+
+    const aliases = new Map<string, Set<string>>()
+    for (const room of rooms) {
+      if ((room as any)?.kind !== 'dm') continue
+      const parts = Array.isArray((room as any)?.participants) ? (room as any).participants : []
+      for (const p of parts) {
+        if (p?.type !== 'user') continue
+        const identifiers: string[] = [
+          p?.actorId,
+          p?.actor?.id,
+          p?.id,
+          p?.userId,
+          p?.handle,
+          p?.email,
+          p?.name,
+        ]
+          .filter(Boolean)
+          .map((v: any) => String(v).trim())
+        // If any identifier matches a connection key, attribute all of this participant's ids as aliases of that connection
+        const matchedConnId = identifiers.map((k) => keyToConnId.get(k)).find(Boolean)
+        if (!matchedConnId) continue
+        const set = aliases.get(matchedConnId) || new Set<string>()
+        for (const id of identifiers) set.add(id)
+        // Ensure the canonical actor ids are included if present
+        if (p?.actorId) set.add(String(p.actorId))
+        if (p?.actor?.id) set.add(String(p.actor.id))
+        aliases.set(matchedConnId, set)
+      }
+    }
+    if (typeof window !== 'undefined') {
+      try { (window as any).__dmAliases = Object.fromEntries([...aliases.entries()].map(([k,v]) => [k, Array.from(v)])) } catch {}
+    }
+    return aliases
+  }, [rooms, connections])
+
+  const unreadByRoom = useUnreadStore((state) => state.unreadByRoom)
+  const dmByActor = useUnreadStore((state) => state.dmUnreadByActorId)
+  // Expose rooms and connections for debugging to verify mapping and unread state
+  useEffect(() => {
+    try { (window as any).__rooms = rooms } catch {}
+  }, [rooms])
+  useEffect(() => {
+    try { (window as any).__connections = connections } catch {}
+  }, [connections])
 
   return (
     <>
@@ -325,19 +417,111 @@ export function NavProjects() {
             </div>
           </SidebarGroupLabel>
           <SidebarMenu>
-                  {connections.map((c: any) => (
-                    <SidebarMenuItem key={c.id}>
-                      <SidebarMenuButton asChild>
-                        <a href="#" onClick={async (e) => { e.preventDefault(); try { const uid = (session as any)?.userId || (session as any)?.user?.email; const res = await fetch('/api/rooms/dm', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) }, body: JSON.stringify({ targetActorId: c.id }) }); const json = await res.json(); const roomId = json?.roomId; if (roomId) window.location.href = `/c/${roomId}`; } catch {} }}>
+            {connections.map((connection) => {
+              const label = connection.displayName || connection.handle || connection.name || connection.id.slice(0, 8)
+              const avatarSrc = typeof connection.avatarUrl === 'string' ? connection.avatarUrl : connection.avatar
+              const lookupKeys = [
+                connection.dmRoomId,
+                connection.id,
+                connection.handle,
+                connection.email,
+                connection.name,
+                connection.displayName,
+                (connection as any).ownerUserId,
+              ].filter(Boolean) as string[]
+              const dmRoomId = (connection as any).dmRoomId || lookupKeys
+                .map((key) => dmRoomsByConnectionId.get(String(key).trim()))
+                .find(Boolean)
+              const aliasSet = actorAliasesByConnectionId.get(connection.id)
+              const hasAliasUnread = aliasSet ? Array.from(aliasSet).some((aid) => dmByActor[aid] === true) : false
+              // Extra robust check: if any dmUnread actor id maps to the same DM room as any of this connection's keys, treat as unread
+              const anyPingMatches = Object.entries(dmByActor).some(([aid, flag]) => {
+                if (!flag) return false
+                const roomForAid = dmRoomsByConnectionId.get(String(aid).trim())
+                if (!roomForAid) return false
+                // If this connection already resolved a dmRoomId, compare directly first
+                if (dmRoomId && roomForAid === dmRoomId) return true
+                const keys = [
+                  connection.dmRoomId,
+                  connection.id,
+                  connection.handle,
+                  connection.email,
+                  connection.displayName,
+                  connection.name,
+                  connection.ownerUserId,
+                ]
+                  .filter(Boolean)
+                  .map((k) => String(k).trim())
+                for (const k of keys) {
+                  const kr = dmRoomsByConnectionId.get(k)
+                  if (kr && kr === roomForAid) return true
+                }
+                return false
+              })
+              let hasUnread = (dmByActor[connection.id] === true) || hasAliasUnread || anyPingMatches || (dmRoomId ? (unreadByRoom[dmRoomId] ?? 0) > 0 : false)
+              if (!hasUnread) {
+                // Fallback: infer from unread rooms by checking room participants against this connection
+                try {
+                  for (const [rid, cnt] of Object.entries(unreadByRoom)) {
+                    if (!cnt || cnt <= 0) continue
+                    const room = rooms.find(r => r.id === rid)
+                    if (!room || (room as any)?.kind !== 'dm') continue
+                    const parts = Array.isArray((room as any)?.participants) ? (room as any).participants : []
+                    const match = parts.some((p: any) => {
+                      const ids = [p?.actorId, p?.actor?.id, p?.id, p?.userId, p?.handle, p?.email, p?.name].filter(Boolean).map((v: any) => String(v).trim())
+                      return ids.includes(String(connection.id).trim()) || (connection.handle && ids.includes(String(connection.handle).trim())) || (connection.email && ids.includes(String(connection.email).trim()))
+                    })
+                    if (match) { hasUnread = true; break }
+                  }
+                } catch {}
+              }
+              // Dev aid: expose mapping for inspection
+              if (typeof window !== 'undefined') {
+                try {
+                  // @ts-ignore
+                  window.__dmMap = Object.assign({}, (window as any).__dmMap, { [connection.id]: dmRoomId })
+                } catch {}
+              }
+              const itemKey = `${connection.id}-${dmRoomId || 'no-room'}`
+
+              return (
+                <SidebarMenuItem key={itemKey}>
+                  <SidebarMenuButton asChild className="justify-start">
+                    <a
+                      href="#"
+                      onClick={async (e) => {
+                        e.preventDefault()
+                        try {
+                          const uid = (session as any)?.userId || (session as any)?.user?.email
+                          const res = await fetch('/api/rooms/dm', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) },
+                            body: JSON.stringify({ targetActorId: connection.id }),
+                          })
+                          const json = await res.json()
+                          const roomId = json?.roomId
+                          if (roomId) window.location.href = `/c/${roomId}`
+                        } catch {}
+                      }}
+                    >
+                      <div className="relative flex items-center gap-2">
+                        <div className="relative">
                           <Avatar className="h-4 w-4">
-                            <AvatarImage src={typeof c.avatarUrl === 'string' ? c.avatarUrl : undefined} />
-                            <AvatarFallback className="text-xs">{(c.displayName || c.handle || 'U')[0]?.toUpperCase?.() || 'U'}</AvatarFallback>
+                            <AvatarImage src={avatarSrc} />
+                            <AvatarFallback className="text-xs">{label?.[0]?.toUpperCase?.() || 'U'}</AvatarFallback>
                           </Avatar>
-                          <span>{c.displayName || c.handle || c.id.slice(0,8)}</span>
-                        </a>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  ))}
+                          {hasUnread ? (
+                            <span className="pointer-events-none absolute -top-1 -right-1 h-2 w-2 rounded-full bg-rose-500" aria-hidden />
+                          ) : null}
+                        </div>
+                        <span className={"truncate " + (hasUnread ? "font-semibold" : "")}>{label}</span>
+                        {/* Removed trailing red dot; keep only avatar corner dot and bold label */}
+                      </div>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )
+            })}
           </SidebarMenu>
         </SidebarGroup>
       )}

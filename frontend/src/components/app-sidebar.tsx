@@ -38,6 +38,7 @@ import {
   SidebarHeader,
   SidebarRail,
 } from "@/components/ui/sidebar"
+import { useUnreadStore } from "@/stores/unread-store"
 
 // Defaults; user will be loaded from backend profile
 const data = {
@@ -120,8 +121,16 @@ const data = {
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const [user, setUser] = React.useState(data.user)
-  const [unread, setUnread] = React.useState<number>(0)
+  const totalUnread = useUnreadStore((state) => state.totalUnread())
   const { status, data: session } = useSession()
+  const hasMounted = React.useRef(false)
+
+  React.useEffect(() => {
+    hasMounted.current = true
+    return () => {
+      hasMounted.current = false
+    }
+  }, [])
 
   React.useEffect(() => {
     let cancelled = false
@@ -152,32 +161,25 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     return () => { cancelled = true }
   }, [status, session])
 
-  // Poll inbox summary
-  React.useEffect(() => {
-    let t: ReturnType<typeof setTimeout> | undefined;
-    let cancelled = false;
-    async function poll() {
-      try {
-        const res = await fetch('/api/inbox?summary=1', { cache: 'no-store' })
-        if (cancelled) return
-        if (res.ok) {
-          const j = await res.json()
-          setUnread(Number(j?.unread || 0))
-        }
-      } catch {}
-      t = setTimeout(poll, 60000)
-    }
-    poll()
-    return () => { cancelled = true; if (t) clearTimeout(t) }
-  }, [])
-
   return (
     <Sidebar collapsible="icon" {...props}>
       <SidebarHeader>
         <TeamSwitcher teams={data.teams} />
       </SidebarHeader>
       <SidebarContent>
-        <NavMain items={data.navMain.map(it => it.title === 'Inbox' ? { ...it, badge: unread > 0 ? String(unread) : undefined } : it)} />
+        <NavMain
+          items={data.navMain.map((item) =>
+            item.title === 'Inbox'
+              ? {
+                  ...item,
+                  badge:
+                    hasMounted.current && totalUnread > 0 ?
+                      (totalUnread > 99 ? '99+' : String(totalUnread))
+                      : undefined,
+                }
+              : item,
+          )}
+        />
         {status === 'authenticated' ? <NavProjects /> : null}
       </SidebarContent>
       <SidebarFooter>

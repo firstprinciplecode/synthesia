@@ -71,3 +71,4 @@ backups/
 # Runtime uploads and generated assets (do not commit)
 backend/uploads/
 frontend/public/uploads/
+env.local

@@ -1,5 +1,6 @@
 import { SuperAgentWebSocket, ChatMessage } from '@/lib/websocket';
 import { enrichAssistantIdentity, upsertMessage } from './message-pipeline';
+import type { useUnreadStore } from '@/stores/unread-store';
 
 type Participant = { id: string; type: 'user'|'agent'; name: string; avatar?: string | null; status?: string };
 
@@ -7,6 +8,8 @@ export interface WSDependencies {
   wsUrl: string;
   getParticipants: () => Participant[];
   getDefaults: () => { name?: string; avatarUrl?: string };
+  setUnread?: ReturnType<typeof useUnreadStore>['setUnread'];
+  clearUnread?: ReturnType<typeof useUnreadStore>['clearUnread'];
   onConnected?: () => void;
   onDisconnected?: () => void;
   onError?: (err: unknown) => void;
@@ -37,6 +40,37 @@ export class WSClient {
       (payload) => deps.onToolResult?.(payload),
       (payload) => deps.onTyping?.(payload),
       (payload) => deps.onReceipts?.(payload),
+      (payload) => {
+        if (!payload || typeof payload !== 'object') return;
+        const roomId = String((payload as any)?.roomId || '');
+        if (!roomId) return;
+        const countRaw = (payload as any)?.unreadCount;
+        const actorIdRaw = (payload as any)?.actorId;
+        const count = typeof countRaw === 'number' ? countRaw : 0;
+        const actorId = typeof actorIdRaw === 'string' ? actorIdRaw : undefined;
+        // Debug log every unread event we receive on the client
+        try { console.log('[ws][unread]', { roomId, actorId, count, meActor: (window as any).__superagent_actor, meUser: (window as any).__superagent_uid, aliases: (window as any).__superagent_actor_aliases }); } catch {}
+        // Accept unread updates aimed at my primary actor, user id, or any alias actor id
+        try {
+          const meActor = String((window as any).__superagent_actor || '').trim();
+          const meUser = String((window as any).__superagent_uid || '').trim();
+          const aliases: string[] = Array.isArray((window as any).__superagent_actor_aliases)
+            ? ((window as any).__superagent_actor_aliases as any[]).map((v) => String(v || '').trim()).filter(Boolean)
+            : [];
+          const isMe = (!actorId) || actorId === meActor || actorId === meUser || aliases.includes(String(actorId));
+          if (!isMe) return;
+        } catch {}
+        if (count > 0) {
+          deps.setUnread?.(roomId, count);
+        } else {
+          deps.clearUnread?.(roomId);
+        }
+        try {
+          window.dispatchEvent(new CustomEvent('chat-room-unread', {
+            detail: { roomId, count, actorId },
+          }));
+        } catch {}
+      },
     );
   }
 

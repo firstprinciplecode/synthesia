@@ -44,6 +44,7 @@ type OnToolCall = (payload: { runId: string; toolCallId: string; tool: string; f
 type OnToolResult = (payload: { runId: string; toolCallId: string; result?: JSONValue; error?: string }) => void;
 type OnTyping = (payload: { roomId: string; typing: Array<{ actorId: string; type?: 'user'|'agent' }>; updatedAt: string }) => void;
 type OnReceipts = (payload: { roomId: string; messageId: string; actorIds: string[]; updatedAt: string }) => void;
+type OnUnreadUpdate = (payload: { roomId: string; unreadCount: number; updatedAt: string; actorId?: string }) => void;
 
 interface JSONRPCRequest {
   jsonrpc: '2.0';
@@ -85,6 +86,7 @@ export class SuperAgentWebSocket {
   private onToolResult?: OnToolResult;
   private onTyping?: OnTyping;
   private onReceipts?: OnReceipts;
+  private onUnreadUpdate?: OnUnreadUpdate;
 
   constructor(
     url: string,
@@ -100,6 +102,7 @@ export class SuperAgentWebSocket {
     onToolResult?: OnToolResult,
     onTyping?: OnTyping,
     onReceipts?: OnReceipts,
+    onUnreadUpdate?: OnUnreadUpdate,
   ) {
     this.url = url;
     this.onMessage = onMessage;
@@ -113,6 +116,7 @@ export class SuperAgentWebSocket {
     this.onToolResult = onToolResult;
     this.onTyping = onTyping;
     this.onReceipts = onReceipts;
+    this.onUnreadUpdate = onUnreadUpdate;
   }
 
   // Expose latest stable resultId for the given room, if known
@@ -325,6 +329,17 @@ export class SuperAgentWebSocket {
         }
         case 'message.receipts': {
           if (this.onReceipts) this.onReceipts(params);
+          break;
+        }
+        case 'room.unread': {
+          if (this.onUnreadUpdate) this.onUnreadUpdate(params as any);
+          break;
+        }
+        case 'dm.ping': {
+          // Fan out to any listeners via a CustomEvent as well
+          try {
+            window.dispatchEvent(new CustomEvent('dm-ping', { detail: params }));
+          } catch {}
           break;
         }
         case 'search.results': {

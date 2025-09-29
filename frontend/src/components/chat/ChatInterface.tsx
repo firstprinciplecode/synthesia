@@ -12,6 +12,7 @@ import { enrichAssistantIdentity, upsertMessage } from '@/lib/chat';
 import { useChatStore } from '@/stores/chat-store';
 import { useParticipantsStore } from '@/stores/participants-store';
 import { useUIStore } from '@/stores/ui-store';
+import { useUnreadStore } from '@/stores/unread-store';
 // import { ChatMessage } from './ChatMessage';
 // import { ChatInput } from './ChatInput';
 import { ChatFooterBar } from './ChatFooterBar';
@@ -55,11 +56,14 @@ export function ChatInterface({
   const [typing, setTyping] = useState<Array<{ actorId: string; type?: 'user'|'agent' }>>([]);
   const typingDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [hasMore, setHasMore] = useState<boolean>(true);
-  const [receipts, setReceipts] = useState<Map<string, Set<string>>>(new Map()); // messageId -> actorIds
+  // Read receipts disabled
   const loadingMoreRef = useRef<boolean>(false);
   const rightOpen = useUIStore(s => s.rightOpen);
   const rightTab = useUIStore(s => s.rightTab);
   const setRightOpen = useUIStore(s => s.setRightOpen);
+  const addUnreadForRoom = useUnreadStore(s => s.setUnread);
+  const clearUnreadFlag = useUnreadStore(s => s.clearUnread);
+  const clearDmPingForRoom = useUnreadStore(s => s.clearDmPingForRoom);
   const setRightTab = useUIStore(s => s.setRightTab);
   type ToolRun = { runId: string; toolCallId: string; tool: string; func: string; args: Record<string, unknown>; status: 'running' | 'succeeded' | 'failed'; error?: string; startedAt: number; completedAt?: number; durationMs?: number };
   const [toolRuns, setToolRuns] = useState<Map<string, ToolRun>>(new Map());
@@ -76,6 +80,7 @@ export function ChatInterface({
   const streamBuffersRef = useRef<Map<string, string>>(new Map());
   const streamTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const handledSuggestionIdsRef = useRef<Set<string>>(new Set());
+  const [currentActorId, setCurrentActorId] = useState<string | undefined>(undefined);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -246,7 +251,7 @@ export function ChatInterface({
         const limit = 50;
         let res = await fetch(`${base}/api/rooms/${encodeURIComponent(currentRoom)}/messages?limit=${limit}`, { cache: 'no-store', ...(headers ? { headers } : {}) });
         if (!res.ok && (res.status === 401 || res.status === 403)) {
-          // Retry once after a short delay in case session/header wasn’t ready
+          // Retry once after a short delay in case session/header wasn't ready
           await new Promise(r => setTimeout(r, 400));
           res = await fetch(`${base}/api/rooms/${encodeURIComponent(currentRoom)}/messages?limit=${limit}`, { cache: 'no-store', ...(headers ? { headers } : {}) });
         }
@@ -335,9 +340,15 @@ export function ChatInterface({
         if (res.ok) {
           const data = await res.json();
           if (!cancelled) {
-            setUserMeta({ name: data.name, avatarUrl: data.avatar });
-            if (data?.id) setCurrentUserId(String(data.id));
-            try { (window as any).__superagent_uid = String(data.id); } catch {}
+            setUserMeta({ name: data.name, avatar: data.avatar });
+            if (data?.id) {
+              setCurrentUserId(String(data.id));
+              setCurrentActorId(String(data.primaryActorId || data.actorId || data.id));
+            }
+            try {
+              (window as any).__superagent_uid = String(data.id);
+              (window as any).__superagent_actor = String(data.primaryActorId || data.actorId || data.id);
+            } catch {}
           }
           return;
         }
@@ -348,7 +359,11 @@ export function ChatInterface({
             const m = await me.json();
             if (!cancelled && m?.ownerUserId) {
               setCurrentUserId(String(m.ownerUserId));
-              try { (window as any).__superagent_uid = String(m.ownerUserId); } catch {}
+              setCurrentActorId(String(m.id || m.ownerUserId));
+              try {
+                (window as any).__superagent_uid = String(m.ownerUserId);
+                (window as any).__superagent_actor = String(m.id || m.ownerUserId);
+              } catch {}
             }
           }
         } catch {}
@@ -422,6 +437,8 @@ export function ChatInterface({
       wsUrl: WEBSOCKET_URL,
       getParticipants: () => participantsRef.current,
       getDefaults: () => ({ name: agentMeta.name, avatarUrl: agentMeta.avatarUrl }),
+      setUnread: addUnreadForRoom,
+      clearUnread: clearUnreadFlag,
       onMessage: (message) => {
         // Ensure user-authored messages carry a friendly name/avatar directly from participants
         try {
@@ -712,14 +729,7 @@ export function ChatInterface({
         if (payload.roomId !== currentRoom) return;
         setTyping(payload.typing || []);
       },
-      onReceipts: (payload: { roomId: string; messageId: string; actorIds: string[]; updatedAt: string }) => {
-        if (payload.roomId !== currentRoom) return;
-        setReceipts(prev => {
-          const next = new Map(prev);
-          next.set(payload.messageId, new Set(payload.actorIds || []));
-          return next;
-        });
-      },
+      // Read receipts disabled
     });
 
     try {
@@ -1495,14 +1505,40 @@ export function ChatInterface({
     return arr;
   }, [messages]);
 
-  // Mark most recent assistant message as read when we become focused/connected
+  // When viewing a room, clear its unread and any DM pings for its participants
   useEffect(() => {
     if (!wsRef.current?.isConnected() || !currentUserId) return;
     if (!allMessages.length) return;
-    const last = allMessages[allMessages.length - 1];
-    if (!last || !last.id) return;
-    try { (wsRef.current as any).markRead?.(currentRoom, last.id, currentUserId); } catch {}
+    // Clear room-level unread
+    useUnreadStore.getState().clearUnread(currentRoom);
+    // Also clear DM pings for any user participants in this room (DMs)
+    try {
+      const userParticipants = participantsRef.current
+        .filter(p => p.type === 'user')
+        .map(p => p.id)
+      if (userParticipants.length > 0) {
+        useUnreadStore.getState().clearDmPingForRoom(currentRoom, userParticipants)
+      }
+    } catch {}
   }, [allMessages, currentRoom, currentUserId, isConnected]);
+
+  // Additionally, when we join a DM room and receive participants, clear any DM ping
+  useEffect(() => {
+    if (!currentRoom) return;
+    if (roomKind !== 'dm') return;
+    const ids = participantsRef.current.filter(p => p.type === 'user').map(p => p.id)
+    if (ids.length > 0) {
+      try { clearDmPingForRoom(currentRoom, ids) } catch {}
+    }
+  }, [currentRoom, roomKind, participants, clearDmPingForRoom]);
+
+  if (!currentActorId && currentUserId) {
+    const inferred = [...messages].reverse().find((m) => m.authorUserId === currentUserId || m.authorId === currentUserId);
+    if (inferred) {
+      setCurrentActorId(String(inferred.authorId || inferred.authorUserId));
+      try { (window as any).__superagent_actor = String(inferred.authorId || inferred.authorUserId); } catch {}
+    }
+  }
 
   return (
     <div className="relative h-full flex flex-col overflow-hidden">
@@ -1511,7 +1547,7 @@ export function ChatInterface({
         rightOpen ? "md:pr-[var(--sidebar-width)]" : "md:pr-0"
       )}>
 
-        <MessagesPanel
+      <MessagesPanel
           allMessages={allMessages}
           pendingTerminalSuggestions={pendingTerminalSuggestions}
           seenMessageIdsRef={seenMessageIdsRef}
@@ -1526,7 +1562,6 @@ export function ChatInterface({
           onLoadMore={loadOlderHistory}
           hasMore={hasMore}
           loadingMore={loadingMoreRef.current}
-          receipts={receipts}
         />
       </div>
 

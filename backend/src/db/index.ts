@@ -1,6 +1,6 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
 import pkg from 'pg';
-import { users, agents, conversations, actors, rooms, roomMembers, relationships, policies, messages } from './schema.js';
+import { users, agents, conversations, actors, rooms, roomMembers, relationships, policies, messages, roomReads } from './schema.js';
 
 const { Pool } = pkg as any;
 
@@ -14,10 +14,21 @@ function createConnection() {
     console.log('DATABASE_URL exists:', !!process.env.DATABASE_URL);
     console.log('DATABASE_URL starts with:', process.env.DATABASE_URL?.substring(0, 20) + '...');
     
+    const connectionString = process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/postgres';
+    const isNeon = connectionString.includes('neon.tech');
+
     _pool = new Pool({
-      connectionString: process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/postgres',
+      connectionString,
+      max: Number(process.env.PG_POOL_MAX ?? 10),
+      idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT ?? 30_000),
+      connectionTimeoutMillis: Number(process.env.PG_CONNECTION_TIMEOUT ?? 10_000),
+      keepAlive: true,
       // Enable SSL for cloud databases like Neon
-      ssl: process.env.DATABASE_URL?.includes('neon.tech') ? { rejectUnauthorized: false } : false
+      ssl: isNeon ? { rejectUnauthorized: false } : false
+    });
+
+    _pool.on('error', (err) => {
+      console.error('Unexpected error on idle PostgreSQL client', err);
     });
     
     _db = drizzle(_pool);
@@ -32,7 +43,7 @@ export const db = new Proxy({}, {
     return dbInstance[prop];
   }
 }) as any;
-export { users, agents, conversations, actors, rooms, roomMembers, relationships, policies, messages };
+export { users, agents, conversations, actors, rooms, roomMembers, relationships, policies, messages, roomReads };
 
 
 // Graceful shutdown helper to close the underlying PG pool
