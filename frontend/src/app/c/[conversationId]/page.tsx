@@ -126,7 +126,7 @@ export default function ConversationPage() {
             </button>
           </div>
         </header>
-        <div className="flex flex-1 flex-col h-full">
+        <div className="flex flex-1 flex-col h-full w-full px-6">
           <ChatInterface 
             currentConversation={currentConversation}
             onConversationChange={(id) => {

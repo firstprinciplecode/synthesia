@@ -46,7 +46,7 @@ export function MessagesPanel({
   }, []);
   const seenHeaderKeysRef = useRef<Set<string>>(new Set());
   return (
-    <div className="flex-1 flex flex-col min-h-0">
+    <div className="flex-1 flex flex-col min-h-0 text-sm">
       {allMessages.length === 0 ? (
         <div className="flex-1 flex items-center justify-center text-muted-foreground">
           <div className={"text-center transition-opacity duration-300 " + (hasMounted ? "opacity-100" : "opacity-0") }>

@@ -78,8 +78,13 @@ export function JsonMarkdownRenderer({ content, className }: JsonMarkdownRendere
       <hr {...props} className={`clear-both my-4 border-border/60 ${props.className || ''}`} />
     ),
     p: (props: any) => (
-      <p {...props} className={`${props.className || ''}`} />
+      <p {...props} className={`leading-relaxed mb-2 last:mb-0 ${props.className || ''}`} />
     ),
+    ul: (props: any) => <ul {...props} className={`list-disc pl-5 space-y-1 ${props.className || ''}`} />,
+    ol: (props: any) => <ol {...props} className={`list-decimal pl-5 space-y-1 ${props.className || ''}`} />,
+    li: (props: any) => <li {...props} className={`leading-relaxed ${props.className || ''}`} />,
+    strong: (props: any) => <strong {...props} className={`font-semibold ${props.className || ''}`} />,
+    em: (props: any) => <em {...props} className={`italic ${props.className || ''}`} />,
   } as any;
   // Function to detect and extract JSON blocks (fenced only)
   const processContent = (text: string) => {

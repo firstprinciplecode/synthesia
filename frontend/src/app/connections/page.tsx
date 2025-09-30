@@ -267,7 +267,7 @@ export default function ConnectionsPage() {
           </div>
         </header>
 
-        <div className="p-4 space-y-4">
+        <div className="mx-auto w-full max-w-4xl px-6 py-6 space-y-4">
           {status !== 'authenticated' ? (
             <div className="text-sm text-muted-foreground">You must be signed in to manage connections.</div>
           ) : (

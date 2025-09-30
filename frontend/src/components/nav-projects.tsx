@@ -43,8 +43,7 @@ export function NavProjects() {
   const [selectedUsers, setSelectedUsers] = useState<Set<string>>(new Set())
   const [selectedAgents, setSelectedAgents] = useState<Set<string>>(new Set())
   const [creating, setCreating] = useState(false)
-  const [addAgentOpen, setAddAgentOpen] = useState(false)
-  const [addUserOpen, setAddUserOpen] = useState(false)
+  const [addPmOpen, setAddPmOpen] = useState(false)
   const [allActors, setAllActors] = useState<any[]>([])
   const [loadingActors, setLoadingActors] = useState(false)
 
@@ -312,45 +311,86 @@ export function NavProjects() {
 
   return (
     <>
+      {/* Private Messages: combine agents and users */}
       <SidebarGroup className="group-data-[collapsible=icon]:hidden">
         <SidebarGroupLabel>
           <div className="flex items-center justify-between w-full">
-            <span>Agents</span>
+            <span>Private Messages</span>
             <button
               className="text-xs px-2 py-0.5 hover:bg-accent/30"
-              onClick={(e) => { e.preventDefault(); setAddAgentOpen(true); loadActorsForAdd() }}
-              aria-label="Add agent"
+              onClick={(e) => { e.preventDefault(); setAddPmOpen(true); loadActorsForAdd() }}
+              aria-label="Start private message"
             >
               +
             </button>
           </div>
         </SidebarGroupLabel>
         <SidebarMenu>
+          {/* Users (DMs) */}
+          {connections.map((connection) => {
+            const label = connection.displayName || connection.handle || connection.name || connection.id.slice(0, 8)
+            const avatarSrc = typeof connection.avatarUrl === 'string' ? connection.avatarUrl : connection.avatar
+            const lookupKeys = [connection.dmRoomId, connection.id, connection.handle, connection.email, connection.name, connection.displayName, (connection as any).ownerUserId].filter(Boolean) as string[]
+            const dmRoomId = (connection as any).dmRoomId || lookupKeys.map((key) => dmRoomsByConnectionId.get(String(key).trim())).find(Boolean)
+            const aliasSet = actorAliasesByConnectionId.get(connection.id)
+            const hasAliasUnread = aliasSet ? Array.from(aliasSet).some((aid) => dmByActor[aid] === true) : false
+            const anyPingMatches = Object.entries(dmByActor).some(([aid, flag]) => {
+              if (!flag) return false
+              const roomForAid = dmRoomsByConnectionId.get(String(aid).trim())
+              if (!roomForAid) return false
+              if (dmRoomId && roomForAid === dmRoomId) return true
+              const keys = [connection.dmRoomId, connection.id, connection.handle, connection.email, connection.displayName, connection.name, connection.ownerUserId].filter(Boolean).map((k) => String(k).trim())
+              for (const k of keys) { const kr = dmRoomsByConnectionId.get(k); if (kr && kr === roomForAid) return true }
+              return false
+            })
+            let hasUnread = (dmByActor[connection.id] === true) || hasAliasUnread || anyPingMatches || (dmRoomId ? (unreadByRoom[dmRoomId] ?? 0) > 0 : false)
+            if (!hasUnread) {
+              try {
+                for (const [rid, cnt] of Object.entries(unreadByRoom)) {
+                  if (!cnt || cnt <= 0) continue
+                  const room = rooms.find(r => r.id === rid)
+                  if (!room || (room as any)?.kind !== 'dm') continue
+                  const parts = Array.isArray((room as any)?.participants) ? (room as any).participants : []
+                  const match = parts.some((p: any) => {
+                    const ids = [p?.actorId, p?.actor?.id, p?.id, p?.userId, p?.handle, p?.email, p?.name].filter(Boolean).map((v: any) => String(v).trim())
+                    return ids.includes(String(connection.id).trim()) || (connection.handle && ids.includes(String(connection.handle).trim())) || (connection.email && ids.includes(String(connection.email).trim()))
+                  })
+                  if (match) { hasUnread = true; break }
+                }
+              } catch {}
+            }
+            const itemKey = `${connection.id}-${dmRoomId || 'no-room'}`
+            return (
+              <SidebarMenuItem key={`u-${itemKey}`}>
+                <SidebarMenuButton asChild className="justify-start">
+                  <a href="#" onClick={async (e) => { e.preventDefault(); try { const uid = (session as any)?.userId || (session as any)?.user?.email; const res = await fetch('/api/rooms/dm', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) }, body: JSON.stringify({ targetActorId: connection.id }) }); const json = await res.json(); const roomId = json?.roomId; if (roomId) window.location.href = `/c/${roomId}` } catch {} }}>
+                    <div className="relative flex items-center gap-2">
+                      <div className="relative">
+                        <Avatar className="h-5 w-5">
+                          <AvatarImage src={avatarSrc} />
+                          <AvatarFallback className="text-xs">{label?.[0]?.toUpperCase?.() || 'U'}</AvatarFallback>
+                        </Avatar>
+                        {hasUnread ? (<span className="pointer-events-none absolute -top-1 -right-1 h-2 w-2 rounded-full bg-rose-500" aria-hidden />) : null}
+                      </div>
+                      <span className={"truncate " + (hasUnread ? "font-semibold" : "")}>{label}</span>
+                    </div>
+                  </a>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            )
+          })}
+          {/* Agents (1:1 agent chat) */}
           {agents.map(a => (
-            <SidebarMenuItem key={a.id}>
+            <SidebarMenuItem key={`a-${a.id}`}>
               <SidebarMenuButton asChild>
                 <a href="#" onClick={async (e) => { e.preventDefault(); try { const uid = (session as any)?.userId || (session as any)?.user?.email; const res = await fetch('/api/rooms/agent', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) }, body: JSON.stringify({ agentId: a.id }) }); const json = await res.json(); const roomId = json?.roomId; if (roomId) window.location.href = `/c/${roomId}`; else window.location.href = `/c/${a.id}`; } catch { window.location.href = `/c/${a.id}`; } }}>
-                  <Avatar className="h-4 w-4">
+                  <Avatar className="h-5 w-5">
                     <AvatarImage src={a.avatar ? (a.avatar.startsWith('/') ? a.avatar : a.avatar) : undefined} />
                     <AvatarFallback className="text-xs">{a.name?.[0]?.toUpperCase() || 'A'}</AvatarFallback>
                   </Avatar>
                   <span>{a.name}</span>
                 </a>
               </SidebarMenuButton>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <SidebarMenuAction showOnHover>
-                    <MoreHorizontal />
-                    <span className="sr-only">More</span>
-                  </SidebarMenuAction>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent className="w-48 rounded-lg" side={isMobile ? "bottom" : "right"} align={isMobile ? "end" : "start"}>
-                  <DropdownMenuItem>
-                    <Bot className="text-muted-foreground" />
-                    <span>Chat with {a.name}</span>
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
             </SidebarMenuItem>
           ))}
         </SidebarMenu>
@@ -402,254 +442,111 @@ export function NavProjects() {
           </SidebarMenu>
       </SidebarGroup>
 
-      {connections.length > 0 && (
-        <SidebarGroup className="group-data-[collapsible=icon]:hidden">
-          <SidebarGroupLabel>
-            <div className="flex items-center justify-between w-full">
-              <span>Users</span>
-              <button
-              className="text-xs px-2 py-0.5 hover:bg-accent/30"
-                onClick={(e) => { e.preventDefault(); setAddUserOpen(true); loadActorsForAdd() }}
-                aria-label="Add user"
-              >
-                +
-              </button>
-            </div>
-          </SidebarGroupLabel>
-          <SidebarMenu>
-            {connections.map((connection) => {
-              const label = connection.displayName || connection.handle || connection.name || connection.id.slice(0, 8)
-              const avatarSrc = typeof connection.avatarUrl === 'string' ? connection.avatarUrl : connection.avatar
-              const lookupKeys = [
-                connection.dmRoomId,
-                connection.id,
-                connection.handle,
-                connection.email,
-                connection.name,
-                connection.displayName,
-                (connection as any).ownerUserId,
-              ].filter(Boolean) as string[]
-              const dmRoomId = (connection as any).dmRoomId || lookupKeys
-                .map((key) => dmRoomsByConnectionId.get(String(key).trim()))
-                .find(Boolean)
-              const aliasSet = actorAliasesByConnectionId.get(connection.id)
-              const hasAliasUnread = aliasSet ? Array.from(aliasSet).some((aid) => dmByActor[aid] === true) : false
-              // Extra robust check: if any dmUnread actor id maps to the same DM room as any of this connection's keys, treat as unread
-              const anyPingMatches = Object.entries(dmByActor).some(([aid, flag]) => {
-                if (!flag) return false
-                const roomForAid = dmRoomsByConnectionId.get(String(aid).trim())
-                if (!roomForAid) return false
-                // If this connection already resolved a dmRoomId, compare directly first
-                if (dmRoomId && roomForAid === dmRoomId) return true
-                const keys = [
-                  connection.dmRoomId,
-                  connection.id,
-                  connection.handle,
-                  connection.email,
-                  connection.displayName,
-                  connection.name,
-                  connection.ownerUserId,
-                ]
-                  .filter(Boolean)
-                  .map((k) => String(k).trim())
-                for (const k of keys) {
-                  const kr = dmRoomsByConnectionId.get(k)
-                  if (kr && kr === roomForAid) return true
-                }
-                return false
-              })
-              let hasUnread = (dmByActor[connection.id] === true) || hasAliasUnread || anyPingMatches || (dmRoomId ? (unreadByRoom[dmRoomId] ?? 0) > 0 : false)
-              if (!hasUnread) {
-                // Fallback: infer from unread rooms by checking room participants against this connection
-                try {
-                  for (const [rid, cnt] of Object.entries(unreadByRoom)) {
-                    if (!cnt || cnt <= 0) continue
-                    const room = rooms.find(r => r.id === rid)
-                    if (!room || (room as any)?.kind !== 'dm') continue
-                    const parts = Array.isArray((room as any)?.participants) ? (room as any).participants : []
-                    const match = parts.some((p: any) => {
-                      const ids = [p?.actorId, p?.actor?.id, p?.id, p?.userId, p?.handle, p?.email, p?.name].filter(Boolean).map((v: any) => String(v).trim())
-                      return ids.includes(String(connection.id).trim()) || (connection.handle && ids.includes(String(connection.handle).trim())) || (connection.email && ids.includes(String(connection.email).trim()))
-                    })
-                    if (match) { hasUnread = true; break }
-                  }
-                } catch {}
-              }
-              // Dev aid: expose mapping for inspection
-              if (typeof window !== 'undefined') {
-                try {
-                  // @ts-ignore
-                  window.__dmMap = Object.assign({}, (window as any).__dmMap, { [connection.id]: dmRoomId })
-                } catch {}
-              }
-              const itemKey = `${connection.id}-${dmRoomId || 'no-room'}`
-
-              return (
-                <SidebarMenuItem key={itemKey}>
-                  <SidebarMenuButton asChild className="justify-start">
-                    <a
-                      href="#"
-                      onClick={async (e) => {
-                        e.preventDefault()
-                        try {
-                          const uid = (session as any)?.userId || (session as any)?.user?.email
-                          const res = await fetch('/api/rooms/dm', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) },
-                            body: JSON.stringify({ targetActorId: connection.id }),
-                          })
-                          const json = await res.json()
-                          const roomId = json?.roomId
-                          if (roomId) window.location.href = `/c/${roomId}`
-                        } catch {}
-                      }}
-                    >
-                      <div className="relative flex items-center gap-2">
-                        <div className="relative">
-                          <Avatar className="h-4 w-4">
-                            <AvatarImage src={avatarSrc} />
-                            <AvatarFallback className="text-xs">{label?.[0]?.toUpperCase?.() || 'U'}</AvatarFallback>
-                          </Avatar>
-                          {hasUnread ? (
-                            <span className="pointer-events-none absolute -top-1 -right-1 h-2 w-2 rounded-full bg-rose-500" aria-hidden />
-                          ) : null}
-                        </div>
-                        <span className={"truncate " + (hasUnread ? "font-semibold" : "")}>{label}</span>
-                        {/* Removed trailing red dot; keep only avatar corner dot and bold label */}
-                      </div>
-                    </a>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              )
-            })}
-          </SidebarMenu>
-        </SidebarGroup>
-      )}
+      {/* Users section removed: covered by Private Messages */}
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Create a room</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-3">
-            <input
-              className="w-full border rounded px-2 py-1 text-sm bg-background"
-              placeholder="Room title (optional)"
-              value={createTitle}
-              onChange={(e) => setCreateTitle(e.target.value)}
-            />
-            <div>
-              <div className="text-xs font-medium mb-1">Users</div>
-              <div className="max-h-40 overflow-auto space-y-1 border rounded p-2">
-                {connections.map((c: any) => (
-                  <label key={c.id} className="flex items-center gap-2 text-sm">
-                    <Checkbox checked={selectedUsers.has(c.id)} onCheckedChange={(v) => {
-                      const s = new Set(selectedUsers); if (v) s.add(c.id); else s.delete(c.id); setSelectedUsers(s);
-                    }} />
-                    <span>{c.displayName || c.handle || c.id.slice(0,8)}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-            <div>
-              <div className="text-xs font-medium mb-1">Agents</div>
-              <div className="max-h-40 overflow-auto space-y-1 border rounded p-2">
-                {agents.map((a: any) => (
-                  <label key={a.id} className="flex items-center gap-2 text-sm">
-                    <Checkbox checked={selectedAgents.has(a.id)} onCheckedChange={(v) => {
-                      const s = new Set(selectedAgents); if (v) s.add(a.id); else s.delete(a.id); setSelectedAgents(s);
-                    }} />
-                    <span>{a.name}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          </div>
-          <DialogFooter>
-            <button
-              disabled={creating}
-              className="text-xs border rounded px-3 py-1"
-              onClick={async () => {
-                try {
-                  setCreating(true);
-                  const uid = (session as any)?.userId || (session as any)?.user?.email;
-                  const headers = { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) } as any;
-                  const participants: string[] = Array.from(selectedUsers);
-                  const agentIds: string[] = Array.from(selectedAgents);
-                  const res = await fetch('/api/rooms', {
-                    method: 'POST', headers, body: JSON.stringify({ kind: 'group', title: createTitle || null, participants, agentIds })
-                  });
-                  const json = await res.json();
-                  setCreating(false);
-                  if (res.ok && json?.id) {
-                    setCreateOpen(false); setCreateTitle(''); setSelectedUsers(new Set()); setSelectedAgents(new Set());
-                    await loadData();
-                    window.location.href = `/c/${json.id}`;
-                  }
-                } catch { setCreating(false); }
-              }}
-            >Create</button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* Add Users dialog */}
-      <Dialog open={addUserOpen} onOpenChange={setAddUserOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Add users</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-2">
-            {loadingActors && <div className="text-xs text-muted-foreground">Loading…</div>}
-            {!loadingActors && (
-              <div className="max-h-64 overflow-auto space-y-1">
-                {allActors.filter(a => a.type === 'user').map(a => (
-                  <div key={a.id} className="flex items-center justify-between border rounded px-2 py-1 text-sm">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <Avatar className="h-5 w-5">
-                        <AvatarImage src={typeof a.avatarUrl === 'string' ? a.avatarUrl : undefined} />
-                        <AvatarFallback className="text-[10px]">{(a.displayName || a.handle || 'U').slice(0,1).toUpperCase()}</AvatarFallback>
-                      </Avatar>
-                      <div className="truncate">{a.displayName || a.handle || a.id.slice(0,8)}</div>
-                    </div>
-                    <button className="text-xs border rounded px-2 py-0.5" onClick={async () => { await connectToUser(a.id); setAddUserOpen(false); }}>Connect</button>
+        <DialogContent className="sm:max-w-none w-screen h-screen p-0 bg-transparent">
+          <div className="w-full h-full flex items-center justify-center p-6">
+            <div className="w-full max-w-md bg-background border rounded-lg p-4 shadow-lg">
+              <DialogHeader>
+                <DialogTitle>Create a room</DialogTitle>
+              </DialogHeader>
+              <div className="space-y-3">
+                <input
+                  className="w-full border rounded px-2 py-1 text-sm bg-background"
+                  placeholder="Room title (optional)"
+                  value={createTitle}
+                  onChange={(e) => setCreateTitle(e.target.value)}
+                />
+                <div>
+                  <div className="text-xs font-medium mb-1">Users</div>
+                  <div className="max-h-40 overflow-auto space-y-1 border rounded p-2">
+                    {connections.map((c: any) => (
+                      <label key={c.id} className="flex items-center gap-2 text-sm">
+                        <Checkbox checked={selectedUsers.has(c.id)} onCheckedChange={(v) => {
+                          const s = new Set(selectedUsers); if (v) s.add(c.id); else s.delete(c.id); setSelectedUsers(s);
+                        }} />
+                        <span>{c.displayName || c.handle || c.id.slice(0,8)}</span>
+                      </label>
+                    ))}
                   </div>
-                ))}
+                </div>
+                <div>
+                  <div className="text-xs font-medium mb-1">Agents</div>
+                  <div className="max-h-40 overflow-auto space-y-1 border rounded p-2">
+                    {agents.map((a: any) => (
+                      <label key={a.id} className="flex items-center gap-2 text-sm">
+                        <Checkbox checked={selectedAgents.has(a.id)} onCheckedChange={(v) => {
+                          const s = new Set(selectedAgents); if (v) s.add(a.id); else s.delete(a.id); setSelectedAgents(s);
+                        }} />
+                        <span>{a.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
               </div>
-            )}
+              <DialogFooter>
+                <button
+                  disabled={creating}
+                  className="text-xs border rounded px-3 py-1"
+                  onClick={async () => {
+                    try {
+                      setCreating(true);
+                      const uid = (session as any)?.userId || (session as any)?.user?.email;
+                      const headers = { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) } as any;
+                      const participants: string[] = Array.from(selectedUsers);
+                      const agentIds: string[] = Array.from(selectedAgents);
+                      const res = await fetch('/api/rooms', {
+                        method: 'POST', headers, body: JSON.stringify({ kind: 'group', title: createTitle || null, participants, agentIds })
+                      });
+                      const json = await res.json();
+                      setCreating(false);
+                      if (res.ok && json?.id) {
+                        setCreateOpen(false); setCreateTitle(''); setSelectedUsers(new Set()); setSelectedAgents(new Set());
+                        await loadData();
+                        window.location.href = `/c/${json.id}`;
+                      }
+                    } catch { setCreating(false); }
+                  }}
+                >Create</button>
+              </DialogFooter>
+            </div>
           </div>
         </DialogContent>
       </Dialog>
 
-      {/* Add Agents dialog */}
-      <Dialog open={addAgentOpen} onOpenChange={setAddAgentOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Add agents</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-2">
-            {loadingActors && <div className="text-xs text-muted-foreground">Loading…</div>}
-            {!loadingActors && (
-              <div className="max-h-64 overflow-auto space-y-1">
-                {allActors.filter(a => a.type === 'agent').map(a => {
-                  const fallback = (a.displayName || a.handle || 'A').slice(0,1).toUpperCase();
-                  const avatarSrc = typeof a.avatarUrl === 'string' ? a.avatarUrl : undefined;
-                  const name = a.displayName || a.handle || a.id.slice(0,8);
-                  return (
-                    <div key={a.id} className="flex items-center justify-between border rounded px-2 py-1 text-sm">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <Avatar className="h-5 w-5">
-                          <AvatarImage src={avatarSrc} />
-                          <AvatarFallback className="text-[10px]">{fallback}</AvatarFallback>
-                        </Avatar>
-                        <div className="truncate">{name}</div>
+      {/* Add Private Message dialog (users + agents) */}
+      <Dialog open={addPmOpen} onOpenChange={setAddPmOpen}>
+        <DialogContent className="sm:max-w-none w-screen h-screen p-0 bg-transparent">
+          <div className="w-full h-full flex items-center justify-center p-6">
+            <div className="w-full max-w-md bg-background border rounded-lg p-4 shadow-lg">
+              <DialogHeader>
+                <DialogTitle>Start a private message</DialogTitle>
+              </DialogHeader>
+              <div className="space-y-2">
+                {loadingActors && <div className="text-xs text-muted-foreground">Loading…</div>}
+                {!loadingActors && (
+                  <div className="max-h-64 overflow-auto space-y-1">
+                    {[...allActors.filter(a => a.type === 'user'), ...allActors.filter(a => a.type === 'agent')].map(a => (
+                      <div key={a.id} className="flex items-center justify-between border rounded px-2 py-1 text-sm">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Avatar className="h-5 w-5">
+                            <AvatarImage src={typeof a.avatarUrl === 'string' ? a.avatarUrl : undefined} />
+                            <AvatarFallback className="text-[10px]">{(a.displayName || a.handle || (a.type === 'agent' ? 'A' : 'U')).slice(0,1).toUpperCase()}</AvatarFallback>
+                          </Avatar>
+                          <div className="truncate">{a.displayName || a.handle || a.id.slice(0,8)}</div>
+                        </div>
+                        {a.type === 'user' ? (
+                          <button className="text-xs border rounded px-2 py-0.5" onClick={async () => { await connectToUser(a.id); setAddPmOpen(false); }}>Message</button>
+                        ) : (
+                          <button className="text-xs border rounded px-2 py-0.5" onClick={async () => { await requestAgentAccess(a); setAddPmOpen(false); }}>Message</button>
+                        )}
                       </div>
-                      <button className="text-xs border rounded px-2 py-0.5" onClick={async () => { await requestAgentAccess(a); setAddAgentOpen(false); }}>Request access</button>
-                    </div>
-                  );
-                })}
+                    ))}
+                  </div>
+                )}
               </div>
-            )}
+            </div>
           </div>
         </DialogContent>
       </Dialog>

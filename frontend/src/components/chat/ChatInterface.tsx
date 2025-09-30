@@ -1509,6 +1509,15 @@ export function ChatInterface({
   useEffect(() => {
     if (!wsRef.current?.isConnected() || !currentUserId) return;
     if (!allMessages.length) return;
+    // Persist read on the server so unread does not reappear after reload/restart
+    try {
+      const last = allMessages[allMessages.length - 1];
+      if (last && last.id) {
+        const actor = currentActorId || currentUserId;
+        // Best-effort server-side read marker; UI receipts remain disabled
+        (wsRef.current as any)?.markRead?.(currentRoom, String(last.id), String(actor));
+      }
+    } catch {}
     // Clear room-level unread
     useUnreadStore.getState().clearUnread(currentRoom);
     // Also clear DM pings for any user participants in this room (DMs)

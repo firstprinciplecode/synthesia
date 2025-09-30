@@ -14,6 +14,77 @@ import { useSearchParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+// Preprocess markdown to clean up mixed list formats
+function preprocessMarkdown(text: string): string {
+  // First, handle the specific case of malformed nested lists
+  // This fixes cases where agents generate "1. - Item" or similar patterns
+  text = text.replace(/^\d+\.\s*[-*+]\s+/gm, (match) => {
+    // Extract the number and convert to just the number
+    const num = match.match(/^(\d+)\./)?.[1];
+    return num ? `${num}. ` : match;
+  });
+  
+  // Handle cases where there are mixed list markers on the same line
+  text = text.replace(/^[-*+]\s*\d+\.\s+/gm, (match) => {
+    // Extract the number and convert to just the number
+    const num = match.match(/(\d+)\./)?.[1];
+    return num ? `${num}. ` : match;
+  });
+  
+  // Split into lines for processing
+  const lines = text.split('\n');
+  const processedLines: string[] = [];
+  let inList = false;
+  let listType: 'ul' | 'ol' | null = null;
+  let listCounter = 1;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    
+    // Check if this is a list item
+    const isBullet = /^[-*+]\s+/.test(trimmed);
+    const isNumbered = /^\d+\.\s+/.test(trimmed);
+    
+    if (isBullet || isNumbered) {
+      // If we're starting a new list or switching list types
+      if (!inList || (isBullet && listType === 'ol') || (isNumbered && listType === 'ul')) {
+        // Close previous list if needed
+        if (inList && processedLines.length > 0) {
+          processedLines.push('');
+        }
+        inList = true;
+        listType = isBullet ? 'ul' : 'ol';
+        listCounter = 1;
+      }
+      
+      // Normalize list items
+      if (isBullet) {
+        processedLines.push(line.replace(/^[-*+]\s+/, '- '));
+      } else {
+        // For numbered lists, ensure consistent numbering
+        const content = line.replace(/^\d+\.\s+/, '');
+        processedLines.push(`${listCounter}. ${content}`);
+        listCounter++;
+      }
+    } else {
+      // Not a list item
+      if (inList) {
+        // Add spacing after list
+        if (trimmed !== '') {
+          processedLines.push('');
+        }
+        inList = false;
+        listType = null;
+        listCounter = 1;
+      }
+      processedLines.push(line);
+    }
+  }
+  
+  return processedLines.join('\n');
+}
+
 type FeedPost = {
   id: string;
   authorType: "user" | "agent";
@@ -33,6 +104,9 @@ function FeedContent() {
   const [posting, setPosting] = useState(false);
   const [text, setText] = useState("");
   const [posts, setPosts] = useState<FeedPost[]>([]);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [page, setPage] = useState(0);
   // Track which post is open; reserved for future inline reply UX
   // const [openPostId, setOpenPostId] = useState<string | null>(null);
   type Reply = { id: string; postId: string; authorType: 'user' | 'agent'; authorId: string; authorName?: string; authorAvatar?: string; text: string; createdAt: string };
@@ -46,19 +120,42 @@ function FeedContent() {
   const diagEnabled = (search?.get('diag') === '1' || search?.get('diagnostics') === '1');
   const [typingByPost, setTypingByPost] = useState<Record<string, { name: string }>>({});
   const [stopLoading, setStopLoading] = useState<Record<string, boolean>>({});
+  const [followableByKey, setFollowableByKey] = useState<Record<string, boolean>>({}); // key: `${postId}:${agentId}`
+  const [feedMode, setFeedMode] = useState<'all' | 'following'>('all');
   // const [selectedFile, setSelectedFile] = useState<File | null>(null);
 
-  const fetchFeed = useCallback(async () => {
-    abortRef.current?.abort();
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
-    setLoading(true);
+  const fetchFeed = useCallback(async (pageNum: number = 0, append: boolean = false) => {
+    if (append) {
+      setLoadingMore(true);
+    } else {
+      abortRef.current?.abort();
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      setLoading(true);
+    }
+    
     try {
-      const res = await fetch("/api/feed?limit=30", { signal: ctrl.signal });
+      const modeParam = feedMode === 'following' ? '&mode=following' : '';
+      const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+      const headers: Record<string, string> = {};
+      if (uid) headers['x-user-id'] = uid;
+      
+      const res = await fetch(`/api/feed?limit=20&offset=${pageNum * 20}${modeParam}`, { 
+        signal: append ? undefined : abortRef.current?.signal,
+        headers
+      });
       if (!res.ok) throw new Error("failed");
       const data = await res.json();
       const list: FeedPost[] = Array.isArray(data?.posts) ? data.posts : [];
-      setPosts(list);
+      
+      if (append) {
+        setPosts(prev => [...prev, ...list]);
+      } else {
+        setPosts(list);
+      }
+      
+      // Check if we have more posts to load
+      setHasMore(list.length === 20);
       // Preload replies for posts that already have replies
       for (const p of list) {
         if ((p.replyCount || 0) > 0 && !repliesByPost[p.id]) {
@@ -70,10 +167,65 @@ function FeedContent() {
             }
           } catch {}
         }
+        // Preload follow status for top-level agent authors
+        try {
+          if (p.authorType === 'agent' && p.authorId) {
+            const mres = await fetch(`/api/monitors?postId=${encodeURIComponent(p.id)}&agentId=${encodeURIComponent(p.authorId)}`);
+            if (mres.ok) {
+              const mj = await mres.json();
+              const active = Array.isArray(mj?.monitors) && mj.monitors.length > 0;
+              setFollowableByKey((s) => ({ ...s, [`${p.id}:${p.authorId}`]: !active }));
+            }
+          }
+        } catch {}
       }
     } catch {}
-    setLoading(false);
-  }, [repliesByPost]);
+    if (append) {
+      setLoadingMore(false);
+    } else {
+      setLoading(false);
+    }
+  }, [repliesByPost, feedMode]);
+
+  const loadMore = useCallback(async () => {
+    if (loadingMore || !hasMore) return;
+    const nextPage = page + 1;
+    setPage(nextPage);
+    await fetchFeed(nextPage, true);
+  }, [page, loadingMore, hasMore, fetchFeed]);
+
+  // Intersection observer for infinite scroll
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (observerRef.current) observerRef.current.disconnect();
+    
+    observerRef.current = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasMore && !loadingMore) {
+          loadMore();
+        }
+      },
+      { threshold: 0.1 }
+    );
+
+    if (loadMoreRef.current) {
+      observerRef.current.observe(loadMoreRef.current);
+    }
+
+    return () => {
+      if (observerRef.current) observerRef.current.disconnect();
+    };
+  }, [hasMore, loadingMore, loadMore]);
+
+  // Refetch feed when mode changes
+  useEffect(() => {
+    setPage(0);
+    setPosts([]);
+    setHasMore(true);
+    fetchFeed(0, false);
+  }, [feedMode]);
 
   useEffect(() => {
     fetchFeed();
@@ -138,6 +290,36 @@ function FeedContent() {
     const id = setInterval(fetchFeed, 20000);
     return () => { clearInterval(id); abortRef.current?.abort(); try { ws?.close(); } catch {} };
   }, [search, fetchFeed]);
+
+  // Prefetch follow status for top-level agent authors and agent replies
+  useEffect(() => {
+    (async () => {
+      const missing: Array<{ postId: string; agentId: string }> = [];
+      try {
+        for (const p of posts) {
+          if (p.authorType === 'agent' && p.authorId && followableByKey[`${p.id}:${p.authorId}`] === undefined) {
+            missing.push({ postId: p.id, agentId: p.authorId });
+          }
+          const reps = repliesByPost[p.id] || [];
+          for (const r of reps) {
+            if (r.authorType === 'agent' && r.authorId && followableByKey[`${p.id}:${r.authorId}`] === undefined) {
+              missing.push({ postId: p.id, agentId: r.authorId });
+            }
+          }
+        }
+      } catch {}
+      for (const item of missing) {
+        try {
+          const resp = await fetch(`/api/monitors?postId=${encodeURIComponent(item.postId)}&agentId=${encodeURIComponent(item.agentId)}`);
+          if (resp.ok) {
+            const mj = await resp.json();
+            const active = Array.isArray(mj?.monitors) && mj.monitors.length > 0;
+            setFollowableByKey((s) => ({ ...s, [`${item.postId}:${item.agentId}`]: !active }));
+          }
+        } catch {}
+      }
+    })();
+  }, [posts, repliesByPost]);
 
   // Load current user profile for composer avatar/name
   useEffect(() => {
@@ -239,14 +421,36 @@ function FeedContent() {
     <SidebarProvider>
       <AppSidebar />
       <SidebarInset>
-        <header className="flex h-16 shrink-0 items-center gap-2 transition-[width,height] ease-linear group-has-data-[collapsible=icon]/sidebar-wrapper:h-12">
-          <div className="flex items-center gap-2 px-4">
+        <header className="flex h-16 shrink-0 items-center justify-center gap-2 transition-[width,height] ease-linear group-has-data-[collapsible=icon]/sidebar-wrapper:h-12">
+          <div className="absolute left-4">
             <SidebarTrigger className="-ml-1" />
-            <h1 className="text-sm font-medium">Feed</h1>
+          </div>
+          <div className="flex items-center bg-muted rounded-full p-0.5">
+            <button
+              onClick={() => setFeedMode('all')}
+              className={`px-3 py-1 text-xs font-medium rounded-full transition-colors ${
+                feedMode === 'all'
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              Everyone
+            </button>
+            <button
+              onClick={() => setFeedMode('following')}
+              className={`px-3 py-1 text-xs font-medium rounded-full transition-colors ${
+                feedMode === 'following'
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              Following
+            </button>
           </div>
         </header>
 
-        <div className="mx-auto w-full max-w-4xl px-6 py-6 space-y-4">
+        <div className="mx-auto w-full max-w-4xl px-6 pt-2 pb-6 space-y-4">
+
           <Card className="p-4 w-full border-0 !shadow-none">
             <div className="space-y-3">
               <div className="flex items-center gap-3">
@@ -322,12 +526,12 @@ function FeedContent() {
                 )}
               </div>
               <div className="flex-1">
-                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <div className="flex items-center gap-1 text-sm">
                   <span>{p.authorName || (p.authorType === 'agent' ? 'Agent' : 'User')}</span>
                   <Separator orientation="vertical" className="h-3" />
-                  <span>{new Date(p.createdAt).toLocaleString()}</span>
+                  <span className="text-xs text-muted-foreground">{new Date(p.createdAt).toLocaleString()}</span>
                 </div>
-                <div className="mt-1 text-base break-words">
+                <div className="mt-0 text-sm break-words">
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={{
@@ -337,15 +541,65 @@ function FeedContent() {
                       img: (props) => (
                         <img {...props} alt={props.alt || ''} className="max-w-full rounded-md my-2" />
                       ),
-                      ul: (props) => <ul {...props} className="list-disc pl-5" />, 
-                      ol: (props) => <ol {...props} className="list-decimal pl-5" />
+                      ul: (props) => <ul {...props} className="list-disc pl-5 space-y-1" />, 
+                      ol: (props) => <ol {...props} className="list-decimal pl-5 space-y-1" />,
+                      li: (props) => <li {...props} className="leading-relaxed" />,
+                      p: (props) => <p {...props} className="leading-relaxed mb-2 last:mb-0" />,
+                      strong: (props) => <strong {...props} className="font-semibold" />,
+                      em: (props) => <em {...props} className="italic" />
                     }}
                   >
-                    {p.text}
+                    {preprocessMarkdown(p.text)}
                   </ReactMarkdown>
                 </div>
                 {(repliesByPost[p.id]?.length || 0) > 0 ? (
-                  <div className="mt-3 space-y-2">
+                  <div className="mt-1 space-y-1">
+                    {/* Top-level actions: Only show Connect/Follow/Stop if the POST itself is from an agent (not for user posts with agent replies) */}
+                    <div className="mt-1 mb-4 flex items-center gap-3 text-xs whitespace-nowrap">
+                      <button className="text-muted-foreground hover:underline" onClick={() => setReplyComposerOpen((m) => ({ ...m, [p.id]: true }))}>Reply</button>
+                      {p.authorType === 'agent' && p.authorId ? (
+                        <>
+                          <button
+                            className="text-muted-foreground hover:underline"
+                            onClick={async () => {
+                              try {
+                                const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+                                const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+                                if (uid) headers['x-user-id'] = uid as string;
+                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: p.authorId, toActorId: p.authorId }) });
+                              } catch {}
+                            }}
+                          >
+                            Connect
+                          </button>
+                          {followableByKey[`${p.id}:${p.authorId}`] ? (
+                            <button
+                              className="text-muted-foreground hover:underline"
+                              onClick={async () => {
+                                try {
+                                  await fetch('/api/monitors/create-for-post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: p.authorId }) });
+                                  setFollowableByKey((s) => ({ ...s, [`${p.id}:${p.authorId}`]: false }));
+                                } catch {}
+                              }}
+                            >
+                              Follow
+                            </button>
+                          ) : (
+                            <button
+                              className="text-muted-foreground hover:underline"
+                              onClick={async () => {
+                                try {
+                                  await fetch('/api/monitors/disable-by-post-and-agent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: p.authorId }) });
+                                  setFollowableByKey((s) => ({ ...s, [`${p.id}:${p.authorId}`]: true }));
+                                } catch {}
+                              }}
+                            >
+                              Stop
+                            </button>
+                          )}
+                        </>
+                      ) : null}
+                    </div>
                     {(repliesByPost[p.id] || []).map((r: Reply) => (
                       <div key={r.id} className="flex items-start gap-2 text-base">
                         <Avatar className="h-6 w-6">
@@ -353,8 +607,8 @@ function FeedContent() {
                           <AvatarFallback>{(r.authorName?.[0] || (r.authorType === 'agent' ? 'A' : 'U')).toUpperCase?.() || 'U'}</AvatarFallback>
                         </Avatar>
                         <div className="flex-1">
-                          <div className="text-[11px] text-muted-foreground">{r.authorName ? `${r.authorName} • ` : ''}{new Date(r.createdAt).toLocaleString()}</div>
-                          <div className="text-base break-words">
+                          <div className="text-sm">{r.authorName ? `${r.authorName} • ` : ''}<span className="text-xs text-muted-foreground">{new Date(r.createdAt).toLocaleString()}</span></div>
+                          <div className="text-sm break-words">
                             <ReactMarkdown
                               remarkPlugins={[remarkGfm]}
                               components={{
@@ -364,12 +618,61 @@ function FeedContent() {
                                 img: (props) => (
                                   <img {...props} alt={props.alt || ''} className="max-w-full rounded-md my-2" />
                                 ),
-                                ul: (props) => <ul {...props} className="list-disc pl-5" />, 
-                                ol: (props) => <ol {...props} className="list-decimal pl-5" />
+                                ul: (props) => <ul {...props} className="list-disc pl-5 space-y-1" />, 
+                                ol: (props) => <ol {...props} className="list-decimal pl-5 space-y-1" />,
+                                li: (props) => <li {...props} className="leading-relaxed" />,
+                                p: (props) => <p {...props} className="leading-relaxed mb-2 last:mb-0" />,
+                                strong: (props) => <strong {...props} className="font-semibold" />,
+                                em: (props) => <em {...props} className="italic" />
                               }}
                             >
-                              {r.text}
+                              {preprocessMarkdown(r.text)}
                             </ReactMarkdown>
+                          </div>
+                          <div className="mt-0.5 mb-1.5 flex items-center gap-3 text-xs whitespace-nowrap">
+                            <button className="text-muted-foreground hover:underline" onClick={() => setReplyComposerOpen((m) => ({ ...m, [p.id]: true }))}>Reply</button>
+                            {r.authorType === 'agent' ? (
+                              <button
+                                className="text-muted-foreground hover:underline"
+                                onClick={async () => {
+                                  try {
+                                    const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+                                    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+                                    if (uid) headers['x-user-id'] = uid as string;
+                                    await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: r.authorId, toActorId: r.authorId }) });
+                                  } catch {}
+                                }}
+                              >
+                                Connect
+                              </button>
+                            ) : null}
+                            {r.authorType === 'agent' && r.authorId ? (
+                              followableByKey[`${p.id}:${r.authorId}`] ? (
+                                <button
+                                  className="text-muted-foreground hover:underline"
+                                  onClick={async () => {
+                                    try {
+                                      await fetch('/api/monitors/create-for-post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: r.authorId }) });
+                                      setFollowableByKey((s) => ({ ...s, [`${p.id}:${r.authorId}`]: false }));
+                                    } catch {}
+                                  }}
+                                >
+                                  Follow
+                                </button>
+                              ) : (
+                                <button
+                                  className="text-muted-foreground hover:underline"
+                                  onClick={async () => {
+                                    try {
+                                      await fetch('/api/monitors/disable-by-post-and-agent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: r.authorId }) });
+                                      setFollowableByKey((s) => ({ ...s, [`${p.id}:${r.authorId}`]: true }));
+                                    } catch {}
+                                  }}
+                                >
+                                  Stop
+                                </button>
+                              )
+                            ) : null}
                           </div>
                         </div>
                       </div>
@@ -393,24 +696,7 @@ function FeedContent() {
                           </div>
                         </div>
                       </div>
-                    ) : (
-                      <div className="mt-2">
-                        <div className="flex items-center gap-2">
-                          <Button variant="ghost" size="sm" onClick={() => setReplyComposerOpen((m) => ({ ...m, [p.id]: true }))}>Reply</Button>
-                          {p.monitoringActive && (
-                            <Button 
-                              variant="ghost" 
-                              size="sm" 
-                              className="text-xs text-muted-foreground hover:text-destructive" 
-                              disabled={!!stopLoading[p.id]} 
-                              onClick={() => stopMonitoring(p.id)}
-                            >
-                              {stopLoading[p.id] ? 'Stopping…' : 'Stop Monitoring'}
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-                    )}
+                    ) : null}
                   </div>
                 ) : (
                   <div className="mt-3">
@@ -434,19 +720,50 @@ function FeedContent() {
                         </div>
                       </div>
                     ) : (
-                      <div className="flex items-center gap-2">
-                        <Button variant="ghost" size="sm" onClick={() => setReplyComposerOpen((m) => ({ ...m, [p.id]: true }))}>Reply</Button>
-                        {p.monitoringActive && (
-                          <Button 
-                            variant="ghost" 
-                            size="sm" 
-                            className="text-xs text-muted-foreground hover:text-destructive" 
-                            disabled={!!stopLoading[p.id]} 
-                            onClick={() => stopMonitoring(p.id)}
+                      <div className="flex items-center gap-3 text-xs whitespace-nowrap">
+                        <button className="text-muted-foreground hover:underline" onClick={() => setReplyComposerOpen((m) => ({ ...m, [p.id]: true }))}>Reply</button>
+                        {p.authorType === 'agent' ? (
+                          <button
+                            className="text-muted-foreground hover:underline"
+                            onClick={async () => {
+                              try {
+                                const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+                                const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+                                if (uid) headers['x-user-id'] = uid as string;
+                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: p.authorId, toActorId: p.authorId }) });
+                              } catch {}
+                            }}
                           >
-                            {stopLoading[p.id] ? 'Stopping…' : 'Stop Monitoring'}
-                          </Button>
-                        )}
+                            Connect
+                          </button>
+                        ) : null}
+                        {p.authorType === 'agent' && p.authorId ? (
+                          followableByKey[`${p.id}:${p.authorId}`] ? (
+                            <button
+                              className="text-muted-foreground hover:underline"
+                              onClick={async () => {
+                                try {
+                                  await fetch('/api/monitors/create-for-post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: p.authorId }) });
+                                  setFollowableByKey((s) => ({ ...s, [`${p.id}:${p.authorId}`]: false }));
+                                } catch {}
+                              }}
+                            >
+                              Follow
+                            </button>
+                          ) : (
+                            <button
+                              className="text-muted-foreground hover:underline"
+                              onClick={async () => {
+                                try {
+                                  await fetch('/api/monitors/disable-by-post-and-agent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: p.authorId }) });
+                                  setFollowableByKey((s) => ({ ...s, [`${p.id}:${p.authorId}`]: true }));
+                                } catch {}
+                              }}
+                            >
+                              Stop
+                            </button>
+                          )
+                        ) : null}
                       </div>
                     )}
                   </div>
@@ -455,6 +772,23 @@ function FeedContent() {
             </div>
           </Card>
         ))}
+        
+        {/* Infinite scroll trigger and loading indicator */}
+        {hasMore && (
+          <div ref={loadMoreRef} className="flex justify-center py-4">
+            {loadingMore ? (
+              <div className="text-sm text-muted-foreground">Loading more posts...</div>
+            ) : (
+              <div className="text-sm text-muted-foreground">Scroll down for more</div>
+            )}
+          </div>
+        )}
+        
+        {!hasMore && posts.length > 0 && (
+          <div className="flex justify-center py-4">
+            <div className="text-sm text-muted-foreground">No more posts to load</div>
+          </div>
+        )}
       </div>
         </div>
       </SidebarInset>

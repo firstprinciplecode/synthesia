@@ -106,7 +106,7 @@ export default function AgentNewPage() {
           </div>
         </header>
 
-        <div className="p-4 space-y-4 max-w-3xl">
+        <div className="mx-auto w-full max-w-3xl px-6 py-6 space-y-4">
           {status !== 'authenticated' && (
             <div className="text-sm text-muted-foreground">Please sign in to create agents.</div>
           )}

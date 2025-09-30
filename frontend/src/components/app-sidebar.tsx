@@ -11,7 +11,7 @@ import {
   Map,
   PieChart,
   Settings2,
-  SquareTerminal,
+  Mail,
 } from "lucide-react"
 import Image from "next/image"
 
@@ -71,17 +71,7 @@ const data = {
       icon: BookOpen,
       isActive: true
     },
-    {
-      title: "Inbox",
-      url: "/inbox",
-      icon: SquareTerminal,
-      isActive: false,
-      items: [
-        { title: "All Messages", url: "/inbox" },
-        { title: "Unread", url: "/inbox" },
-        { title: "Starred", url: "/inbox" },
-      ],
-    },
+    { title: "Inbox", url: "/inbox", icon: Mail, isActive: false },
     {
       title: "Agent Studio",
       url: "/agents",
@@ -91,14 +81,7 @@ const data = {
         { title: "Connections", url: "/connections" },
       ],
     },
-    {
-      title: "Integrations",
-      url: "/integrations",
-      icon: Settings2,
-      items: [
-        { title: "Tools & APIs", url: "/integrations" },
-      ],
-    },
+    // Integrations moved to user popup menu
   ],
   projects: [
     {
@@ -167,19 +150,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         <TeamSwitcher teams={data.teams} />
       </SidebarHeader>
       <SidebarContent>
-        <NavMain
-          items={data.navMain.map((item) =>
-            item.title === 'Inbox'
-              ? {
-                  ...item,
-                  badge:
-                    hasMounted.current && totalUnread > 0 ?
-                      (totalUnread > 99 ? '99+' : String(totalUnread))
-                      : undefined,
-                }
-              : item,
-          )}
-        />
+        <NavMain items={data.navMain} />
         {status === 'authenticated' ? <NavProjects /> : null}
       </SidebarContent>
       <SidebarFooter>

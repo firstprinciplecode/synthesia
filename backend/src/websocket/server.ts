@@ -63,6 +63,22 @@ export class WebSocketServer {
   private roomsRegistry: RoomRegistry;
   private orchestrator: AgentOrchestrator;
 
+  // Normalize assistant final text to avoid accidental duplication like "Hello!Hello!"
+  private normalizeFinalText(text: string): string {
+    try {
+      const s = String(text || '');
+      const t = s.trim();
+      if (!t) return s;
+      if (t.length % 2 === 0) {
+        const mid = t.length / 2;
+        const a = t.slice(0, mid);
+        const b = t.slice(mid);
+        if (a === b) return a;
+      }
+      return s;
+    } catch { return text; }
+  }
+
   constructor() {
     this.llmRouter = new LLMRouter();
     this.bus = new WebSocketBus(this.connections, this.rooms);
@@ -1066,6 +1082,9 @@ export class WebSocketServer {
         console.error('[handleMessageCreate] failed to persist message', error);
       }
 
+      // Generate a separate message id for the agent's streaming/final reply
+      const agentRunMessageId = randomUUID();
+
       try {
         const unread = await this.computeUnreadCounts(roomId);
         this.broadcastUnread(roomId, unread);
@@ -1450,7 +1469,7 @@ ${personaBlock}${memoryContext}`,
                 }
               }
             } catch {}
-            this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } } as MessageDeltaNotification);
+            this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId: agentRunMessageId, delta, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } } as MessageDeltaNotification);
           },
           getCatalog: () => this.toolRegistry.catalog(),
           getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
@@ -1521,7 +1540,7 @@ ${personaBlock}${memoryContext}`,
               }
             }
           } catch {}
-          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: responseText }] }, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } });
+          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId: agentRunMessageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: this.normalizeFinalText(responseText) }] }, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } });
         }
       } else {
         const { fullResponse } = await this.orchestrator.streamPrimaryAgentResponse({
@@ -1545,7 +1564,7 @@ ${personaBlock}${memoryContext}`,
                 }
               }
             } catch {}
-            this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId, delta, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } } as MessageDeltaNotification);
+            this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.delta', params: { roomId, messageId: agentRunMessageId, delta, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } } as MessageDeltaNotification);
           },
         });
         responseText = fullResponse;
@@ -1562,7 +1581,7 @@ ${personaBlock}${memoryContext}`,
               }
             }
           } catch {}
-          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] }, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } });
+          this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId: agentRunMessageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: this.normalizeFinalText(fullResponse) }] }, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } });
         }
       }
 
@@ -1570,12 +1589,12 @@ ${personaBlock}${memoryContext}`,
       try {
         if (responseText && typeof responseText === 'string') {
           await db.insert(DBSchema.messages as any).values({
-            id: messageId,
+            id: agentRunMessageId,
             conversationId: roomId,
             authorId: String(primaryAgentId || roomId),
             authorType: 'agent',
             role: 'assistant',
-            content: [{ type: 'text', text: responseText }] as any,
+            content: [{ type: 'text', text: this.normalizeFinalText(responseText) }] as any,
             status: 'completed',
             createdAt: new Date(),
             updatedAt: new Date(),
@@ -2714,7 +2733,7 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
             params: {
               runId,
               messageId: runMessageId,
-              finalMessage: { role: 'assistant', content: [{ type: 'text', text: fullResponse }] },
+              finalMessage: { role: 'assistant', content: [{ type: 'text', text: this.normalizeFinalText(fullResponse) }] },
               usage: chunk.usage,
               authorId: nextAgentId,
               authorType: 'agent',
@@ -2728,7 +2747,7 @@ Provide helpful responses using available tools. Be concise but thorough.${perso
               authorId: String(nextAgentId),
               authorType: 'agent',
               role: 'assistant',
-              content: [{ type: 'text', text: fullResponse }] as any,
+              content: [{ type: 'text', text: this.normalizeFinalText(fullResponse) }] as any,
               status: 'completed',
               createdAt: new Date(),
               updatedAt: new Date(),

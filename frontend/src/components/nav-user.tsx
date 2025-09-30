@@ -10,6 +10,7 @@ import {
   User,
   Moon,
   Sun,
+  Wrench,
 } from "lucide-react"
 
 import {
@@ -95,6 +96,12 @@ export function NavUser({
                     <Link href="/profile">
                       <User />
                       Profile
+                    </Link>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem asChild>
+                    <Link href="/integrations">
+                      <Wrench />
+                      Tools & Integrations
                     </Link>
                   </DropdownMenuItem>
                 </DropdownMenuGroup>

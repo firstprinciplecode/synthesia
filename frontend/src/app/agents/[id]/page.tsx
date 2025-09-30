@@ -163,7 +163,7 @@ export default function AgentDetailPage() {
           </div>
         </header>
 
-        <div className="p-4 space-y-4 max-w-3xl">
+        <div className="mx-auto w-full max-w-3xl px-6 py-6 space-y-4">
           {status !== 'authenticated' && (
             <div className="text-sm text-muted-foreground">Please sign in to edit agents.</div>
           )}
@@ -268,7 +268,7 @@ export default function AgentDetailPage() {
                         <Label>SerpAPI engine (max one)</Label>
                         <div className="grid grid-cols-2 gap-2 text-sm max-h-60 overflow-auto p-2 border rounded">
                           {[
-                            'google','google_events','google_finance','google_flights','google_hotels','google_images','google_local','patents','google_shopping','google_scholar','google_trends','google_videos',
+                            'google','google_events','google_finance','google_flights','google_hotels','google_images','google_local','google_news','patents','google_shopping','google_scholar','google_trends','google_videos',
                             'baidu','bing_images','bing','ebay','home_depot','tripadvisor','walmart','yelp','youtube'
                           ].map((key) => (
                             <label key={key} className="flex items-center gap-2">

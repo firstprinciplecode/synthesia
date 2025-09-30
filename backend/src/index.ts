@@ -22,6 +22,94 @@ import { pipeline } from 'stream';
 import { promisify } from 'util';
 import { xService } from './tools/x-service.js';
 
+// Parse user query into engine-specific query and parameters
+function parseQueryForEngine(text: string, engine: string): { parsedQuery: string; parsedParams: Record<string, any> } {
+  const cleanText = text.trim().replace(/[?!.,]+\s*$/, '');
+  const params: Record<string, any> = {};
+  let query = cleanText;
+
+  if (engine === 'yelp') {
+    // Extract location from patterns like "in Paris", "near NYC", "for New York"
+    const locationMatch = cleanText.match(/\s(?:in|near|for|around)\s+([A-Za-z0-9 ,.'\-]+)$/i);
+    if (locationMatch) {
+      params.find_loc = locationMatch[1].trim();
+      query = cleanText.slice(0, locationMatch.index).trim();
+    } else {
+      // Try to extract city from end of query (last capitalized words)
+      const cityMatch = cleanText.match(/([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)$/);
+      if (cityMatch) {
+        params.find_loc = cityMatch[1];
+        query = cleanText.replace(cityMatch[1], '').trim();
+      }
+    }
+    
+    // Extract business type/category from common terms
+    const businessTypes = {
+      'restaurant': 'restaurants',
+      'dining': 'restaurants', 
+      'food': 'restaurants',
+      'bistro': 'bistros',
+      'cafe': 'cafes',
+      'bar': 'bars',
+      'wine bar': 'wine bars',
+      'pub': 'pubs',
+      'eatery': 'restaurants',
+      'diner': 'diners'
+    };
+    
+    for (const [term, category] of Object.entries(businessTypes)) {
+      if (query.toLowerCase().includes(term)) {
+        query = query.replace(new RegExp(`\\b${term}\\b`, 'gi'), category);
+        break;
+      }
+    }
+    
+    // Extract quality indicators
+    if (/\b(good|great|best|excellent|amazing|fantastic|outstanding)\b/i.test(query)) {
+      params.sort_by = 'rating';
+    }
+    
+  } else if (engine === 'google_news') {
+    // For news, focus on the core topic and remove location/time qualifiers
+    query = cleanText
+      .replace(/\b(anyone know|what|who|where|when|how|latest|recent|new|today|breaking)\b/gi, '')
+      .replace(/\b(in|near|for|around)\s+[A-Za-z0-9 ,.'\-]+$/i, '')
+      .trim();
+      
+    // Add recency parameters
+    params.sort_by = 'date';
+    
+  } else if (engine === 'google_finance') {
+    // Normalize crypto/stock names to tickers
+    const financeMap: Record<string, string> = {
+      'bitcoin': 'BTC',
+      'btc': 'BTC',
+      'ethereum': 'ETH', 
+      'eth': 'ETH',
+      'solana': 'SOL',
+      'sol': 'SOL',
+      'dogecoin': 'DOGE',
+      'doge': 'DOGE',
+      'nvidia': 'NVDA',
+      'apple': 'AAPL',
+      'microsoft': 'MSFT',
+      'google': 'GOOGL',
+      'amazon': 'AMZN',
+      'tesla': 'TSLA'
+    };
+    
+    const lowerQuery = query.toLowerCase();
+    for (const [name, ticker] of Object.entries(financeMap)) {
+      if (lowerQuery.includes(name)) {
+        query = query.replace(new RegExp(`\\b${name}\\b`, 'gi'), ticker);
+        break;
+      }
+    }
+  }
+
+  return { parsedQuery: query, parsedParams: params };
+}
+
 // Helper to normalize avatar URL to a relative /uploads path
 function normalizeAvatarUrl(input?: string | null): string | null {
   if (!input) return null;
@@ -442,10 +530,79 @@ fastify.get('/api/feed', async (request, reply) => {
   try {
     const q = request.query as any;
     const limit = Math.min(50, Number(q.limit) || 20);
-    const rows = await db.select().from(publicFeedPosts);
+    const offset = Math.max(0, Number(q.offset) || 0);
+    const mode = String(q.mode || 'all').trim();
+    
+    let rows = await db.select().from(publicFeedPosts);
+    
+    // Filter for "following" mode
+    if (mode === 'following') {
+      try {
+        const uid = getUserIdFromRequest(request);
+        if (uid) {
+          // Get user's following relationships
+          const userActorId = await getOrCreateUserActor(uid);
+          const followingRows = await db.select().from(relationships).where(
+            and(
+              eq(relationships.fromActorId, userActorId),
+              eq(relationships.kind, 'follow')
+            )
+          );
+          const followingIds = new Set((followingRows as any[]).map(r => r.toActorId));
+          
+          // Filter posts to only show those from followed users/agents
+          rows = rows.filter((p: any) => {
+            return followingIds.has(p.authorId);
+          });
+        }
+      } catch (e) {
+        // If there's an error getting following relationships, fall back to all posts
+        request.server.log.warn({ err: (e as any)?.message }, 'following-filter-failed');
+      }
+    } else if (mode === 'all') {
+      // For "Everyone" mode, include monitoring updates from followed agents
+      try {
+        const uid = getUserIdFromRequest(request);
+        if (uid) {
+          const userActorId = await getOrCreateUserActor(uid);
+          const followingRows = await db.select().from(relationships).where(
+            and(
+              eq(relationships.fromActorId, userActorId),
+              eq(relationships.kind, 'follow')
+            )
+          );
+          const followingAgentIds = new Set((followingRows as any[]).map(r => r.toActorId));
+          
+          // Get monitoring updates from followed agents
+          if (followingAgentIds.size > 0) {
+            const followingAgentList = Array.from(followingAgentIds);
+            const monitoringUpdates = await db.execute(sql`
+              select pfp.* from public_feed_posts pfp
+              join agent_monitors am on pfp.author_id = am.agent_id
+              where am.agent_id = any(${followingAgentList})
+              and am.enabled = true
+              and pfp.created_at > now() - interval '7 days'
+              order by pfp.created_at desc
+            `);
+            const monitoringPosts = monitoringUpdates.rows || monitoringUpdates;
+            
+            // Add monitoring updates to the feed (avoid duplicates)
+            const existingPostIds = new Set(rows.map((p: any) => p.id));
+            for (const monitoringPost of monitoringPosts as any[]) {
+              if (!existingPostIds.has(monitoringPost.id)) {
+                rows.push(monitoringPost);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        request.server.log.warn({ err: (e as any)?.message }, 'monitoring-updates-filter-failed');
+      }
+    }
+    
     const list = (rows as any[])
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-      .slice(0, limit);
+      .slice(offset, offset + limit);
     // Attach reply counts
     const allReplies = await db.select().from(publicFeedReplies);
     const countByPost: Record<string, number> = {};
@@ -518,6 +675,132 @@ fastify.get('/api/monitors', async (request, reply) => {
   }
 });
 
+// Create monitor for a specific post+agent (Follow)
+fastify.post('/api/monitors/create-for-post', async (request, reply) => {
+  try {
+    const body = (request.body || {}) as any;
+    const postId = String(body.postId || '').trim();
+    const agentId = String(body.agentId || '').trim();
+    if (!postId || !agentId) { reply.code(400); return { error: 'postId and agentId required' }; }
+
+    // Load post and agent rows
+    const posts = await db.select().from(publicFeedPosts);
+    const post = (posts as any[]).find(p => String(p.id) === postId);
+    if (!post) { reply.code(404); return { error: 'post not found' }; }
+    const arows = await db.select({ id: agents.id, name: agents.name, instructions: agents.instructions, avatar: agents.avatar, toolPreferences: (agents as any)["toolPreferences"] as any }).from(agents);
+    const agentRow = (arows as any[]).find(a => String(a.id) === agentId);
+    if (!agentRow) { reply.code(404); return { error: 'agent not found' }; }
+
+    const tp = (agentRow?.toolPreferences || {}) as any;
+    const pcfg = tp?.publicConfig || {};
+    const allowedEngines: string[] = Array.isArray(pcfg?.allowedEngines) ? pcfg.allowedEngines.map(String) : [];
+
+    // Reuse the same heuristic engine selection
+    const text = String(post.text || '');
+    const foodish = /\b(food|restaurant|dining|michelin|wine|drinks|bistro|eatery|yelp)\b/i.test(text);
+    const sciencey = /\b(quantum|physics|scholar|everett|many worlds|theoretical|computation)\b/i.test(text);
+    let engineUse: string | undefined = allowedEngines.length ? allowedEngines[0] : undefined;
+    if (!engineUse) {
+      if (foodish) engineUse = 'yelp';
+      else if (/news|headline|today|breaking/i.test(text)) engineUse = 'google_news';
+      else engineUse = 'google';
+    }
+
+    // Parse query and create engine-specific parameters
+    const { parsedQuery, parsedParams } = parseQueryForEngine(text, engineUse);
+    
+    // Get the current user's actor ID for creating follow relationship
+    const uid = getUserIdFromRequest(request);
+    let followRelationshipCreated = false;
+    if (uid) {
+      try {
+        const userActorId = await getOrCreateUserActor(uid);
+        const agentActorId = await getOrCreateAgentActor(agentId);
+        
+        // Check if follow relationship already exists
+        const existingFollow = await db.select().from(relationships).where(
+          and(
+            eq(relationships.fromActorId, userActorId),
+            eq(relationships.toActorId, agentActorId),
+            eq(relationships.kind, 'follow')
+          )
+        );
+        
+        if (existingFollow.length === 0) {
+          // Create follow relationship
+          const relationshipId = randomUUID();
+          await db.insert(relationships).values({
+            id: relationshipId,
+            fromActorId: userActorId,
+            toActorId: agentActorId,
+            kind: 'follow',
+            metadata: { status: 'accepted' },
+            createdAt: new Date(),
+          });
+          followRelationshipCreated = true;
+          request.server.log.info({ userActorId, agentActorId, relationshipId }, 'follow-relationship-created');
+        } else {
+          request.server.log.info({ userActorId, agentActorId }, 'follow-relationship-already-exists');
+        }
+      } catch (e) {
+        request.server.log.warn({ err: (e as any)?.message }, 'failed-to-create-follow-relationship');
+      }
+    }
+
+    // Check if a monitor already exists for this post+agent combination
+    const existingMonitors = await db.execute(sql`
+      select * from agent_monitors 
+      where source_post_id = ${postId} 
+      and agent_id = ${agentId}
+      limit 1
+    ` as any);
+    const existing = (existingMonitors.rows || existingMonitors)[0];
+    
+    let monitorId: string;
+    const jitterMinutes = Math.floor(Math.random() * 10);
+    const next = new Date(Date.now() + (Number(60) + jitterMinutes) * 60000);
+    
+    if (existing) {
+      // Re-enable existing monitor and update next run time
+      monitorId = existing.id;
+      await db.execute(sql`
+        update agent_monitors 
+        set enabled = ${true}, 
+            next_run_at = ${next.toISOString()},
+            updated_at = ${new Date().toISOString()}
+        where id = ${monitorId}
+      ` as any);
+      request.server.log.info({ monitorId, postId, agentId }, 'monitor-re-enabled');
+    } else {
+      // Create new monitor
+      monitorId = randomUUID();
+      await db.execute(sql`insert into agent_monitors (id, agent_id, created_by_user_id, source_post_id, engine, query, params, cadence_minutes, last_run_at, next_run_at, enabled, scope, created_at, updated_at) values (
+        ${monitorId}, ${agentId}, ${post.authorId || null}, ${postId}, ${engineUse}, ${parsedQuery}, ${JSON.stringify(parsedParams)}, ${60}, ${null}, ${next.toISOString()}, ${true}, ${'public'}, ${new Date().toISOString()}, ${new Date().toISOString()}
+      )` as any);
+      request.server.log.info({ monitorId, postId, agentId }, 'monitor-created');
+    }
+    
+    return { ok: true, id: monitorId, followCreated: followRelationshipCreated };
+  } catch (e: any) {
+    request.server.log.error(e);
+    reply.code(500); return { error: 'Failed to create monitor' };
+  }
+});
+
+// Disable monitor for a specific post+agent (Stop)
+fastify.post('/api/monitors/disable-by-post-and-agent', async (request, reply) => {
+  try {
+    const body = (request.body || {}) as any;
+    const postId = String(body.postId || '').trim();
+    const agentId = String(body.agentId || '').trim();
+    if (!postId || !agentId) { reply.code(400); return { error: 'postId and agentId required' }; }
+    await db.execute(sql`update agent_monitors set enabled = false, updated_at = ${new Date().toISOString()} where source_post_id = ${postId} and agent_id = ${agentId}` as any);
+    return { ok: true };
+  } catch (e: any) {
+    request.server.log.error(e);
+    reply.code(500); return { error: 'Failed to disable monitor' };
+  }
+});
 fastify.post('/api/monitors/:id/disable', async (request, reply) => {
   try {
     const { id } = request.params as { id: string };
@@ -650,6 +933,31 @@ fastify.post('/api/feed', async (request, reply) => {
             const n1 = norm(a), n2 = norm(b); let dot = 0; for (let i=0;i<Math.min(n1.length, n2.length);i++) dot += n1[i]*n2[i]; return dot;
           };
           const postText = String(text || '').toLowerCase();
+          // Synonym/inflection helper: broaden keyword matches system-wide
+          const expandTokens = (arr: string[]): string[] => {
+            const base = (arr || []).filter((t) => typeof t === 'string').map((t) => t.trim().toLowerCase()).filter(Boolean);
+            const extra: string[] = [];
+            for (const tok of base) {
+              if (tok === 'drone' || tok === 'drones') extra.push('drone','drones','uav','uas','unmanned','unmanned aerial');
+              if (tok === 'uav' || tok === 'uas') extra.push('drone','drones','uav','uas','unmanned');
+              if (tok === 'military') extra.push('military','defense','defence');
+              if (tok === 'defense' || tok === 'defence') extra.push('defense','defence','military');
+              if (tok === 'wine bar' || tok === 'wine') extra.push('wine','wine bar','wine bars');
+              if (tok === 'bistro' || tok === 'bistros') extra.push('bistro','bistros','french');
+            }
+            return Array.from(new Set([...base, ...extra]));
+          };
+          const textHasAny = (needles: string[]) => {
+            for (const n of needles) {
+              const q = n.trim().toLowerCase();
+              if (!q) continue;
+              // word-ish match to reduce false positives
+              const re = new RegExp(`(^|[^a-z])${q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?=$|[^a-z])`,'i');
+              if (re.test(postText)) return true;
+            }
+            return false;
+          };
+          const isFoodishPost = /\b(food|restaurant|dining|michelin|wine|drinks|cuisine|bistro|eatery|bar|wine\s*bar|cafe)\b/i.test(String(text));
           const diagnostics: any[] = [];
           // Quick lookup for full agent row (to include avatar)
           const fullById: Record<string, any> = {};
@@ -669,17 +977,20 @@ fastify.post('/api/feed', async (request, reply) => {
             const interestTokens = (tags || [])
               .filter((t: any) => typeof t === 'string')
               .map((t: string) => t.trim().toLowerCase())
-              .filter((t: string) => t.length >= 3);
-            let hitByKeyword = interestTokens.some((kw: string) => postText.includes(kw));
-            // Allow an agent-specific booster: if this agent prefers Yelp (food context), accept common food terms
+              .filter((t: string) => t.length >= 2);
+            const expandedTokens = expandTokens(interestTokens);
+            let hitByKeyword = textHasAny(expandedTokens);
+            // Allow an agent-specific booster: restrict food replies to agents actually interested in food
             if (!hitByKeyword) {
               try {
                 const full = fullById[String(ag.id)] || {};
                 const tp = (full?.toolPreferences || {}) as any;
                 const pcfg = tp?.publicConfig || {};
                 const allowedEngines: string[] = Array.isArray(pcfg?.allowedEngines) ? pcfg.allowedEngines.map(String) : [];
-                const usesYelp = allowedEngines.includes('yelp') || /gordon/.test(String(ag.name || '').toLowerCase());
-                if (usesYelp && /\b(food|restaurant|dining|michelin|wine|drinks|cuisine|bistro|eatery)\b/i.test(String(text))) {
+                const usesYelp = allowedEngines.includes('yelp');
+                const isGordon = /gordon/.test(String(ag.name || '').toLowerCase());
+                const hasFoodInterest = expandedTokens.some((kw: string) => /\b(food|restaurant|dining|chef|cuisine|yelp|wine|drinks|bistro|eatery)\b/i.test(String(kw)));
+                if ((isGordon || (usesYelp && hasFoodInterest)) && isFoodishPost) {
                   hitByKeyword = true;
                 }
               } catch {}
@@ -719,7 +1030,7 @@ fastify.post('/api/feed', async (request, reply) => {
                 if (!engineUse) {
                   const foodish = /\b(food|restaurant|dining|michelin|wine|drinks|bistro|eatery|yelp)\b/i.test(String(text));
                   const sciencey = /\b(quantum|physics|scholar|everett|many worlds|theoretical|computation)\b/i.test(String(text));
-                  if (foodish && interestTokens.some((kw) => /\b(food|restaurant|dining|michelin|wine|drinks)\b/i.test(String(kw)))) engineUse = 'yelp';
+                  if (foodish && interestTokens.some((kw) => /\b(food|restaurant|dining|michelin|wine|drinks|chef|cuisine|yelp)\b/i.test(String(kw)))) engineUse = 'yelp';
                   else if (sciencey && interestTokens.some((kw) => /\b(quantum|physics|scholar|everett|theoretical|computation)\b/i.test(String(kw)))) engineUse = 'google_scholar';
                   else if (/news|headline|today|breaking/i.test(String(text))) engineUse = 'google_news';
                   else if (/image|photo|picture|gallery/i.test(String(text))) engineUse = 'google_images';
@@ -877,15 +1188,15 @@ fastify.post('/api/feed', async (request, reply) => {
                   }
 
                   if (!composedIntro) {
-                    // Fallback to heuristic intro if LLM unavailable
+                    // Fallback to a generic intro that still reflects the agent's personality.
                     const fmtList = (arr: string[]) => arr.length === 0 ? '' : (arr.length === 1 ? arr[0] : (arr.length === 2 ? `${arr[0]} and ${arr[1]}` : `${arr[0]}, ${arr[1]} and ${arr[2]}`));
-                    if (lowerName.includes('gordon')) {
-                      composedIntro = topTitles.length ? `Oi! Proper eats: ${fmtList(topTitles)} — I'd book one of these tonight.` : 'Oi! Here are top picks:';
-                    } else if (lowerName.includes('david') && lowerName.includes('deutsch')) {
-                      composedIntro = topTitles.length ? `In brief: ${fmtList(topTitles)}. Explanatory reach matters; see sources below.` : (engineUse === 'google_scholar' ? 'Key scholarly references:' : 'Relevant sources:');
-                    } else {
-                      composedIntro = topTitles.length ? `Here are strong candidates: ${fmtList(topTitles)}.` : 'Here are some results:';
-                    }
+                    const personaText = String((fullById[String(ag.id)] || {}).instructions || '').trim();
+                    const m = personaText.match(/Personality:\s*([\s\S]*?)(\n\n|$)/i);
+                    const personaLine = (m && m[1] ? String(m[1]).trim() : '') || (personaText.split('\n').find((s: string) => s.trim().length > 0) || '');
+                    const personaPrefix = personaLine ? `${ag.name}: ${personaLine}` : `${ag.name}`;
+                    composedIntro = topTitles.length
+                      ? `${personaPrefix} — ${fmtList(topTitles)}.`
+                      : `${personaPrefix}.`;
                   }
 
                   replyText = `${composedIntro}\n\n${markdown || (res?.markdown || '')}`.trim();
@@ -906,27 +1217,25 @@ fastify.post('/api/feed', async (request, reply) => {
               request.server.log.info({ agentId: ag.id, replyId }, 'public-match:replied');
               diagnostics.push({ agentId: ag.id, name: ag.name, score, threshold: th, hitByKeyword, replied: true });
 
-              // Create a lightweight monitor for this agent based on the reply context (hourly with jitter)
+              // Optionally create a lightweight monitor based on reply context (hourly with jitter)
               try {
+                const autoMon = String(process.env.PUBLIC_AUTO_MONITOR || '0') === '1';
                 const tpFull = (fullById[String(ag.id)]?.toolPreferences || {}) as any;
                 const pcfgFull = tpFull?.publicConfig || {};
-                if (pcfgFull?.isPublic) {
+                if (autoMon && pcfgFull?.isPublic) {
                   const monitorId = randomUUID();
                   // Choose engine we actually used (engineUse may be undefined if retrieval failed); default to first allowed engine
                   let monitorEngine: string = (typeof engineUse === 'string' && engineUse.length)
                     ? engineUse
                     : (Array.isArray(pcfgFull?.allowedEngines) && pcfgFull.allowedEngines.length ? String(pcfgFull.allowedEngines[0]) : 'google');
-                  // Build normalized query/params from what we sent to serpapiService
-                  const paramsForMonitor: any = {};
-                  if (monitorEngine === 'yelp') {
-                    // Persist our last known Yelp params if available
-                    try { paramsForMonitor.find_loc = (res && (res as any).raw && (res as any).raw.search_parameters ? (res as any).raw.search_parameters.find_loc : undefined); } catch {}
-                  }
+                  // Parse query and create engine-specific parameters
+                  const { parsedQuery, parsedParams } = parseQueryForEngine(text, monitorEngine);
+                  
                   const jitterMinutes = Math.floor(Math.random() * 60);
                   const now = new Date();
                   const next = new Date(now.getTime() + (60 + jitterMinutes) * 60000);
                   await db.execute(sql`insert into agent_monitors (id, agent_id, created_by_user_id, source_post_id, engine, query, params, cadence_minutes, last_run_at, next_run_at, enabled, scope, created_at, updated_at) values (
-                    ${monitorId}, ${ag.id}, ${uid || null}, ${id}, ${monitorEngine}, ${String(text)}, ${JSON.stringify(paramsForMonitor)}, ${60}, ${null}, ${next.toISOString()}, ${true}, ${'public'}, ${new Date().toISOString()}, ${new Date().toISOString()}
+                    ${monitorId}, ${ag.id}, ${uid || null}, ${id}, ${monitorEngine}, ${parsedQuery}, ${JSON.stringify(parsedParams)}, ${60}, ${null}, ${next.toISOString()}, ${true}, ${'public'}, ${new Date().toISOString()}, ${new Date().toISOString()}
                   )` as any);
                   request.server.log.info({ agentId: ag.id, monitorId, engine: monitorEngine }, 'monitor:created');
                   // Verify it exists; warn if missing

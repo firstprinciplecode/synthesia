@@ -183,10 +183,10 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
       
       <div className="flex flex-col gap-0 flex-1 min-w-0">
         <div
-          className={`flex items-baseline gap-2 ${animateHeader ? 'sa-fade-in-up' : ''}`}
+          className={`flex items-baseline gap-1 ${animateHeader ? 'sa-fade-in-up' : ''}`}
         >
           <span 
-            className="font-semibold text-sm text-foreground"
+            className="text-sm text-foreground"
             title={isTerminal && message.terminalResult ? `$ ${message.terminalResult.command}` : undefined}
           >
             {isUser ? (isSelf ? 'You' : ((userName && userName.trim()) || 'User')) : isTerminal ? 'Terminal' : (agentName || 'Agent')}
