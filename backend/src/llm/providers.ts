@@ -6,9 +6,76 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 
 export type LLMProvider = 'openai' | 'anthropic' | 'google' | 'xai' | 'deepseek';
 
+export type LLMContentBlock = 
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
 export interface LLMMessage {
   role: 'user' | 'assistant' | 'system';
-  content: string;
+  content: string | LLMContentBlock[];
+}
+
+// Helper to detect and extract image URLs from text
+export function extractImageUrls(text: string): { text: string; imageUrls: string[] } {
+  const imageUrlPattern = /(https?:\/\/[^\s]+\.(?:jpg|jpeg|png|gif|webp|bmp)(?:\?[^\s]*)?)/gi;
+  const imageUrls: string[] = [];
+  const matches = text.match(imageUrlPattern);
+  
+  if (matches) {
+    imageUrls.push(...matches);
+  }
+  
+  return { text, imageUrls };
+}
+
+// Helper to convert message to content blocks format
+export function messageToContentBlocks(message: LLMMessage): LLMMessage {
+  if (typeof message.content !== 'string') {
+    return message; // Already in blocks format
+  }
+  
+  const { text, imageUrls } = extractImageUrls(message.content);
+  
+  if (imageUrls.length === 0) {
+    return message; // No images, keep as string
+  }
+  
+  // Convert to blocks format
+  const blocks: LLMContentBlock[] = [
+    { type: 'text', text }
+  ];
+  
+  for (const url of imageUrls) {
+    blocks.push({
+      type: 'image_url',
+      image_url: { url }
+    });
+  }
+  
+  return {
+    ...message,
+    content: blocks
+  };
+}
+
+// Convert our generic message content to Google Generative AI Part[] format
+function toGoogleParts(content: string | LLMContentBlock[]): any[] {
+  if (typeof content === 'string') {
+    return [{ text: content }];
+  }
+  const parts: any[] = [];
+  for (const block of content) {
+    if ((block as any)?.type === 'text') {
+      parts.push({ text: (block as any).text });
+    } else if ((block as any)?.type === 'image_url') {
+      const url = (block as any).image_url?.url;
+      // Degrade image blocks to textual reference to maintain type compatibility
+      // If needed, this can be upgraded to actual image parts supported by the SDK
+      parts.push({ text: `Image: ${String(url || '')}` });
+    }
+  }
+  if (parts.length === 0) return [{ text: '' }];
+  return parts;
 }
 
 export interface LLMStreamChunk {
@@ -103,7 +170,7 @@ export class AnthropicProvider {
     this.client = new Anthropic({ apiKey });
   }
 
-  async *stream(messages: LLMMessage[], config: LLMConfig): AsyncGenerator<LLMStreamChunk> {
+async *stream(messages: LLMMessage[], config: LLMConfig): AsyncGenerator<LLMStreamChunk> {
     // Convert messages to Anthropic format
     const systemMessage = messages.find(m => m.role === 'system')?.content;
     const conversationMessages = messages.filter(m => m.role !== 'system');
@@ -112,10 +179,10 @@ export class AnthropicProvider {
       model: config.model,
       max_tokens: config.maxTokens || 4000,
       temperature: config.temperature,
-      system: systemMessage,
+      system: typeof systemMessage === 'string' ? systemMessage : undefined,
       messages: conversationMessages.map(m => ({
         role: m.role as 'user' | 'assistant',
-        content: m.content,
+        content: typeof m.content === 'string' ? m.content : m.content as any,
       })),
       stream: true,
     });
@@ -142,10 +209,10 @@ export class AnthropicProvider {
       model: config.model,
       max_tokens: config.maxTokens || 4000,
       temperature: config.temperature,
-      system: systemMessage,
+      system: typeof systemMessage === 'string' ? systemMessage : undefined,
       messages: conversationMessages.map(m => ({
         role: m.role as 'user' | 'assistant',
-        content: m.content,
+        content: typeof m.content === 'string' ? m.content : m.content as any,
       })),
     });
 
@@ -182,14 +249,14 @@ export class GoogleProvider {
       .filter(m => m.role !== 'system')
       .map(m => ({
         role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }],
-      }));
+        parts: toGoogleParts(m.content),
+      })) as any;
 
     const systemInstruction = messages.find(m => m.role === 'system')?.content;
     
     const result = await model.generateContentStream({
-      contents,
-      systemInstruction: systemInstruction ? { role: 'system', parts: [{ text: systemInstruction }] } : undefined,
+      contents: contents as any,
+      systemInstruction: systemInstruction ? { role: 'system', parts: toGoogleParts(systemInstruction as any) } as any : undefined,
       generationConfig: {
         temperature: config.temperature,
         maxOutputTokens: config.maxTokens,
@@ -223,14 +290,14 @@ export class GoogleProvider {
       .filter(m => m.role !== 'system')
       .map(m => ({
         role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }],
-      }));
+        parts: toGoogleParts(m.content),
+      })) as any;
 
     const systemInstruction = messages.find(m => m.role === 'system')?.content;
     
     const result = await model.generateContent({
-      contents,
-      systemInstruction: systemInstruction ? { role: 'system', parts: [{ text: systemInstruction }] } : undefined,
+      contents: contents as any,
+      systemInstruction: systemInstruction ? { role: 'system', parts: toGoogleParts(systemInstruction as any) } as any : undefined,
       generationConfig: {
         temperature: config.temperature,
         maxOutputTokens: config.maxTokens,
