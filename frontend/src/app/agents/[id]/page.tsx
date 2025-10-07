@@ -28,6 +28,10 @@ type Agent = {
   publicMatchThreshold?: number;
   interests?: string[];
   allowedPublicEngines?: string[];
+  // Room config (server persists inside toolPreferences.roomConfig)
+  roomInterestEnabled?: boolean;
+  roomInterests?: string[];
+  roomMatchThreshold?: number;
 };
 
 export default function AgentDetailPage() {
@@ -49,6 +53,10 @@ export default function AgentDetailPage() {
   const [publicThreshold, setPublicThreshold] = useState(0.7);
   const [interests, setInterests] = useState<string>('');
   const [allowedEngine, setAllowedEngine] = useState<string>('yelp');
+  // Room interests UI state
+  const [roomEnabled, setRoomEnabled] = useState(false);
+  const [roomInterests, setRoomInterests] = useState<string>('');
+  const [roomThreshold, setRoomThreshold] = useState(0.7);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const getBackendHttpBase = () => '/';
@@ -73,6 +81,14 @@ export default function AgentDetailPage() {
         setInterests(Array.isArray(data.interests) ? data.interests.join(', ') : '');
         const engines = Array.isArray((data as any).allowedPublicEngines) ? (data as any).allowedPublicEngines : [];
         if (engines.length) setAllowedEngine(engines[0]);
+        // Room config (may live under toolPreferences.roomConfig; backend exposes merged values when present)
+        try {
+          const rc = (data as any)?.toolPreferences?.roomConfig || {};
+          const enabled = !!rc?.enabled;
+          setRoomEnabled(enabled);
+          setRoomInterests(Array.isArray(rc?.interests) ? rc.interests.join(', ') : '');
+          setRoomThreshold(typeof rc?.matchThreshold === 'number' ? rc.matchThreshold : 0.7);
+        } catch {}
         // We encode Personality + Extra instructions inside instructions field for now
         // Keep existing instructions and allow editing split parts
         const instr: string = data.instructions || '';
@@ -103,6 +119,10 @@ export default function AgentDetailPage() {
     } catch {}
     const interestsArr = interests.split(',').map(s => s.trim()).filter(Boolean).slice(0, 32);
     const payload = { name, description, instructions, avatar: avatarToSave, autoExecuteTools, isPublic, publicMatchThreshold: publicThreshold, interests: interestsArr, allowedEngines: allowedEngine ? [allowedEngine] : [] } as any;
+    // Merge room config into toolPreferences.roomConfig via backend PUT handler
+    payload.roomInterestEnabled = roomEnabled;
+    payload.roomInterests = roomInterests.split(',').map(s => s.trim()).filter(Boolean).slice(0, 64);
+    payload.roomMatchThreshold = roomThreshold;
     const uid = (session as any)?.userId;
     const res = await fetch(`/api/agents/${id}`, {
       method: 'PUT',
@@ -175,6 +195,7 @@ export default function AgentDetailPage() {
                 <TabsList className="mb-2">
                   <TabsTrigger value="profile">Profile</TabsTrigger>
                   <TabsTrigger value="public">Public</TabsTrigger>
+                <TabsTrigger value="room">Room</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="profile">
@@ -285,6 +306,33 @@ export default function AgentDetailPage() {
                     </CardContent>
                   </Card>
                 </TabsContent>
+
+              <TabsContent value="room">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Room Participation</CardTitle>
+                    <CardDescription>Control when the agent replies in rooms (multi-user chats).</CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div className="flex items-center space-x-2">
+                      <Switch id="room-enabled" checked={roomEnabled} onCheckedChange={setRoomEnabled} />
+                      <Label htmlFor="room-enabled" className="text-sm">Enable room interests</Label>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="room-interests">Room interests (comma-separated)</Label>
+                      <Input id="room-interests" value={roomInterests} onChange={(e) => setRoomInterests(e.target.value)} placeholder="crypto, space, robotics, defense" />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="room-threshold">Match threshold ({roomThreshold.toFixed(2)})</Label>
+                      <input id="room-threshold" type="range" min={0.3} max={0.95} step={0.01} value={roomThreshold} onChange={(e) => setRoomThreshold(parseFloat(e.target.value))} className="w-full" />
+                    </div>
+                    <div className="flex justify-end gap-2 pt-2">
+                      <Button variant="outline" asChild><Link href="/agents">Cancel</Link></Button>
+                      <Button onClick={onSave}>Save</Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </TabsContent>
               </Tabs>
             </>
           )}

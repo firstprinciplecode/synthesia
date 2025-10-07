@@ -44,9 +44,9 @@ export function TeamSwitcher({
               size={state === 'collapsed' ? 'default' : 'lg'}
               className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
             >
-              <div className="bg-white text-black flex aspect-square items-center justify-center rounded-lg animate-glow"
+              <div className="bg-black dark:bg-white text-white dark:text-black flex aspect-square items-center justify-center rounded-lg animate-glow"
                    style={{ width: '2rem', height: '2rem' }}>
-                <activeTeam.logo className="size-4" />
+                <activeTeam.logo className="size-6 dark:invert" />
               </div>
               <div className="grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden">
                 <span className="truncate font-medium">{activeTeam.name}</span>
@@ -70,8 +70,8 @@ export function TeamSwitcher({
                 onClick={() => setActiveTeam(team)}
                 className="gap-2 p-2"
               >
-                <div className="flex size-6 items-center justify-center rounded-md border">
-                  <team.logo className="size-3.5 shrink-0" />
+                <div className="flex size-6 items-center justify-center rounded-md border bg-black dark:bg-white text-white dark:text-black">
+                  <team.logo className="size-5 shrink-0 dark:invert" />
                 </div>
                 {team.name}
                 <DropdownMenuShortcut>⌘{index + 1}</DropdownMenuShortcut>

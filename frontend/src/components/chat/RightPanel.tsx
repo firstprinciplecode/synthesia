@@ -3,6 +3,7 @@
 import { RefObject } from 'react';
 import { JsonFormatter } from '@/components/ui/json-formatter';
 import { Search, Globe2, Mic, Wrench, X } from 'lucide-react';
+import { RotateCcw } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -10,6 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandSeparator } from '@/components/ui/command';
 import { Checkbox } from '@/components/ui/checkbox';
 import { resolveWsUrl, getHttpBaseFromWs } from '@/lib/chat/net';
+import { toast } from 'sonner';
 
 export function RightPanel({
   rightOpen,
@@ -44,6 +46,16 @@ export function RightPanel({
   const [requestAgentId, setRequestAgentId] = useState('');
 
   const httpBase = getHttpBaseFromWs(resolveWsUrl());
+  async function resetContext() {
+    try {
+      if (!currentRoomId) return;
+      const uid = (typeof window !== 'undefined' ? (window as any).__superagent_uid : undefined) as string | undefined;
+      const headers = { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) } as any;
+      const res = await fetch(`${httpBase}/api/rooms/${encodeURIComponent(currentRoomId)}/reset-context`, { method: 'POST', headers });
+      if (!res.ok) { toast.error('Failed to reset context'); return; }
+      toast.success('Context reset');
+    } catch {}
+  }
   const resolveAvatarUrl = (src?: string | null) => {
     if (!src) return undefined as unknown as string;
     if (src.startsWith('http://') || src.startsWith('https://')) return src;
@@ -96,6 +108,9 @@ export function RightPanel({
           <button className={`px-2 py-1 rounded ${rightTab === 'tasks' ? 'bg-accent' : ''}`} onClick={() => setRightTab('tasks')}>Tasks{toolRuns.size > 0 ? ` (${[...toolRuns.values()].filter((r:any) => r.status === 'running').length})` : ''}</button>
         </div>
         <div className="flex items-center gap-2">
+          <button title="Reset context" onClick={resetContext} className="h-7 w-7 inline-flex items-center justify-center rounded hover:bg-accent">
+            <RotateCcw className="h-4 w-4" />
+          </button>
           {rightTab === 'participants' && (
             <Button size="sm" variant="secondary" onClick={() => setShowInvite(true)}>+</Button>
           )}

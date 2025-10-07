@@ -263,7 +263,7 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
                   </div>
                 </div>
               )}
-              {isStreaming && (
+              {isStreaming && (!displayContent || displayContent.trim().length === 0) && (
                 <span className="inline-block w-1 h-4 bg-current animate-pulse ml-1" />
               )}
             </div>

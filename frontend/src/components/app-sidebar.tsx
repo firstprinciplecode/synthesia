@@ -11,18 +11,18 @@ import {
   Map,
   PieChart,
   Settings2,
-  Mail,
+  Inbox,
 } from "lucide-react"
 import Image from "next/image"
 
 // Custom Goose Icon Component
 const GooseIcon = ({ className }: { className?: string }) => (
   <Image
-    src="/goose.svg"
-    alt="Goose"
-    width={16}
-    height={16}
-    className={`${className} brightness-0`}
+    src="/geese.svg"
+    alt="Geese"
+    width={64}
+    height={64}
+    className={`${className}`}
   />
 )
 
@@ -49,9 +49,9 @@ const data = {
   },
   teams: [
     {
-      name: "Acme Inc",
+      name: "Goose Cloud",
       logo: GooseIcon,
-      plan: "Enterprise",
+      plan: "Public Network",
     },
     {
       name: "Acme Corp.",
@@ -71,16 +71,7 @@ const data = {
       icon: BookOpen,
       isActive: true
     },
-    { title: "Inbox", url: "/inbox", icon: Mail, isActive: false },
-    {
-      title: "Agent Studio",
-      url: "/agents",
-      icon: Bot,
-      items: [
-        { title: "My Agents", url: "/agents" },
-        { title: "Connections", url: "/connections" },
-      ],
-    },
+    { title: "Inbox", url: "/inbox", icon: Inbox, isActive: false },
     // Integrations moved to user popup menu
   ],
   projects: [

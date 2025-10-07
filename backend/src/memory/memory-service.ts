@@ -57,7 +57,7 @@ export class MemoryService {
   }
   private pinecone: Pinecone | null = null;
   private shortTermMemories: Map<string, ShortTermMemory> = new Map();
-  private readonly SHORT_TERM_SIZE = 10;
+  private readonly SHORT_TERM_SIZE = 30;
 
   constructor() {
     // Defer Pinecone initialization until needed to avoid crashing when
@@ -102,6 +102,13 @@ export class MemoryService {
 
   getShortTerm(agentId: string): MemoryMessage[] {
     return this.shortTermMemories.get(agentId)?.messages || [];
+  }
+
+  // Clear short-term memory for a given key (agentId or roomId)
+  clearShortTerm(key: string): void {
+    try {
+      this.shortTermMemories.delete(key);
+    } catch {}
   }
 
   // Long-term memory (Pinecone)

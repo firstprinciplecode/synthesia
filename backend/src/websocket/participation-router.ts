@@ -34,19 +34,42 @@ export class ParticipationRouter {
 				if (pattern.test(lower) && roomAgentIds.includes(id)) { mentionedIds.push(id); break; }
 			}
 		}
-		return { all, mentionedIds };
+		// Deduplicate while preserving order to make selection deterministic when duplicate handles exist
+		const seen = new Set<string>();
+		const unique = mentionedIds.filter((aid) => { if (seen.has(aid)) return false; seen.add(aid); return true; });
+		return { all, mentionedIds: unique };
 	}
 
 	// Placeholder similarity using keywords only for now; future: embeddings
 	private computeKeywordScore(message: string, keywords: string[] | null | undefined): number {
 		if (!keywords || keywords.length === 0) return 0;
 		const text = message.toLowerCase();
-		let hits = 0;
 		for (const k of keywords) {
 			if (!k) continue;
-			if (text.includes(String(k).toLowerCase())) hits++;
+			if (text.includes(String(k).toLowerCase())) {
+				// Any match yields a positive decision (1.0). Thresholds then gate the response.
+				return 1;
+			}
 		}
-		return Math.min(1, hits / Math.max(3, keywords.length));
+		return 0;
+	}
+
+	private getAgentRoomInterest(agentRow: any): { tokens: string[]; threshold: number } {
+		try {
+			const tp = (agentRow?.toolPreferences || {}) as any;
+			const roomCfg = tp?.roomConfig || {};
+			const pubCfg = tp?.publicConfig || {};
+			const enabled = !!roomCfg?.enabled;
+			const roomTokens: string[] = Array.isArray(roomCfg?.interests) ? roomCfg.interests : [];
+			const publicTokens: string[] = Array.isArray(pubCfg?.interests) ? pubCfg.interests : [];
+			const tokens = enabled && roomTokens.length ? roomTokens : publicTokens;
+			const threshold = typeof roomCfg?.matchThreshold === 'number'
+				? Math.max(0.3, Math.min(0.95, roomCfg.matchThreshold))
+				: (typeof pubCfg?.publicMatchThreshold === 'number' ? pubCfg.publicMatchThreshold : 0.7);
+			return { tokens: tokens.filter((t: any) => typeof t === 'string' && t.trim().length > 0), threshold };
+		} catch {
+			return { tokens: [], threshold: 0.7 };
+		}
 	}
 
 	async scoreAgentsForMessage(roomId: string, message: string, eligibleAgentIds: string[]): Promise<ParticipationCandidate[]> {
@@ -74,15 +97,20 @@ export class ParticipationRouter {
 			}
 		} catch {}
 
-		const scored: ParticipationCandidate[] = infos.map((a) => {
-			const keywordScore = this.computeKeywordScore(message, (a.keywords as string[] | null) || undefined);
-			const tagScore = this.computeKeywordScore(message, capsByAgentId.get(a.id) || []);
-			// Confidence threshold
-			const conf = Number(a.confidenceThreshold ?? 0.7);
-			const score = Math.max(keywordScore, tagScore);
-			const reason = tagScore > keywordScore ? 'capability tag match' : (keywordScore > 0 ? 'keyword match' : 'low relevance');
-			return { agentId: a.id, name: a.name, score, reason };
-		}).filter((c) => c.score >= 0.01);
+		const scored: ParticipationCandidate[] = infos
+			.map((a) => {
+				const { tokens, threshold } = this.getAgentRoomInterest(a);
+				const interestScore = this.computeKeywordScore(message, tokens);
+				const tagScore = this.computeKeywordScore(message, capsByAgentId.get(a.id) || []);
+				const score = Math.max(interestScore, tagScore);
+				const reason = tagScore > interestScore
+					? 'capability tag match'
+					: (interestScore > 0 ? 'room/public interest match' : 'low relevance');
+				// Only keep agents meeting threshold
+				if (score < Math.max(0.01, threshold)) return null;
+				return { agentId: a.id, name: a.name, score, reason } as ParticipationCandidate;
+			})
+			.filter((c): c is ParticipationCandidate => !!c);
 
 		scored.sort((a, b) => b.score - a.score);
 		return scored.slice(0, this.MAX_AGENTS);

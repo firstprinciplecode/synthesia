@@ -53,12 +53,12 @@ export const authOptions = {
       return session
     },
     async redirect({ url, baseUrl }: any) {
-      // Always land on dashboard after sign-in
+      // Always land on feed (search tab) after sign-in
       try {
         const b = new URL(baseUrl)
-        return `${b.origin}/dashboard`
+        return `${b.origin}/feed?tab=search`
       } catch {
-        return '/dashboard'
+        return '/feed?tab=search'
       }
     },
   },

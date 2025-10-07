@@ -33,10 +33,8 @@ export default function SignInPage() {
           <Card>
             <CardHeader className="text-center">
               <div className="flex items-center justify-center mb-2">
-                <Image src="/goose.svg" alt="Goose" width={28} height={28} className="filter brightness-0 dark:brightness-100" />
+                <Image src="/goose.svg" alt="Goose" width={40} height={40} className="filter brightness-0 dark:brightness-100" />
               </div>
-              <CardTitle className="text-xl">Welcome back</CardTitle>
-              <CardDescription>Login with your account</CardDescription>
             </CardHeader>
             <CardContent>
               <form onSubmit={onSubmit}>

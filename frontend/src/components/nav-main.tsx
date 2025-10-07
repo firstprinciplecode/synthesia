@@ -35,7 +35,6 @@ export function NavMain({
 }) {
   return (
     <SidebarGroup>
-      <SidebarGroupLabel>Platform</SidebarGroupLabel>
       <SidebarMenu>
         {items.map((item) => (
           <SidebarMenuItem key={item.title}>
@@ -67,7 +66,7 @@ export function NavMain({
             ) : (
               <SidebarMenuButton asChild tooltip={item.title}>
                 <a href={item.url} className="relative">
-                  {item.icon && <item.icon />}
+                  {item.icon && <item.icon className="h-5 w-5" />}
                   <span>{item.title}</span>
                   {item.badge ? (
                     <span className="ml-auto inline-flex items-center justify-center rounded-full bg-green-500 text-[10px] font-medium text-white px-1.5 py-0.5">

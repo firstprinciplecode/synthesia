@@ -46,6 +46,11 @@ export function NavProjects() {
   const [addPmOpen, setAddPmOpen] = useState(false)
   const [allActors, setAllActors] = useState<any[]>([])
   const [loadingActors, setLoadingActors] = useState(false)
+  const [allConnections, setAllConnections] = useState<{ id: string }[]>([])
+  const [outgoingPending, setOutgoingPending] = useState<{ toActorId: string }[]>([])
+  const [outgoingAgentAccessPending, setOutgoingAgentAccessPending] = useState<{ toActorId: string }[]>([])
+  const [myActorId, setMyActorId] = useState<string>('')
+  const [myOwnerUserId, setMyOwnerUserId] = useState<string>('')
 
   const loadData = useCallback(async () => {
     try {
@@ -134,10 +139,77 @@ export function NavProjects() {
       setLoadingActors(true)
       const uid = (session as any)?.userId || (session as any)?.user?.email
       const headers = uid ? { 'x-user-id': uid } : undefined
-      const res = await fetch('/api/actors', { cache: 'no-store', headers })
-      const j = await res.json()
-      const list = Array.isArray(j?.actors) ? j.actors : (Array.isArray(j) ? j : [])
-      setAllActors(list)
+      const [actorsRes, connRes, outgoingRes, outgoingAgentRes, meRes, agentsRes] = await Promise.all([
+        fetch('/api/actors', { cache: 'no-store', headers }),
+        fetch('/api/connections', { cache: 'no-store', headers }),
+        fetch('/api/relationships?direction=outgoing&status=pending', { cache: 'no-store', headers }),
+        fetch('/api/relationships?direction=outgoing&kind=agent_access&status=pending', { cache: 'no-store', headers }),
+        fetch('/api/actors/me', { cache: 'no-store', headers }),
+        fetch('/api/agents/accessible', { cache: 'no-store', headers }),
+      ])
+      const j = await actorsRes.json()
+      let list = Array.isArray(j?.actors) ? j.actors : (Array.isArray(j) ? j : [])
+      
+      // Deduplicate agent actors: keep only the one owned by the agent's creator
+      const agentsJson = await agentsRes.json()
+      const accessibleAgents = Array.isArray(agentsJson?.agents) ? agentsJson.agents : []
+      const agentCreatorByAgentId = new Map<string, string>()
+      for (const ag of accessibleAgents) {
+        if (ag.id && ag.createdBy) {
+          agentCreatorByAgentId.set(ag.id, ag.createdBy)
+        }
+      }
+      
+      // Group agent actors by agentId
+      const agentActorsByAgentId = new Map<string, any[]>()
+      const users: any[] = []
+      for (const actor of list) {
+        if (actor.type === 'agent' && actor.settings?.agentId) {
+          const agentId = actor.settings.agentId
+          if (!agentActorsByAgentId.has(agentId)) {
+            agentActorsByAgentId.set(agentId, [])
+          }
+          agentActorsByAgentId.get(agentId)!.push(actor)
+        } else if (actor.type === 'user') {
+          users.push(actor)
+        }
+      }
+      
+      // For each agentId, keep only the actor owned by the creator
+      const deduplicatedAgents: any[] = []
+      for (const [agentId, actors] of agentActorsByAgentId.entries()) {
+        const creator = agentCreatorByAgentId.get(agentId)
+        if (creator) {
+          // Find the actor whose ownerUserId matches the creator
+          const canonical = actors.find(a => a.ownerUserId === creator)
+          if (canonical) {
+            deduplicatedAgents.push(canonical)
+            continue
+          }
+        }
+        // Fallback: if no creator match, keep the most recently updated one
+        const sorted = actors.sort((a, b) => 
+          new Date(b.updatedAt || b.createdAt || 0).getTime() - 
+          new Date(a.updatedAt || a.createdAt || 0).getTime()
+        )
+        deduplicatedAgents.push(sorted[0])
+      }
+      
+      setAllActors([...users, ...deduplicatedAgents])
+      
+      const conJson = await connRes.json()
+      const conns = Array.isArray(conJson?.connections) ? conJson.connections : []
+      setAllConnections(conns)
+      
+      const outgoingJson = await outgoingRes.json()
+      setOutgoingPending(Array.isArray(outgoingJson?.relationships) ? outgoingJson.relationships : [])
+      
+      const outAgentJson = await outgoingAgentRes.json()
+      setOutgoingAgentAccessPending(Array.isArray(outAgentJson?.relationships) ? outAgentJson.relationships : [])
+      
+      const me = await meRes.json()
+      if (me?.id) setMyActorId(me.id as string)
+      if (typeof me?.ownerUserId === 'string') setMyOwnerUserId(me.ownerUserId)
     } catch {}
     finally { setLoadingActors(false) }
   }
@@ -167,6 +239,59 @@ export function NavProjects() {
       })
       try { window.dispatchEvent(new CustomEvent('connections-updated')) } catch {}
       await loadData()
+      await loadActorsForAdd()
+    } catch {}
+  }
+
+  const disconnectFromActor = async (actorId: string) => {
+    try {
+      const uid = (session as any)?.userId || (session as any)?.user?.email
+      // Find the actor to determine if it's a user or agent
+      const actor = allActors.find(a => a.id === actorId)
+      if (!actor) return
+      
+      let url: string
+      if (actor.type === 'agent' && actor.settings?.agentId) {
+        // For agents, use agent_access with agentId
+        url = `/api/relationships?toActorId=${encodeURIComponent(actorId)}&kind=agent_access&agentId=${encodeURIComponent(actor.settings.agentId)}`
+      } else {
+        // For users, use follow
+        url = `/api/relationships?toActorId=${encodeURIComponent(actorId)}&kind=follow`
+      }
+      
+      await fetch(url, { method: 'DELETE', headers: uid ? { 'x-user-id': uid } : {} })
+      try { window.dispatchEvent(new CustomEvent('connections-updated')) } catch {}
+      await loadData()
+      await loadActorsForAdd()
+    } catch {}
+  }
+
+  const cancelRequest = async (actor: any) => {
+    try {
+      const uid = (session as any)?.userId || (session as any)?.user?.email
+      const kind = actor.type === 'agent' ? 'agent_access' : 'follow'
+      const url = `/api/relationships?toActorId=${encodeURIComponent(actor.id)}&kind=${encodeURIComponent(kind)}`
+      await fetch(url, { method: 'DELETE', headers: uid ? { 'x-user-id': uid } : {} })
+      try { window.dispatchEvent(new CustomEvent('connections-updated')) } catch {}
+      await loadData()
+      await loadActorsForAdd()
+    } catch {}
+  }
+
+  const messageActor = async (actorId: string) => {
+    try {
+      const uid = (session as any)?.userId || (session as any)?.user?.email
+      const res = await fetch('/api/rooms/dm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) },
+        body: JSON.stringify({ targetActorId: actorId }),
+      })
+      const json = await res.json()
+      const roomId = json?.roomId as string | undefined
+      if (roomId) {
+        setAddPmOpen(false)
+        window.location.href = `/c/${roomId}`
+      }
     } catch {}
   }
 
@@ -445,71 +570,79 @@ export function NavProjects() {
       {/* Users section removed: covered by Private Messages */}
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-        <DialogContent className="sm:max-w-none w-screen h-screen p-0 bg-transparent">
-          <div className="w-full h-full flex items-center justify-center p-6">
-            <div className="w-full max-w-md bg-background border rounded-lg p-4 shadow-lg">
+        <DialogContent className="sm:max-w-none w-screen h-screen p-0 bg-background/70 backdrop-blur-sm">
+          <div className="w-full h-full overflow-y-auto py-8 px-4">
+            <div className="mx-auto w-full max-w-2xl">
               <DialogHeader>
                 <DialogTitle>Create a room</DialogTitle>
               </DialogHeader>
-              <div className="space-y-3">
+              <div className="mt-4 space-y-4">
                 <input
-                  className="w-full border rounded px-2 py-1 text-sm bg-background"
+                  className="w-full border rounded px-3 py-2 text-sm bg-background"
                   placeholder="Room title (optional)"
                   value={createTitle}
                   onChange={(e) => setCreateTitle(e.target.value)}
                 />
                 <div>
-                  <div className="text-xs font-medium mb-1">Users</div>
-                  <div className="max-h-40 overflow-auto space-y-1 border rounded p-2">
+                  <div className="text-sm font-medium mb-2">Users</div>
+                  <div className="space-y-2">
                     {connections.map((c: any) => (
-                      <label key={c.id} className="flex items-center gap-2 text-sm">
+                      <label key={c.id} className="flex items-center gap-3 py-2 text-sm cursor-pointer">
                         <Checkbox checked={selectedUsers.has(c.id)} onCheckedChange={(v) => {
                           const s = new Set(selectedUsers); if (v) s.add(c.id); else s.delete(c.id); setSelectedUsers(s);
                         }} />
+                        <Avatar className="h-8 w-8">
+                          <AvatarImage src={c.avatarUrl} />
+                          <AvatarFallback className="text-xs">{(c.displayName || c.handle || 'U').slice(0,1).toUpperCase()}</AvatarFallback>
+                        </Avatar>
                         <span>{c.displayName || c.handle || c.id.slice(0,8)}</span>
                       </label>
                     ))}
                   </div>
                 </div>
                 <div>
-                  <div className="text-xs font-medium mb-1">Agents</div>
-                  <div className="max-h-40 overflow-auto space-y-1 border rounded p-2">
+                  <div className="text-sm font-medium mb-2">Agents</div>
+                  <div className="space-y-2">
                     {agents.map((a: any) => (
-                      <label key={a.id} className="flex items-center gap-2 text-sm">
+                      <label key={a.id} className="flex items-center gap-3 py-2 text-sm cursor-pointer">
                         <Checkbox checked={selectedAgents.has(a.id)} onCheckedChange={(v) => {
                           const s = new Set(selectedAgents); if (v) s.add(a.id); else s.delete(a.id); setSelectedAgents(s);
                         }} />
+                        <Avatar className="h-8 w-8">
+                          <AvatarImage src={a.avatar} />
+                          <AvatarFallback className="text-xs">{(a.name || 'A').slice(0,1).toUpperCase()}</AvatarFallback>
+                        </Avatar>
                         <span>{a.name}</span>
                       </label>
                     ))}
                   </div>
                 </div>
+                <div className="pt-4">
+                  <button
+                    disabled={creating}
+                    className="w-full text-sm border rounded px-4 py-2 disabled:opacity-50"
+                    onClick={async () => {
+                      try {
+                        setCreating(true);
+                        const uid = (session as any)?.userId || (session as any)?.user?.email;
+                        const headers = { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) } as any;
+                        const participants: string[] = Array.from(selectedUsers);
+                        const agentIds: string[] = Array.from(selectedAgents);
+                        const res = await fetch('/api/rooms', {
+                          method: 'POST', headers, body: JSON.stringify({ kind: 'group', title: createTitle || null, participants, agentIds })
+                        });
+                        const json = await res.json();
+                        setCreating(false);
+                        if (res.ok && json?.id) {
+                          setCreateOpen(false); setCreateTitle(''); setSelectedUsers(new Set()); setSelectedAgents(new Set());
+                          await loadData();
+                          window.location.href = `/c/${json.id}`;
+                        }
+                      } catch { setCreating(false); }
+                    }}
+                  >{creating ? 'Creating...' : 'Create'}</button>
+                </div>
               </div>
-              <DialogFooter>
-                <button
-                  disabled={creating}
-                  className="text-xs border rounded px-3 py-1"
-                  onClick={async () => {
-                    try {
-                      setCreating(true);
-                      const uid = (session as any)?.userId || (session as any)?.user?.email;
-                      const headers = { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) } as any;
-                      const participants: string[] = Array.from(selectedUsers);
-                      const agentIds: string[] = Array.from(selectedAgents);
-                      const res = await fetch('/api/rooms', {
-                        method: 'POST', headers, body: JSON.stringify({ kind: 'group', title: createTitle || null, participants, agentIds })
-                      });
-                      const json = await res.json();
-                      setCreating(false);
-                      if (res.ok && json?.id) {
-                        setCreateOpen(false); setCreateTitle(''); setSelectedUsers(new Set()); setSelectedAgents(new Set());
-                        await loadData();
-                        window.location.href = `/c/${json.id}`;
-                      }
-                    } catch { setCreating(false); }
-                  }}
-                >Create</button>
-              </DialogFooter>
             </div>
           </div>
         </DialogContent>
@@ -517,32 +650,67 @@ export function NavProjects() {
 
       {/* Add Private Message dialog (users + agents) */}
       <Dialog open={addPmOpen} onOpenChange={setAddPmOpen}>
-        <DialogContent className="sm:max-w-none w-screen h-screen p-0 bg-transparent">
-          <div className="w-full h-full flex items-center justify-center p-6">
-            <div className="w-full max-w-md bg-background border rounded-lg p-4 shadow-lg">
+        <DialogContent className="sm:max-w-none w-screen h-screen p-0 bg-background/70 backdrop-blur-sm">
+          <div className="w-full h-full overflow-y-auto py-8 px-4">
+            <div className="mx-auto w-full max-w-2xl">
               <DialogHeader>
                 <DialogTitle>Start a private message</DialogTitle>
               </DialogHeader>
-              <div className="space-y-2">
+              <div className="mt-4 space-y-3">
                 {loadingActors && <div className="text-xs text-muted-foreground">Loading…</div>}
                 {!loadingActors && (
-                  <div className="max-h-64 overflow-auto space-y-1">
-                    {[...allActors.filter(a => a.type === 'user'), ...allActors.filter(a => a.type === 'agent')].map(a => (
-                      <div key={a.id} className="flex items-center justify-between border rounded px-2 py-1 text-sm">
-                        <div className="flex items-center gap-2 min-w-0">
-                          <Avatar className="h-5 w-5">
-                            <AvatarImage src={typeof a.avatarUrl === 'string' ? a.avatarUrl : undefined} />
-                            <AvatarFallback className="text-[10px]">{(a.displayName || a.handle || (a.type === 'agent' ? 'A' : 'U')).slice(0,1).toUpperCase()}</AvatarFallback>
-                          </Avatar>
-                          <div className="truncate">{a.displayName || a.handle || a.id.slice(0,8)}</div>
+                  <div className="space-y-3">
+                    {[...allActors.filter(a => a.type === 'user'), ...allActors.filter(a => a.type === 'agent')].map(a => {
+                      // Build comprehensive set of connection identifiers (actor ID and ownerUserId)
+                      const connectionIds = new Set<string>()
+                      for (const c of allConnections) {
+                        if (c.id) connectionIds.add(c.id)
+                        // Also include ownerUserId for user actors to handle canonical user matching
+                        if (c.type === 'user' && (c as any).ownerUserId) {
+                          connectionIds.add((c as any).ownerUserId)
+                        }
+                      }
+                      
+                      const outgoingPendingIds = new Set(outgoingPending.map(r => r.toActorId))
+                      const outgoingAgentAccessPendingIds = new Set(outgoingAgentAccessPending.map(r => r.toActorId))
+                      const isMe = a.id === myActorId || (a.type === 'user' && a.ownerUserId && a.ownerUserId === myOwnerUserId)
+                      
+                      // Check connection by actor ID or ownerUserId
+                      const isConnected = connectionIds.has(a.id) || (a.type === 'user' && a.ownerUserId && connectionIds.has(a.ownerUserId))
+                      const isPending = a.type === 'agent' ? outgoingAgentAccessPendingIds.has(a.id) : outgoingPendingIds.has(a.id)
+                      
+                      return (
+                        <div key={a.id} className="flex items-center justify-between py-2 text-sm">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <Avatar className="h-8 w-8">
+                              <AvatarImage src={typeof a.avatarUrl === 'string' ? a.avatarUrl : undefined} />
+                              <AvatarFallback className="text-xs">{(a.displayName || a.handle || (a.type === 'agent' ? 'A' : 'U')).slice(0,1).toUpperCase()}</AvatarFallback>
+                            </Avatar>
+                            <div className="min-w-0">
+                              <div className="font-medium truncate">{a.displayName || a.handle || a.id.slice(0,8)}</div>
+                              <div className="text-xs text-muted-foreground">{a.type === 'agent' ? 'agent' : 'user'}{a.handle ? ` · @${a.handle}` : ''}</div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {isMe ? (
+                              <button className="text-xs border rounded px-2 py-1 opacity-50 cursor-not-allowed" disabled>You</button>
+                            ) : isConnected ? (
+                              <>
+                                <button className="text-xs border rounded px-2 py-1" onClick={() => messageActor(a.id)}>Message</button>
+                                <button className="text-xs border rounded px-2 py-1" onClick={() => disconnectFromActor(a.id)}>Disconnect</button>
+                              </>
+                            ) : isPending ? (
+                              <button className="text-xs border rounded px-2 py-1" onClick={() => cancelRequest(a)}>Cancel</button>
+                            ) : (
+                              <button className="text-xs border rounded px-2 py-1" onClick={() => {
+                                if (a.type === 'agent') requestAgentAccess(a)
+                                else connectToUser(a.id)
+                              }}>Connect</button>
+                            )}
+                          </div>
                         </div>
-                        {a.type === 'user' ? (
-                          <button className="text-xs border rounded px-2 py-0.5" onClick={async () => { await connectToUser(a.id); setAddPmOpen(false); }}>Message</button>
-                        ) : (
-                          <button className="text-xs border rounded px-2 py-0.5" onClick={async () => { await requestAgentAccess(a); setAddPmOpen(false); }}>Message</button>
-                        )}
-                      </div>
-                    ))}
+                      )
+                    })}
                   </div>
                 )}
               </div>

@@ -36,8 +36,9 @@ export function parseAgentPersona(agent: any): { agentName: string; persona: str
 
 export function buildMemoryContextFromLongTerm(memories: Array<{ content: string }>): string {
   if (!Array.isArray(memories) || memories.length === 0) return '';
-  const lines = memories.map(m => `- ${m.content}`).join('\n');
-  return `\nRelevant Context from Previous Conversations:\n${lines}`;
+  const take = memories.slice(0, 3);
+  const lines = take.map(m => `- ${m.content}`).join('\n');
+  return `\nConversation context so far (summarized):\n${lines}`;
 }
 
 export function buildUserProfileContext(userProfile: any): string {
@@ -137,7 +138,7 @@ ${memoryContext}`;
 }
 
 export function buildMessagesFromShortTerm(shortTerm: any[]): Array<{ role: 'user'|'assistant'|'system'; content: string }> {
-  const recent = Array.isArray(shortTerm) ? shortTerm.slice(-10) : [];
+  const recent = Array.isArray(shortTerm) ? shortTerm.slice(-20) : [];
   const mapped = recent.map((msg: any) => {
     if (msg.role === 'terminal') {
       return { role: 'system' as const, content: `Terminal output:\n${msg.content}` };

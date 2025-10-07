@@ -91,6 +91,8 @@ export class AgentOrchestrator {
       autoExecuteTools: !!autoExecuteTools,
       toolPreferences,
     });
+    // Selection memory instructions for pronoun resolution
+    systemContent += `\nCONVERSATION AWARENESS\n- The room maintains a selected article URL when the user says \"read 2\" or similar.\n- If the user references \"this\", \"that\", \"it\", or \"the article\" without a URL, assume they mean the most recently selected article for this room.\n- If no article has been selected in this room yet, ask a single clarifying question: \"Which result number should I open (1-10)?\".\n- After fetching content, use the agent persona to write a brief on-air segment before proposing narration via @elevenlabs.\nTOOL CONTEXT\n- When you say \"Should I run serpapi...\", the UI interprets this as asking approval to run the tool. After approval you will receive either Markdown with [View](url) links or a structured resultId and links list.\n- After results are shown, ask the user to pick a number if they don’t specify which item to read.\n`;
     const shortTermMsgs = buildMessagesFromShortTerm(shortTerm);
 
     const maxSteps = Math.max(1, Math.min(20, runOptions?.maxSteps ?? 6));

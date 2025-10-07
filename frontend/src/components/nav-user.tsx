@@ -11,6 +11,7 @@ import {
   Moon,
   Sun,
   Wrench,
+  Bot,
 } from "lucide-react"
 
 import {
@@ -96,6 +97,12 @@ export function NavUser({
                     <Link href="/profile">
                       <User />
                       Profile
+                    </Link>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem asChild>
+                    <Link href="/agents">
+                      <Bot />
+                      Agent Studio
                     </Link>
                   </DropdownMenuItem>
                   <DropdownMenuItem asChild>

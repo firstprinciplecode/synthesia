@@ -1,5 +1,5 @@
 "use client";
-import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useRef, useState } from "react";
 // import Link from "next/link";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -13,9 +13,84 @@ import { AvatarImage } from "@/components/ui/avatar";
 import { useSearchParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Search } from "lucide-react";
+
+// Simple loading dots component
+function LoadingDots() {
+  return (
+    <div className="flex items-center gap-1">
+      <div className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-pulse" style={{ animationDelay: '0ms', animationDuration: '1.4s' }} />
+      <div className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-pulse" style={{ animationDelay: '200ms', animationDuration: '1.4s' }} />
+      <div className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-pulse" style={{ animationDelay: '400ms', animationDuration: '1.4s' }} />
+    </div>
+  );
+}
+
+// Replace bare URLs with a short markdown link label to avoid overflow
+function wrapBareUrlsWithView(text: string): string {
+  try {
+    // Replace standalone http(s) URLs not already in markdown links with [View](url)
+    // Matches start-of-line or whitespace followed by URL, ending before whitespace
+    return text.replace(/(^|[\s@])(https?:\/\/[^\s)]+)(?=$|\s)/g, (m, prefix, url) => {
+      // If the prefix was an '@', drop it (treat as prefix hint) otherwise keep spacing
+      const pre = prefix === '@' ? '' : prefix;
+      return `${pre}[View](${url})`;
+    });
+  } catch {
+    return text;
+  }
+}
+
+// Extract sources from markdown text
+function extractSources(text: string): { url: string; title: string }[] {
+  const sources: { url: string; title: string }[] = [];
+  const sourcesMatch = text.match(/Sources?:\s*([\s\S]*?)(?:\n\n|$)/i);
+  if (sourcesMatch) {
+    const sourcesText = sourcesMatch[1];
+    const linkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
+    let match;
+    while ((match = linkRegex.exec(sourcesText)) !== null) {
+      sources.push({ title: match[1], url: match[2] });
+    }
+  }
+  return sources;
+}
+
+// Remove sources section from markdown
+function removeSources(text: string): string {
+  return text.replace(/\n*Sources?:\s*[\s\S]*?(?=\n\n|$)/i, '').trim();
+}
+
+// Get favicon URL for a domain
+function getFaviconUrl(url: string): string {
+  try {
+    const domain = new URL(url).hostname;
+    return `https://www.google.com/s2/favicons?domain=${domain}&sz=32`;
+  } catch {
+    return '';
+  }
+}
+
+// Extract URL from text (prioritize first URL found), supports [View](url)
+function extractUrl(text: string): string | null {
+  const str = String(text || '');
+  // 1) markdown link
+  const md = str.match(/\]\((https?:\/\/[^\s)]+)\)/);
+  if (md) return md[1];
+  // 2) bare url
+  const match = str.match(/https?:\/\/[^\s)]+/);
+  return match ? match[0] : null;
+}
+
+// Check if URL is an image
+function isImageUrl(url: string): boolean {
+  return /\.(jpg|jpeg|png|gif|webp|bmp)(\?.*)?$/i.test(url);
+}
 
 // Preprocess markdown to clean up mixed list formats
 function preprocessMarkdown(text: string): string {
+  // First, normalize bare URLs into short "View" links to prevent overflow
+  text = wrapBareUrlsWithView(text);
   // First, handle the specific case of malformed nested lists
   // This fixes cases where agents generate "1. - Item" or similar patterns
   text = text.replace(/^\d+\.\s*[-*+]\s+/gm, (match) => {
@@ -107,12 +182,31 @@ function FeedContent() {
   const [hasMore, setHasMore] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [page, setPage] = useState(0);
+  // Search UI state
+  const [searchOpen, setSearchOpen] = useState(true);
+  useEffect(() => {
+    try {
+      const tab = (search?.get('tab') || '').toLowerCase();
+      if (tab && tab !== 'search') setSearchOpen(false);
+      if (tab === 'search') setSearchOpen(true);
+    } catch {}
+  }, [search]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchNotes, setSearchNotes] = useState<string[]>([]);
+  const [searchPostId, setSearchPostId] = useState<string | null>(null);
+  type AgentThread = { agentId: string; agentName?: string; agentAvatar?: string; initialReply: string; conversation: Reply[] };
+  const [searchThread, setSearchThread] = useState<{ question: string; agentThreads: AgentThread[]; imageDescription?: string } | null>(null);
+  const [searchReplyOpenForAgent, setSearchReplyOpenForAgent] = useState<string | null>(null);
+  const [waitingForAgentReply, setWaitingForAgentReply] = useState<Record<string, boolean>>({});
   // Track which post is open; reserved for future inline reply UX
   // const [openPostId, setOpenPostId] = useState<string | null>(null);
   type Reply = { id: string; postId: string; authorType: 'user' | 'agent'; authorId: string; authorName?: string; authorAvatar?: string; text: string; createdAt: string };
   const [repliesByPost, setRepliesByPost] = useState<Record<string, Reply[]>>({});
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
   const [replyComposerOpen, setReplyComposerOpen] = useState<Record<string, boolean>>({});
+  const [replyingToPost, setReplyingToPost] = useState<Record<string, boolean>>({});
   const abortRef = useRef<AbortController | null>(null);
   const [meName, setMeName] = useState<string>("");
   const [meAvatar, setMeAvatar] = useState<string>("");
@@ -393,6 +487,7 @@ function FeedContent() {
     const temp: Reply = { id: `tmp_${Date.now()}`, postId, authorType: 'user', authorId: String(uid || 'me'), text: textValue, createdAt: new Date().toISOString(), authorName: meName || (session as unknown as { user?: { name?: string; email?: string } })?.user?.name || (session as unknown as { user?: { email?: string } })?.user?.email || 'You', authorAvatar: meAvatar };
     setRepliesByPost((m) => ({ ...m, [postId]: [ ...(m[postId] || []), temp ] }));
     setReplyDrafts((d) => ({ ...d, [postId]: '' }));
+    setReplyingToPost((prev) => ({ ...prev, [postId]: true }));
     try {
       const res = await fetch(`/api/feed/${encodeURIComponent(postId)}/replies`, { method: 'POST', headers, body: JSON.stringify({ text: textValue }) });
       if (!res.ok) throw new Error('reply failed');
@@ -405,6 +500,8 @@ function FeedContent() {
           if (Array.isArray(j?.replies)) setRepliesByPost((m) => ({ ...m, [postId]: j.replies }));
         }
       } catch {}
+    } finally {
+      setReplyingToPost((prev) => ({ ...prev, [postId]: false }));
     }
   };
 
@@ -417,38 +514,523 @@ function FeedContent() {
     setStopLoading((m) => ({ ...m, [postId]: false }));
   };
 
+  async function runSearch() {
+    try {
+      setSearching(true);
+      setSearchError(null);
+      setSearchNotes([]);
+      const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (uid) headers['x-user-id'] = uid;
+      const question = searchQuery.trim();
+      if (!question) { setSearching(false); return; }
+      
+      // Immediately show the search card with empty agent threads
+      const tempPostId = `search-${Date.now()}`;
+      setSearchPostId(tempPostId);
+      setSearchThread({ question, agentThreads: [] });
+      setSearchQuery('');
+      
+      // Send to backend private search
+      const res = await fetch('/api/feed/search', { method: 'POST', headers, body: JSON.stringify({ query: question }) });
+      if (!res.ok) throw new Error('search failed');
+      const j = await res.json();
+      const pid: string | undefined = j?.postId;
+      setSearchPostId(pid || tempPostId);
+      
+      // Extract image description from first agent response and strip it from display
+      let imageDescription: string | undefined;
+      const agentThreads: AgentThread[] = Array.isArray(j?.results) ? j.results.map((r: any, idx: number) => {
+        let displayText = r.text;
+        // For the first agent response about an image, extract description
+        if (idx === 0 && /https?:\/\/\S+\.(?:jpg|jpeg|png|gif|webp|bmp)(?:\?\S*)?/i.test(question)) {
+          const match = displayText.match(/^(The image (?:shows|features|depicts)[^.!?]*[.!?])\s*/i);
+          if (match) {
+            imageDescription = match[1];
+            displayText = displayText.substring(match[0].length).trim();
+          }
+        }
+        return {
+          agentId: r.authorId,
+          agentName: r.authorName,
+          agentAvatar: r.authorAvatar,
+          initialReply: displayText,
+          conversation: []
+        };
+      }) : [];
+      setSearchThread({ question, agentThreads, imageDescription });
+    } catch (e: any) {
+      setSearchError(e?.message || 'Search failed');
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  // Listen for live agent replies to the search postId and append to the correct agent's thread
+  useEffect(() => {
+    if (!searchPostId || !searchThread) return;
+    const ws = new WebSocket(process.env.NEXT_PUBLIC_WS_URL || '');
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(String(evt.data || '{}'));
+        console.log('[Search WS] Received:', msg);
+        if (msg?.method === 'feed.reply' && msg.params?.postId === searchPostId) {
+          console.log('[Search WS] Matched postId, adding reply');
+          const newReply: Reply = {
+            id: String(msg.params?.id || `tmp_${Date.now()}`),
+            postId: searchPostId,
+            authorType: (msg.params?.authorType as 'user' | 'agent') || 'agent',
+            authorId: String(msg.params?.authorId || ''),
+            authorName: msg.params?.authorName,
+            authorAvatar: msg.params?.authorAvatar,
+            text: String(msg.params?.text || ''),
+            createdAt: String(msg.params?.createdAt || new Date().toISOString()),
+          };
+          // Append to the correct agent's conversation thread
+          setSearchThread((prev) => {
+            if (!prev) return null;
+            const agentThreads = prev.agentThreads.map(thread => {
+              if (thread.agentId === newReply.authorId) {
+                return { ...thread, conversation: [...thread.conversation, newReply] };
+              }
+              return thread;
+            });
+            return { ...prev, agentThreads };
+          });
+          // Clear waiting state for this agent
+          setWaitingForAgentReply((prev) => {
+            const next = { ...prev };
+            delete next[newReply.authorId];
+            return next;
+          });
+        }
+      } catch (e) {
+        console.error('[Search WS] Error:', e);
+      }
+    };
+    return () => { try { ws.close(); } catch {} };
+  }, [searchPostId, searchThread]);
+
+  async function submitSearchFollowup() {
+    if (!searchPostId || !searchThread || !searchReplyOpenForAgent) return;
+    const textValue = (replyDrafts[searchPostId] || '').trim();
+    if (!textValue) return;
+    const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (uid) headers['x-user-id'] = uid;
+    // Optimistic update: add user's question to the specific agent's conversation
+    const temp: Reply = { 
+      id: `tmp_${Date.now()}`, 
+      postId: searchPostId, 
+      authorType: 'user', 
+      authorId: String(uid || 'me'), 
+      text: textValue, 
+      createdAt: new Date().toISOString(), 
+      authorName: meName || 'You', 
+      authorAvatar: meAvatar 
+    };
+    setSearchThread((prev) => {
+      if (!prev) return null;
+      const agentThreads = prev.agentThreads.map(thread => {
+        if (thread.agentId === searchReplyOpenForAgent) {
+          return { ...thread, conversation: [...thread.conversation, temp] };
+        }
+        return thread;
+      });
+      return { ...prev, agentThreads };
+    });
+    setReplyDrafts((d) => ({ ...d, [searchPostId]: '' }));
+    setSearchReplyOpenForAgent(null); // Close the reply field
+    setWaitingForAgentReply((prev) => ({ ...prev, [searchReplyOpenForAgent]: true }));
+    try {
+      // Only send the specific agent ID, not all engaged agents
+      const body: any = { text: textValue, engagedAgentIds: [searchReplyOpenForAgent], originalSearchQuery: searchThread.question };
+      console.log('[Search Follow-up] Sending:', { postId: searchPostId, body });
+      const res = await fetch(`/api/feed/${encodeURIComponent(searchPostId)}/replies`, { method: 'POST', headers, body: JSON.stringify(body) });
+      console.log('[Search Follow-up] Response status:', res.status);
+      if (!res.ok) {
+        console.error('[Search Follow-up] Failed:', await res.text());
+      }
+    } catch (e) {
+      console.error('[Search Follow-up] Error:', e);
+    } finally {
+      // Will be cleared when agent response comes via WebSocket
+    }
+  }
+
   return (
-    <SidebarProvider>
+    <SidebarProvider defaultOpen={false}>
       <AppSidebar />
       <SidebarInset>
-        <header className="flex h-16 shrink-0 items-center justify-center gap-2 transition-[width,height] ease-linear group-has-data-[collapsible=icon]/sidebar-wrapper:h-12">
-          <div className="absolute left-4">
+        <header className="flex h-16 shrink-0 items-center gap-2 transition-[width,height] ease-linear group-has-data-[collapsible=icon]/sidebar-wrapper:h-12">
+          {/* Left: sidebar trigger */}
+          <div className="px-4">
             <SidebarTrigger className="-ml-1" />
           </div>
-          <div className="flex items-center bg-muted rounded-full p-0.5">
-            <button
-              onClick={() => setFeedMode('all')}
-              className={`px-3 py-1 text-xs font-medium rounded-full transition-colors ${
-                feedMode === 'all'
-                  ? 'bg-background text-foreground shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
+          {/* Center: pill group fixed in the middle */}
+          <div className="flex-1 flex justify-center">
+            <div className="inline-flex items-center gap-1 rounded-full border border-border bg-muted dark:bg-black/30 dark:border-zinc-800/80 px-1 py-0.5 shadow-sm">
+              <Button
+                aria-label="Search feed"
+                size="sm"
+                variant={searchOpen ? 'default' : 'ghost'}
+                className="!rounded-full !size-7 !p-0 flex items-center justify-center"
+                onClick={() => setSearchOpen((v) => !v)}
+              >
+                <Search className="h-4 w-4" />
+              </Button>
+              <Button
+                variant={!searchOpen && feedMode==='all' ? 'default' : 'ghost'}
+                size="sm"
+                className="!rounded-full h-7 px-3"
+                onClick={()=>{ setSearchOpen(false); setFeedMode('all'); }}
             >
               Everyone
+              </Button>
+              <Button
+                variant={!searchOpen && feedMode==='following' ? 'default' : 'ghost'}
+                size="sm"
+                className="!rounded-full h-7 px-3"
+                onClick={()=>{ setSearchOpen(false); setFeedMode('following'); }}
+              >
+                Following
+              </Button>
+            </div>
+          </div>
+          {/* Right: spacer to balance layout */}
+          <div className="px-4" />
+        </header>
+        {searchOpen ? (
+          searchThread ? (
+            <div className="flex-1 overflow-y-auto">
+              <div className="mx-auto w-full max-w-4xl px-6 pt-4 pb-6 space-y-4">
+                {/* Search result card at top */}
+                <Card className="relative border shadow-sm py-0">
+                  <button 
+                    onClick={() => { setSearchThread(null); setSearchPostId(null); }} 
+                    className="absolute top-2 right-2 size-6 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none"
+                  >
+                    <svg className="h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                    <span className="sr-only">Close</span>
             </button>
+                  <div className="px-3 py-2">
+                    <div className="flex gap-3">
+                      {(() => {
+                        const qUrl = extractUrl(searchThread.question);
+                        const imageMatch = qUrl && isImageUrl(qUrl) ? [qUrl] as any : null;
+                        return imageMatch ? (
+                          <div className="flex-shrink-0">
+                            <img 
+                              src={imageMatch[0]} 
+                              alt={searchThread.imageDescription || "Fashion image"} 
+                              className="max-h-[120px] w-auto rounded-md" 
+                            />
+                          </div>
+                        ) : null;
+                      })()}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <Avatar className="h-6 w-6">
+                            {meAvatar ? <AvatarImage src={meAvatar} /> : null}
+                            <AvatarFallback>{(meName?.[0] || 'U').toUpperCase()}</AvatarFallback>
+                          </Avatar>
+                          <span className="text-sm font-medium">{meName || 'You'}</span>
+                        </div>
+                        <div className="text-sm text-muted-foreground">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={{
+                              a: (props) => <a {...props} target="_blank" rel="noopener noreferrer" className="underline" />,
+                              img: (props) => <img {...props} alt={props.alt || ''} className="max-w-full rounded-md my-2" />,
+                              ul: (props) => <ul {...props} className="list-disc pl-5 space-y-1" />,
+                              ol: (props) => <ol {...props} className="list-decimal pl-5 space-y-1" />,
+                              li: (props) => <li {...props} className="leading-relaxed" />,
+                              p: (props) => <p {...props} className="leading-relaxed mb-0" />,
+                            }}
+                          >
+                            {preprocessMarkdown(searchThread.question)}
+                          </ReactMarkdown>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </Card>
+                
+                {/* Agent threads - each agent has their own conversation */}
+                <div className="space-y-3">
+                  {searchThread.agentThreads.map((thread) => (
+                    <Card key={thread.agentId} className="p-4 border-0 !shadow-none">
+                      <div className="flex items-start gap-3">
+                        <Avatar className="h-8 w-8">
+                          {thread.agentAvatar ? <AvatarImage src={thread.agentAvatar} /> : null}
+                          <AvatarFallback>{(thread.agentName?.[0] || 'A').toUpperCase()}</AvatarFallback>
+                        </Avatar>
+                        <div className="flex-1">
+                          <div className="text-sm font-medium">{thread.agentName || 'Agent'}</div>
+                          <div className="mt-1 text-sm break-words">
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm]}
+                              components={{
+                                a: (props) => <a {...props} target="_blank" rel="noopener noreferrer" className="underline" />,
+                                img: (props) => <img {...props} alt={props.alt || ''} className="max-w-full rounded-md my-2" />,
+                                ul: (props) => <ul {...props} className="list-disc pl-5 space-y-1" />,
+                                ol: (props) => <ol {...props} className="list-decimal pl-5 space-y-1" />,
+                                li: (props) => <li {...props} className="leading-relaxed" />,
+                                p: (props) => <p {...props} className="leading-relaxed mb-2 last:mb-0" />,
+                                strong: (props) => <strong {...props} className="font-semibold" />,
+                                em: (props) => <em {...props} className="italic" />
+                              }}
+                            >
+                              {preprocessMarkdown(removeSources(thread.initialReply))}
+                            </ReactMarkdown>
+                            {/* Source favicons */}
+                            {(() => {
+                              const sources = extractSources(thread.initialReply);
+                              if (sources.length === 0) return null;
+                              return (
+                                <div className="mt-2 flex items-center">
+                                  {sources.map((source, idx) => (
+                                    <a
+                                      key={idx}
+                                      href={source.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      title={source.title}
+                                      className="inline-block w-6 h-6 rounded-full bg-white border-2 border-background shadow-sm hover:z-10 hover:scale-110 transition-transform"
+                                      style={{ marginLeft: idx === 0 ? 0 : '-8px' }}
+                                    >
+                                      <img 
+                                        src={getFaviconUrl(source.url)} 
+                                        alt={source.title}
+                                        className="w-full h-full rounded-full"
+                                        onError={(e) => {
+                                          const target = e.target as HTMLImageElement;
+                                          target.src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>';
+                                        }}
+                                      />
+                                    </a>
+                                  ))}
+                                </div>
+                              );
+                            })()}
+                            {/* Action buttons under source icons for alignment */}
+                            <div className="mt-2 flex items-center gap-3 text-xs">
             <button
-              onClick={() => setFeedMode('following')}
-              className={`px-3 py-1 text-xs font-medium rounded-full transition-colors ${
-                feedMode === 'following'
-                  ? 'bg-background text-foreground shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              Following
+                                className="text-muted-foreground hover:underline" 
+                                onClick={() => setSearchReplyOpenForAgent(searchReplyOpenForAgent === thread.agentId ? null : thread.agentId)}
+                              >
+                                Reply
+                              </button>
+                              <button
+                                className="text-muted-foreground hover:underline"
+                                onClick={async () => {
+                                  try {
+                                    const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+                                    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+                                    if (uid) headers['x-user-id'] = uid as string;
+                                    await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: thread.agentId, toActorId: thread.agentId }) });
+                                  } catch {}
+                                }}
+                              >
+                                Connect
+                              </button>
+                              <button
+                                className="text-muted-foreground hover:underline"
+                                onClick={async () => {
+                                  try {
+                                    if (!searchPostId) return;
+                                    await fetch('/api/monitors/create-for-post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: searchPostId, agentId: thread.agentId }) });
+                                  } catch {}
+                                }}
+                              >
+                                Follow
             </button>
           </div>
-        </header>
+                          </div>
+                          
+                          {/* Conversation thread with this agent */}
+                          {thread.conversation.length > 0 && (
+                            <div className="mt-3 space-y-3">
+                              {thread.conversation.map((reply) => {
+                                const rUrl = reply.authorType === 'user' ? extractUrl(reply.text) : null;
+                                const imageMatch = rUrl && isImageUrl(rUrl) ? [rUrl] as any : null;
+                                return (
+                                  <div key={reply.id} className="flex items-start gap-3">
+                                    <Avatar className="h-8 w-8">
+                                      {reply.authorAvatar ? <AvatarImage src={reply.authorAvatar} /> : null}
+                                      <AvatarFallback>{(reply.authorName?.[0] || (reply.authorType === 'user' ? 'U' : 'A')).toUpperCase()}</AvatarFallback>
+                                    </Avatar>
+                                    <div className="flex-1">
+                                      <div className="text-sm font-medium">{reply.authorName || (reply.authorType === 'user' ? 'You' : 'Agent')}</div>
+                                      {imageMatch && reply.authorType === 'user' ? (
+                                        <div className="mt-2 mb-2">
+                                          <img src={imageMatch[0]} alt="Follow-up" className="max-h-[120px] w-auto rounded-md" />
+                                        </div>
+                                      ) : null}
+                                      <div className="mt-1 text-sm break-words">
+                                        <ReactMarkdown
+                                          remarkPlugins={[remarkGfm]}
+                                          components={{
+                                            a: (props) => <a {...props} target="_blank" rel="noopener noreferrer" className="underline" />,
+                                            img: (props) => <img {...props} alt={props.alt || ''} className="max-w-full rounded-md my-2" />,
+                                            ul: (props) => <ul {...props} className="list-disc pl-5 space-y-1" />,
+                                            ol: (props) => <ol {...props} className="list-decimal pl-5 space-y-1" />,
+                                            li: (props) => <li {...props} className="leading-relaxed" />,
+                                            p: (props) => <p {...props} className="leading-relaxed mb-2 last:mb-0" />,
+                                            strong: (props) => <strong {...props} className="font-semibold" />,
+                                            em: (props) => <em {...props} className="italic" />
+                                          }}
+                                        >
+                                          {preprocessMarkdown(removeSources(reply.text))}
+                                        </ReactMarkdown>
+                                      </div>
+                                      
+                                      {/* Source favicons for follow-up agent replies */}
+                                      {reply.authorType === 'agent' && (() => {
+                                        const sources = extractSources(reply.text);
+                                        if (sources.length === 0) return null;
+                                        return (
+                                          <div className="mt-2 flex items-center">
+                                            {sources.map((source, idx) => (
+                                              <a
+                                                key={idx}
+                                                href={source.url}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                title={source.title}
+                                                className="inline-block w-6 h-6 rounded-full bg-white border-2 border-background shadow-sm hover:z-10 hover:scale-110 transition-transform"
+                                                style={{ marginLeft: idx === 0 ? 0 : '-8px' }}
+                                              >
+                                                <img 
+                                                  src={getFaviconUrl(source.url)} 
+                                                  alt={source.title}
+                                                  className="w-full h-full rounded-full"
+                                                  onError={(e) => {
+                                                    const target = e.target as HTMLImageElement;
+                                                    target.src = 'data:image/svg+xml,<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M12 16v-4M12 8h.01\"/></svg>';
+                                                  }}
+                                                />
+                                              </a>
+                                            ))}
+                                          </div>
+                                        );
+                                      })()}
 
+                                      {/* Actions for agent reply - aligned with text container */}
+                                      {reply.authorType === 'agent' && reply.authorId ? (
+                                        <div className="mt-2 flex items-center gap-3 text-xs">
+                                          <button 
+                                            className="text-muted-foreground hover:underline" 
+                                            onClick={() => setSearchReplyOpenForAgent(searchReplyOpenForAgent === thread.agentId ? null : thread.agentId)}
+                                          >
+                                            Reply
+                                          </button>
+                                          <button
+                                            className="text-muted-foreground hover:underline"
+                                            onClick={async () => {
+                                              try {
+                                                const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+                                                const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+                                                if (uid) headers['x-user-id'] = uid as string;
+                                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: reply.authorId, toActorId: reply.authorId }) });
+                                              } catch {}
+                                            }}
+                                          >
+                                            Connect
+                                          </button>
+                                          <button
+                                            className="text-muted-foreground hover:underline"
+                                            onClick={async () => {
+                                              try {
+                                                if (!searchPostId) return;
+                                                await fetch('/api/monitors/create-for-post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: searchPostId, agentId: reply.authorId }) });
+                                              } catch {}
+                                            }}
+                                          >
+                                            Follow
+                                          </button>
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          
+                          {/* Loading indicator for agent response */}
+                          {waitingForAgentReply[thread.agentId] ? (
+                            <div className="mt-3 flex items-center gap-2 text-sm text-muted-foreground">
+                              <LoadingDots />
+                              <span>Waiting for response...</span>
+                            </div>
+                          ) : null}
+                          
+                          {/* Action buttons moved above */}
+                          
+                          {/* Reply composer */}
+                          {searchReplyOpenForAgent === thread.agentId ? (
+                            <div className="mt-3">
+                              <div className="flex-1">
+                                <Textarea 
+                                  rows={2} 
+                                  placeholder="Ask a follow-up…" 
+                                  value={replyDrafts[searchPostId || ''] || ''} 
+                                  onChange={(e) => setReplyDrafts((d) => ({ ...d, [searchPostId || '']: e.target.value }))} 
+                                  onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitSearchFollowup(); } }}
+                                />
+                                <div className="mt-2 flex justify-end gap-2">
+                                  <Button size="sm" variant="ghost" onClick={() => setSearchReplyOpenForAgent(null)}>Cancel</Button>
+                                  <Button size="sm" onClick={submitSearchFollowup}>Send</Button>
+                                </div>
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    </Card>
+                  ))}
+                  {searching && searchThread.agentThreads.length === 0 ? (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground px-4 py-4">
+                      <LoadingDots />
+                      <span>Finding interested agents...</span>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="flex-1 flex items-start justify-center px-4 pt-60">
+              <div className="w-full max-w-xl">
+                <div className="flex justify-center mb-6">
+                  <img src="/geese.svg" alt="Geese" className="w-32 h-32 invert dark:invert-0" />
+                </div>
+                <div className="flex items-center gap-2 border rounded-full px-3 py-2 bg-background/70">
+                  <Search className="w-4 h-4 text-muted-foreground" />
+                  <input
+                    autoFocus
+                    value={searchQuery}
+                    onChange={(e)=>setSearchQuery(e.target.value)}
+                    onKeyDown={(e)=>{ if(e.key==='Enter'){ e.preventDefault(); runSearch(); } if(e.key==='Escape'){ setSearchOpen(false); setSearchThread(null); } }}
+                    placeholder="What would you like to know?"
+                    className="flex-1 bg-transparent outline-none text-sm"
+                  />
+                  <button 
+                    className="h-9 w-9 rounded-full bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:pointer-events-none flex items-center justify-center flex-shrink-0 transition-colors"
+                    style={{ borderRadius: '50%' }}
+                    onClick={runSearch} 
+                    disabled={searching || !searchQuery.trim()}
+                  >
+                    <Search className="w-4 h-4" />
+                  </button>
+                </div>
+                {searchError ? <div className="mt-2 text-xs text-red-500 text-center">{searchError}</div> : null}
+              </div>
+            </div>
+          )
+        ) : (
         <div className="mx-auto w-full max-w-4xl px-6 pt-2 pb-6 space-y-4">
 
           <Card className="p-4 w-full border-0 !shadow-none">
@@ -509,6 +1091,13 @@ function FeedContent() {
         ) : null}
       </Card>
 
+      {posting ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground px-4 py-3">
+          <LoadingDots />
+          <span>Posting...</span>
+        </div>
+      ) : null}
+
       <div className="space-y-4">
         {loading && posts.length === 0 ? (
           <div className="text-sm text-muted-foreground">Loading…</div>
@@ -551,6 +1140,33 @@ function FeedContent() {
                   >
                     {preprocessMarkdown(p.text)}
                   </ReactMarkdown>
+                  {(() => {
+                    try {
+                      const url = extractUrl(p.text);
+                      if (!url) return null;
+                      
+                      if (isImageUrl(url)) {
+                        return (
+                          <div className="mt-2 mb-1">
+                            <img src={url} alt="Linked image" className="max-h-[120px] w-auto rounded-md" />
+                          </div>
+                        );
+                      }
+                      
+                      // Link preview for non-image URLs
+                      return (
+                        <a href={url} target="_blank" rel="noopener noreferrer" className="mt-2 mb-1 block">
+                          <div className="border rounded-md p-3 hover:bg-muted/50 transition-colors">
+                            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                              <img src={getFaviconUrl(url)} alt="" className="w-4 h-4 flex-shrink-0" />
+                              <span className="truncate">{new URL(url).hostname}</span>
+                            </div>
+                            <div className="mt-1 text-sm font-medium break-all">{url}</div>
+                          </div>
+                        </a>
+                      );
+                    } catch { return null; }
+                  })()}
                 </div>
                 {(repliesByPost[p.id]?.length || 0) > 0 ? (
                   <div className="mt-1 space-y-1">
@@ -609,6 +1225,33 @@ function FeedContent() {
                         <div className="flex-1">
                           <div className="text-sm">{r.authorName ? `${r.authorName} • ` : ''}<span className="text-xs text-muted-foreground">{new Date(r.createdAt).toLocaleString()}</span></div>
                           <div className="text-sm break-words">
+                            {(() => {
+                              try {
+                                const url = extractUrl(r.text);
+                                if (!url) return null;
+                                
+                                if (isImageUrl(url)) {
+                                  return (
+                                    <div className="mt-2 mb-2">
+                                      <img src={url} alt="Linked image" className="max-h-[120px] w-auto rounded-md" />
+                                    </div>
+                                  );
+                                }
+                                
+                                // Link preview for non-image URLs
+                                return (
+                                  <a href={url} target="_blank" rel="noopener noreferrer" className="mt-2 mb-2 block">
+                                    <div className="border rounded-md p-3 hover:bg-muted/50 transition-colors">
+                                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                                        <img src={getFaviconUrl(url)} alt="" className="w-4 h-4 flex-shrink-0" />
+                                        <span className="truncate">{new URL(url).hostname}</span>
+                                      </div>
+                                      <div className="mt-1 text-sm font-medium break-all">{url}</div>
+                                    </div>
+                                  </a>
+                                );
+                              } catch { return null; }
+                            })()}
                             <ReactMarkdown
                               remarkPlugins={[remarkGfm]}
                               components={{
@@ -697,6 +1340,12 @@ function FeedContent() {
                         </div>
                       </div>
                     ) : null}
+                    {replyingToPost[p.id] ? (
+                      <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
+                        <LoadingDots />
+                        <span>Waiting for agent response...</span>
+                      </div>
+                    ) : null}
                   </div>
                 ) : (
                   <div className="mt-3">
@@ -719,7 +1368,14 @@ function FeedContent() {
                           </div>
                         </div>
                       </div>
-                    ) : (
+                    ) : null}
+                    {replyingToPost[p.id] ? (
+                      <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
+                        <LoadingDots />
+                        <span>Waiting for agent response...</span>
+                      </div>
+                    ) : null}
+                    {!replyComposerOpen[p.id] && !replyingToPost[p.id] ? (
                       <div className="flex items-center gap-3 text-xs whitespace-nowrap">
                         <button className="text-muted-foreground hover:underline" onClick={() => setReplyComposerOpen((m) => ({ ...m, [p.id]: true }))}>Reply</button>
                         {p.authorType === 'agent' ? (
@@ -765,7 +1421,7 @@ function FeedContent() {
                           )
                         ) : null}
                       </div>
-                    )}
+                    ) : null}
                   </div>
                 )}
               </div>
@@ -791,6 +1447,7 @@ function FeedContent() {
         )}
       </div>
         </div>
+        )}
       </SidebarInset>
     </SidebarProvider>
   );

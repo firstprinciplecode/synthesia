@@ -191,13 +191,18 @@ export function ChatInterface({
         const rm = await fetch(`${base}/api/rooms/${encodeURIComponent(currentRoom)}`, { cache: 'no-store', ...(headers ? { headers } : {}) });
         if (rm.ok) {
           const data = await rm.json();
-          if ((data?.room?.kind === 'dm' || data?.room?.kind === 'agent_chat') && data.dm?.title) {
+          const kind = data?.room?.kind;
+          if ((kind === 'dm' || kind === 'agent_chat') && data.dm?.title) {
             const avatar = data.dm.avatar as string | undefined;
             const resolved = avatar ? (avatar.startsWith('/') ? `${base}${avatar}` : avatar) : undefined;
             if (!cancelled) setAgentMeta({ name: data.dm.title, avatarUrl: resolved });
-            if (!cancelled) setRoomKind(data?.room?.kind === 'dm' ? 'dm' : 'agent_chat');
+            if (!cancelled) setRoomKind(kind === 'dm' ? 'dm' : 'agent_chat');
             return;
           }
+          // Group/multi-agent room: no agent metadata fetch
+          if (!cancelled) setAgentMeta({});
+          if (!cancelled) setRoomKind(kind || 'group');
+          return;
         }
         // Fallback to agent metadata
         const res = await fetch(`${base}/api/agents/${encodeURIComponent(currentRoom)}`, { cache: 'no-store', ...(headers ? { headers } : {}) });
@@ -392,7 +397,7 @@ export function ChatInterface({
     });
   }, [agentMeta]);
 
-  // After participants are set, backfill user labels for any user messages missing them
+  // After participants are set, backfill user labels and avatars for any user messages missing them
   useEffect(() => {
     setMessages(prev => {
       let changed = false;
@@ -406,6 +411,29 @@ export function ChatInterface({
             const base = getHttpBaseFromWs(WEBSOCKET_URL);
             const avatar = p.avatar && typeof p.avatar === 'string' && p.avatar.startsWith('/') ? `${base}${p.avatar}` : p.avatar;
             return { ...(m as any), userName: p.name, ...(avatar ? { userAvatar: avatar } : {}) };
+          }
+        }
+        return m;
+      });
+      return changed ? updated : prev;
+    });
+  }, [participants]);
+
+  // After participants are set, backfill agent avatars for any agent messages
+  useEffect(() => {
+    setMessages(prev => {
+      let changed = false;
+      const updated = prev.map(m => {
+        if (m.role === 'assistant') {
+          const aid = (m as any).authorId as string | undefined;
+          const p = participantsRef.current.find(p => p.type === 'agent' && p.id === aid);
+          if (p && p.avatar) {
+            const current = (m as any).agentAvatar as string | undefined;
+            // Only update if missing or different
+            if (!current || current !== p.avatar) {
+              changed = true;
+              return { ...(m as any), agentName: p.name || (m as any).agentName, agentAvatar: p.avatar };
+            }
           }
         }
         return m;
@@ -1105,12 +1133,13 @@ export function ChatInterface({
           temp: true,
         };
         
-        // DM rooms or rooms without agents: do NOT add assistant placeholder
+        // Only show an assistant typing placeholder when we can predict a response:
+        // - Single-agent rooms (direct agent chats)
+        // - Explicit @mentions (including @all)
         const agentCount = participantsRef.current.filter(p => p.type === 'agent').length;
-        const isAgentless = agentCount === 0;
-        const hasMentions = /@\w+/.test(content);
-        const isMultiAgent = agentCount > 1;
-        const shouldShowPlaceholder = !isAgentless && (!isMultiAgent || !hasMentions || !!agentMeta.name);
+        const isSingleAgentRoom = (roomKind === 'agent_chat') || agentCount === 1;
+        const hasExplicitMention = /(^|\W)@\w+/.test(content) || /(^|\W)@all(\W|$)/i.test(content);
+        const shouldShowPlaceholder = (isSingleAgentRoom && !!agentMeta.name) || hasExplicitMention;
         
         let assistantLoader = null;
         if (shouldShowPlaceholder) {
@@ -1555,7 +1584,6 @@ export function ChatInterface({
         "flex-1 w-full pt-2 gap-2 pb-20 flex flex-col overflow-hidden",
         rightOpen ? "md:pr-[var(--sidebar-width)]" : "md:pr-0"
       )}>
-
       <MessagesPanel
           allMessages={allMessages}
           pendingTerminalSuggestions={pendingTerminalSuggestions}

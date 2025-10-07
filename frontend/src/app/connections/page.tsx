@@ -32,6 +32,7 @@ export default function ConnectionsPage() {
   const [query, setQuery] = useState('');
   const [agentMap, setAgentMap] = useState<Record<string, any>>({});
   const [accessibleAgentIds, setAccessibleAgentIds] = useState<Set<string>>(new Set());
+  const [ownedAgentIds, setOwnedAgentIds] = useState<Set<string>>(new Set());
 
   const loadAll = useCallback(async function loadAll() {
     if (!uid) return;
@@ -72,6 +73,8 @@ export default function ConnectionsPage() {
       const allAgents = Array.isArray(agentsJson?.agents) ? agentsJson.agents : (Array.isArray(agentsJson) ? agentsJson : []);
       const m: Record<string, any> = {};
       for (const a of allAgents) m[a.id] = a;
+      // Track owned agent ids strictly from /api/agents (owner only)
+      try { setOwnedAgentIds(new Set(allAgents.map((ag: any) => String(ag.id)))); } catch {}
       try {
         const acc = await accessibleAgentsRes.json();
         const arr = Array.isArray(acc?.agents) ? acc.agents : [];
@@ -94,11 +97,8 @@ export default function ConnectionsPage() {
   const connectionIds = useMemo(() => new Set(connections.map(c => c.id)), [connections]);
   const outgoingPendingIds = useMemo(() => new Set(outgoingPending.map(r => r.toActorId)), [outgoingPending]);
   const outgoingAgentAccessPendingIds = useMemo(() => new Set(outgoingAgentAccessPending.map(r => r.toActorId)), [outgoingAgentAccessPending]);
-  const myAgentIds = useMemo(() => {
-    const ids: string[] = [];
-    for (const [aid, ag] of Object.entries(agentMap)) ids.push(aid);
-    return new Set(ids);
-  }, [agentMap]);
+  // Owned agent ids come only from /api/agents (not from accessible merge)
+  const myAgentIds = ownedAgentIds;
 
   // Choose a single preferred actor per agentId (prefer Owned > Accessible > other)
   const preferredActorIdByAgentId = useMemo(() => {
@@ -184,6 +184,35 @@ export default function ConnectionsPage() {
       const json = await res.json();
       const roomId = json?.roomId as string | undefined;
       if (roomId) window.location.href = `/c/${roomId}`;
+    } catch {}
+  }
+
+  async function messageAgent(agentId: string) {
+    if (!uid) return;
+    try {
+      const res = await fetch('/api/rooms/agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-user-id': uid },
+        body: JSON.stringify({ agentId }),
+      });
+      const json = await res.json();
+      const roomId = json?.roomId as string | undefined;
+      if (roomId) window.location.href = `/c/${roomId}`;
+    } catch {}
+  }
+
+  async function revokeAgentAccess(a: Actor) {
+    if (!uid) return;
+    try {
+      const params = new URLSearchParams();
+      params.set('kind', 'agent_access');
+      if (a?.id) params.set('toActorId', a.id);
+      const agentId = (a as any)?.settings?.agentId as string | undefined;
+      if (agentId) params.set('agentId', agentId);
+      const url = `/api/relationships?${params.toString()}`;
+      await fetch(url, { method: 'DELETE', headers: { 'x-user-id': uid } });
+      await loadAll();
+      try { window.dispatchEvent(new CustomEvent('connections-updated')); } catch {}
     } catch {}
   }
 
@@ -332,7 +361,10 @@ export default function ConnectionsPage() {
                       ) : a.type === 'agent' && a.settings?.agentId && myAgentIds.has(a.settings.agentId) ? (
                         <button className="text-xs border rounded px-2 py-1 opacity-50 cursor-not-allowed" disabled>Owned</button>
                       ) : a.type === 'agent' && a.settings?.agentId && accessibleAgentIds.has(a.settings.agentId) ? (
-                        <button className="text-xs border rounded px-2 py-1 opacity-50 cursor-not-allowed" disabled>Accessible</button>
+                        <>
+                          <button onClick={() => messageAgent(a.settings!.agentId as string)} className="text-xs border rounded px-2 py-1">Message</button>
+                          <button onClick={() => revokeAgentAccess(a)} className="text-xs border rounded px-2 py-1">Disconnect</button>
+                        </>
                       ) : connectionIds.has(a.id) ? (
                         <>
                           <button onClick={() => message(a.id)} className="text-xs border rounded px-2 py-1">Message</button>

@@ -49,6 +49,8 @@ export class WebSocketServer {
   private toolRunner: ToolRunner;
   // Track invited agents per room (roomId -> Set<agentId>)
   private roomAgents: Map<string, Set<string>> = new Map();
+  // Selection memory: last explicitly picked article per room
+  private roomSelectedUrl: Map<string, string> = new Map();
   private participationRouter: ParticipationRouter = new ParticipationRouter(5);
   // Turn-taking state
   private roomSpeaking: Set<string> = new Set();
@@ -757,18 +759,17 @@ export class WebSocketServer {
     console.log(`[routeParticipation] Parsed mentions:`, { all, mentionedIds });
     if (mentionedIds.length > 0) return mentionedIds.slice(0, 5);
     if (!all) {
-      // Score by interest/keywords
+      // Score by room/public interests and capability tags
       const scored = await this.participationRouter.scoreAgentsForMessage(roomId, text, eligible);
       const picked = scored.map(s => s.agentId).slice(0, 5);
-      if (picked.length > 0) return picked;
-      // Fallback: if no scores, still let eligible agents speak (up to 5)
-      return eligible.slice(0, 5);
+      // If no matches, do not respond (silence is acceptable unless @all or explicit mentions)
+      return picked;
     }
     // @all → allow up to 5, scored order
     const scored = await this.participationRouter.scoreAgentsForMessage(roomId, text, eligible);
     const picked = scored.map(s => s.agentId).slice(0, 5);
     if (picked.length > 0) return picked;
-    // Fallback: if no scores (e.g., no keywords configured), allow all eligible up to 5
+    // @all with no configured interests: still allow up to 5 eligible agents
     return eligible.slice(0, 5);
   }
 
@@ -1333,6 +1334,18 @@ ${personaBlock}${memoryContext}`,
       // If this is a conversation (not a single-agent channel), route to participating agents instead of running a generic assistant
       if (!isAgentRoom) {
         try {
+          // Record the user message into room short-term memory for conversation awareness
+          try {
+            const mem = {
+              id: randomUUID(),
+              role: 'user' as const,
+              content: userMessage,
+              timestamp: new Date(),
+              conversationId: roomId,
+              agentId: roomId,
+            } as any;
+            memoryService.addToShortTerm(roomId, mem);
+          } catch {}
           const candidates = await this.routeParticipation(roomId, userMessage);
           if (candidates.length > 0) {
             const now = Date.now();
@@ -1352,18 +1365,8 @@ ${personaBlock}${memoryContext}`,
         } catch (e) {
           console.error('participation routing (conversation) failed', e);
         }
-        // Conversation room: do not fall back to generic assistant
-        this.broadcastToRoom(roomId, {
-          jsonrpc: '2.0',
-          method: 'message.received',
-          params: {
-            roomId,
-            messageId: randomUUID(),
-            authorId: 'system',
-            authorType: 'system',
-            message: 'No eligible agents responded. Mention an agent (e.g., @Buzz Daly) or add agents to this room.',
-          },
-        });
+        // Conversation room: do not fall back to generic assistant and do not post a neutral system message.
+        // If no agents are eligible to respond, we simply do nothing to keep the thread unchanged.
         return;
       }
 
@@ -1410,6 +1413,19 @@ ${personaBlock}${memoryContext}`,
               this.bus.broadcastToolCall(roomId, trRunId, toolCallId, 'web', 'scrape.pick', { index: pickIndex });
               const result = await webScraperService.scrape(url);
               this.bus.broadcastToolResult(roomId, trRunId, toolCallId, { ok: true });
+              // Persist selection in memory for pronoun resolution
+              try {
+                this.roomSelectedUrl.set(roomId, url);
+                memoryService.addToShortTerm(roomId, {
+                  id: randomUUID(),
+                  role: 'terminal',
+                  content: `Selected article URL: ${url}\nTitle: ${(result as any)?.title || ''}`,
+                  timestamp: new Date(),
+                  conversationId: roomId,
+                  agentId: (primaryAgentId || roomId) as any,
+                  metadata: { selectedUrl: url }
+                } as any);
+              } catch {}
               return { ok: true, result, pickedIndex: pickIndex };
             }
             const { runId: trRunId, toolCallId, result } = await this.toolRunner.run(call.name, fn, call.args || {}, { roomId, userId: activeUserId } as any);
@@ -1433,6 +1449,20 @@ ${personaBlock}${memoryContext}`,
                   const items = links.slice(0, 10).map((url, i) => ({ index: i + 1, url }));
                   const rid = createResults(roomId, items);
                   this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'search.results', params: { roomId, resultId: rid, items } });
+                  // Nudge the user to pick an item using the agent persona
+                  try {
+                    let authorName: string | undefined;
+                    let authorAvatar: string | undefined;
+                    if (primaryAgentId) {
+                      const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+                      if (arows && arows.length) {
+                        authorName = (arows[0] as any).name || undefined;
+                        authorAvatar = (arows[0] as any).avatar || undefined;
+                      }
+                    }
+                    const prompt = 'Which result number should I open (e.g., 1-10)?';
+                    this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.received', params: { roomId, messageId: randomUUID(), authorType: 'agent', authorId: primaryAgentId || roomId, ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}), message: { content: [{ type: 'text', text: prompt }] } } });
+                  } catch {}
                 } else {
                   // Fallback: parse markdown for [View](...)
                   try {
@@ -1448,6 +1478,20 @@ ${personaBlock}${memoryContext}`,
                       const items = mdLinks.slice(0, 10).map((url, i) => ({ index: i + 1, url }));
                       const rid = createResults(roomId, items);
                       this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'search.results', params: { roomId, resultId: rid, items } });
+                      // Nudge selection as above
+                      try {
+                        let authorName: string | undefined;
+                        let authorAvatar: string | undefined;
+                        if (primaryAgentId) {
+                          const arows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+                          if (arows && arows.length) {
+                            authorName = (arows[0] as any).name || undefined;
+                            authorAvatar = (arows[0] as any).avatar || undefined;
+                          }
+                        }
+                        const prompt = 'Which result number should I open (e.g., 1-10)?';
+                        this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.received', params: { roomId, messageId: randomUUID(), authorType: 'agent', authorId: primaryAgentId || roomId, ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}), message: { content: [{ type: 'text', text: prompt }] } } });
+                      } catch {}
                     }
                   } catch {}
                 }
@@ -2697,6 +2741,35 @@ ${personaBlock}${memoryContext}`,
       ? `\n\nAGENT PERSONA\n${agentPersona}\n\n`
       : '\n\n';
 
+    // Include recent room short-term context so the agent can understand what others said
+    const st = memoryService.getShortTerm(roomId);
+    const shortMsgs = (Array.isArray(st) ? st.slice(-20) : []).map((m: any) => {
+      if (m.role === 'terminal') return { role: 'system' as const, content: `Terminal output:\n${m.content}` };
+      const role = (m.role === 'user' || m.role === 'assistant') ? (m.role as 'user'|'assistant') : 'user';
+      return { role, content: String(m.content || '') };
+    });
+
+    // Try to extract the last user question in context (for elliptical follow-ups like "what about you")
+    let lastUserQuestion = '';
+    try {
+      const prev = Array.isArray(st) ? [...st].reverse() : [];
+      for (const m of prev) {
+        if (m && String(m.role) === 'user') {
+          const t = String(m.content || '').trim();
+          if (t) {
+            if (/[?؟]$/.test(t) || /(what|how|why|quote|memory|opinion|thought|favorite)/i.test(t)) {
+              lastUserQuestion = t;
+              break;
+            }
+          }
+        }
+      }
+    } catch {}
+
+    const awarenessBlock = lastUserQuestion
+      ? `\n\nCONVERSATION AWARENESS\n- Someone just asked: "${lastUserQuestion}"\n- The current message is directed at you: "${userMessage}"\n- If the current message is a follow-up phrase like "what about you?" or "how about you?" or similar, you should answer the ORIGINAL question ("${lastUserQuestion}") in your own words, not introduce yourself or say how you're doing. Focus on answering the substantive question that was asked.`
+      : `\n\nCONVERSATION AWARENESS\n- Use the short conversation snippet above to infer context. If the user references you or uses anaphora like 'what about you', infer the preceding question and answer it directly.`;
+
     const messages = [
       {
         role: 'system' as const,
@@ -2710,8 +2783,9 @@ TOOL USAGE
 
 IMPORTANT: Agent instructions take precedence over these general tool guidelines. If the agent has specific instructions about tool preferences (e.g., "use Twitter/X first for news"), follow those instructions instead of the general guidelines above.
 
-Provide helpful responses using available tools. Be concise but thorough.${personaBlock}${memoryContext}` 
+Provide helpful responses using available tools. Be concise but thorough.${personaBlock}${memoryContext}${awarenessBlock}` 
       },
+      ...shortMsgs,
       { role: 'user' as const, content: userMessage },
     ];
 
