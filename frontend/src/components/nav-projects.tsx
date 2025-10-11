@@ -28,7 +28,7 @@ import { useUnreadStore } from "@/stores/unread-store"
 type Agent = { id: string; name: string; avatar?: string | null }
 type Conversation = { id: string; title: string; type: string; participants: any[] }
 type Room = { id: string; title?: string | null; kind?: string | null }
-type Connection = { id: string; name?: string; displayName?: string; handle?: string; email?: string; avatar?: string; avatarUrl?: string; type?: string; dmRoomId?: string; ownerUserId?: string }
+type Connection = { id: string; name?: string; displayName?: string; handle?: string; email?: string; avatar?: string; avatarUrl?: string; type?: string; dmRoomId?: string; ownerUserId?: string; agentId?: string }
 
 export function NavProjects() {
   const { isMobile } = useSidebar()
@@ -63,7 +63,16 @@ export function NavProjects() {
       // Load agents (owned + accessible)
       const agentsRes = await fetch('/api/agents/accessible', { cache: 'no-store', headers })
       const agentsData = await agentsRes.json()
-      const agentsList: Agent[] = Array.isArray(agentsData) ? agentsData : (Array.isArray(agentsData?.agents) ? agentsData.agents : [])
+      let agentsList: Agent[] = Array.isArray(agentsData) ? agentsData : (Array.isArray(agentsData?.agents) ? agentsData.agents : [])
+      
+      // Deduplicate agents by id (keep the first occurrence)
+      const seenAgentIds = new Set<string>()
+      agentsList = agentsList.filter((agent) => {
+        if (seenAgentIds.has(agent.id)) return false
+        seenAgentIds.add(agent.id)
+        return true
+      })
+      
       setAgents(agentsList)
       
       // Create agent map for quick lookup
@@ -98,6 +107,7 @@ export function NavProjects() {
           let normalized: Connection[] = rawConnections.map((c) => {
             const id = String(c.id || c.actorId || c.email || c.handle || '').trim()
             const dmRoomId = c.dmRoomId || c.roomId || (Array.isArray(c.rooms) ? c.rooms.find((room: any) => room?.kind === 'dm')?.id : undefined)
+            const agentId = c.settings?.agentId || c.agentId
             return {
               id,
               name: c.name,
@@ -109,9 +119,19 @@ export function NavProjects() {
               type: c.type,
               dmRoomId,
               ownerUserId: c.ownerUserId,
+              agentId,
             }
           }).filter((c) => c.id)
-          setConnections(normalized)
+          
+          // Deduplicate connections by id (keep the first occurrence)
+          const seenIds = new Set<string>()
+          const deduplicated = normalized.filter((c) => {
+            if (seenIds.has(c.id)) return false
+            seenIds.add(c.id)
+            return true
+          })
+          
+          setConnections(deduplicated)
         } else {
           // Absolute fallback to preserve sidebar UX
           setConnections([])
@@ -451,7 +471,7 @@ export function NavProjects() {
           </div>
         </SidebarGroupLabel>
         <SidebarMenu>
-          {/* Users (DMs) */}
+          {/* Users (DMs) and Agent Connections */}
           {connections.map((connection) => {
             const label = connection.displayName || connection.handle || connection.name || connection.id.slice(0, 8)
             const avatarSrc = typeof connection.avatarUrl === 'string' ? connection.avatarUrl : connection.avatar
@@ -488,7 +508,35 @@ export function NavProjects() {
             return (
               <SidebarMenuItem key={`u-${itemKey}`}>
                 <SidebarMenuButton asChild className="justify-start">
-                  <a href="#" onClick={async (e) => { e.preventDefault(); try { const uid = (session as any)?.userId || (session as any)?.user?.email; const res = await fetch('/api/rooms/dm', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) }, body: JSON.stringify({ targetActorId: connection.id }) }); const json = await res.json(); const roomId = json?.roomId; if (roomId) window.location.href = `/c/${roomId}` } catch {} }}>
+                  <a href="#" onClick={async (e) => { 
+                    e.preventDefault(); 
+                    try { 
+                      const uid = (session as any)?.userId || (session as any)?.user?.email;
+                      const headers = { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) };
+                      
+                      // If this is an agent connection, use /api/rooms/agent, otherwise use /api/rooms/dm
+                      if (connection.type === 'agent' && connection.agentId) {
+                        const res = await fetch('/api/rooms/agent', { 
+                          method: 'POST', 
+                          headers, 
+                          body: JSON.stringify({ agentId: connection.agentId }) 
+                        });
+                        const json = await res.json();
+                        const roomId = json?.roomId;
+                        if (roomId) window.location.href = `/c/${roomId}`;
+                        else window.location.href = `/c/${connection.agentId}`;
+                      } else {
+                        const res = await fetch('/api/rooms/dm', { 
+                          method: 'POST', 
+                          headers, 
+                          body: JSON.stringify({ targetActorId: connection.id }) 
+                        });
+                        const json = await res.json();
+                        const roomId = json?.roomId;
+                        if (roomId) window.location.href = `/c/${roomId}`;
+                      }
+                    } catch {} 
+                  }}>
                     <div className="relative flex items-center gap-2">
                       <div className="relative">
                         <Avatar className="h-5 w-5">
@@ -504,8 +552,11 @@ export function NavProjects() {
               </SidebarMenuItem>
             )
           })}
-          {/* Agents (1:1 agent chat) */}
-          {agents.map(a => (
+          {/* Agents (1:1 agent chat) - only show owned agents not already in connections */}
+          {agents.filter(a => {
+            // Exclude agents that are already in connections (via agent_access relationships)
+            return !connections.some(c => c.agentId === a.id)
+          }).map(a => (
             <SidebarMenuItem key={`a-${a.id}`}>
               <SidebarMenuButton asChild>
                 <a href="#" onClick={async (e) => { e.preventDefault(); try { const uid = (session as any)?.userId || (session as any)?.user?.email; const res = await fetch('/api/rooms/agent', { method: 'POST', headers: { 'Content-Type': 'application/json', ...(uid ? { 'x-user-id': uid } : {}) }, body: JSON.stringify({ agentId: a.id }) }); const json = await res.json(); const roomId = json?.roomId; if (roomId) window.location.href = `/c/${roomId}`; else window.location.href = `/c/${a.id}`; } catch { window.location.href = `/c/${a.id}`; } }}>

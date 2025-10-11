@@ -57,7 +57,7 @@ export class MemoryService {
   }
   private pinecone: Pinecone | null = null;
   private shortTermMemories: Map<string, ShortTermMemory> = new Map();
-  private readonly SHORT_TERM_SIZE = 30;
+  private readonly SHORT_TERM_SIZE = 50;
 
   constructor() {
     // Defer Pinecone initialization until needed to avoid crashing when

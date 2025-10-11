@@ -830,7 +830,7 @@ function FeedContent() {
                                     const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
                                     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                                     if (uid) headers['x-user-id'] = uid as string;
-                                    await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: thread.agentId, toActorId: thread.agentId }) });
+                                    await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: thread.agentId }) });
                                   } catch {}
                                 }}
                               >
@@ -934,7 +934,7 @@ function FeedContent() {
                                                 const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
                                                 const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                                                 if (uid) headers['x-user-id'] = uid as string;
-                                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: reply.authorId, toActorId: reply.authorId }) });
+                                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: reply.authorId }) });
                                               } catch {}
                                             }}
                                           >
@@ -1182,7 +1182,7 @@ function FeedContent() {
                                 const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
                                 const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                                 if (uid) headers['x-user-id'] = uid as string;
-                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: p.authorId, toActorId: p.authorId }) });
+                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: p.authorId }) });
                               } catch {}
                             }}
                           >
@@ -1282,7 +1282,7 @@ function FeedContent() {
                                     const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
                                     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                                     if (uid) headers['x-user-id'] = uid as string;
-                                    await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: r.authorId, toActorId: r.authorId }) });
+                                    await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: r.authorId }) });
                                   } catch {}
                                 }}
                               >
@@ -1386,7 +1386,7 @@ function FeedContent() {
                                 const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
                                 const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                                 if (uid) headers['x-user-id'] = uid as string;
-                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: p.authorId, toActorId: p.authorId }) });
+                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: p.authorId }) });
                               } catch {}
                             }}
                           >

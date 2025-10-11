@@ -645,3 +645,82 @@ export const roomReadsRelations = relations(roomReads, ({ one }) => ({
     references: [conversations.id],
   }),
 }));
+
+// === CREDIT SYSTEM ===
+
+export const wallets = pgTable('wallets', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  ownerId: varchar('owner_id', { length: 191 }).notNull(),
+  ownerType: varchar('owner_type', { length: 20 }).notNull(), // USER | AGENT
+  balance: numeric('balance', { precision: 10, scale: 2 }).notNull().default('0.00'),
+  lifetimeEarned: numeric('lifetime_earned', { precision: 12, scale: 2 }).notNull().default('0.00'),
+  lifetimeSpent: numeric('lifetime_spent', { precision: 12, scale: 2 }).notNull().default('0.00'),
+  status: varchar('status', { length: 20 }).notNull().default('ACTIVE'), // ACTIVE | FROZEN
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  uniqueOwner: index('wallets_owner_idx').on(table.ownerId, table.ownerType),
+  statusIdx: index('wallets_status_idx').on(table.status),
+}));
+
+export const transactions = pgTable('transactions', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  fromWalletId: varchar('from_wallet_id', { length: 191 }),
+  toWalletId: varchar('to_wallet_id', { length: 191 }),
+  amount: numeric('amount', { precision: 10, scale: 2 }).notNull(),
+  transactionType: varchar('transaction_type', { length: 20 }).notNull(), // ALLOCATE | SPEND | TRANSFER | RECLAIM | INITIAL | EARN
+  status: varchar('status', { length: 20 }).notNull().default('COMPLETED'), // PENDING | COMPLETED | FAILED
+  reason: text('reason'),
+  metadata: jsonb('metadata'), // messageId, agentId, tokenUsage, etc.
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  fromIdx: index('transactions_from_idx').on(table.fromWalletId),
+  toIdx: index('transactions_to_idx').on(table.toWalletId),
+  createdIdx: index('transactions_created_idx').on(table.createdAt),
+  typeIdx: index('transactions_type_idx').on(table.transactionType),
+}));
+
+export const creditRequests = pgTable('credit_requests', {
+  id: varchar('id', { length: 191 }).primaryKey(),
+  agentId: varchar('agent_id', { length: 191 }).notNull(),
+  userId: varchar('user_id', { length: 191 }).notNull(),
+  amountRequested: numeric('amount_requested', { precision: 10, scale: 2 }).notNull(),
+  status: varchar('status', { length: 20 }).notNull().default('PENDING'), // PENDING | APPROVED | REJECTED
+  reason: text('reason'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  resolvedAt: timestamp('resolved_at'),
+}, (table) => ({
+  agentIdx: index('credit_requests_agent_idx').on(table.agentId),
+  userIdx: index('credit_requests_user_idx').on(table.userId),
+  statusIdx: index('credit_requests_status_idx').on(table.status),
+}));
+
+// Credit system relations
+export const walletsRelations = relations(wallets, ({ many }) => ({
+  transactionsFrom: many(transactions, { relationName: 'from_wallet' }),
+  transactionsTo: many(transactions, { relationName: 'to_wallet' }),
+}));
+
+export const transactionsRelations = relations(transactions, ({ one }) => ({
+  fromWallet: one(wallets, {
+    fields: [transactions.fromWalletId],
+    references: [wallets.id],
+    relationName: 'from_wallet',
+  }),
+  toWallet: one(wallets, {
+    fields: [transactions.toWalletId],
+    references: [wallets.id],
+    relationName: 'to_wallet',
+  }),
+}));
+
+export const creditRequestsRelations = relations(creditRequests, ({ one }) => ({
+  agent: one(agents, {
+    fields: [creditRequests.agentId],
+    references: [agents.id],
+  }),
+  user: one(users, {
+    fields: [creditRequests.userId],
+    references: [users.id],
+  }),
+}));

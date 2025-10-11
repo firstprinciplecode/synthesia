@@ -3,10 +3,12 @@ import { JSONRPCNotification, JSONRPCResponse, JSONRPCError } from '../types/pro
 export class WebSocketBus {
   private connections: Map<string, any>;
   private rooms: Map<string, Set<string>>;
+  private connectionUserId: Map<string, string>;
 
-  constructor(connections: Map<string, any>, rooms: Map<string, Set<string>>) {
+  constructor(connections: Map<string, any>, rooms: Map<string, Set<string>>, connectionUserId: Map<string, string>) {
     this.connections = connections;
     this.rooms = rooms;
+    this.connectionUserId = connectionUserId;
   }
 
   sendResponse(connectionId: string, id: string, result: any) {
@@ -73,6 +75,19 @@ export class WebSocketBus {
       method: 'tool.result',
       params: { runId, toolCallId, result },
     });
+  }
+
+  // Send notification to all connections belonging to a specific user
+  emitToUser(userId: string, notification: JSONRPCNotification) {
+    try {
+      for (const [connectionId, connUserId] of this.connectionUserId.entries()) {
+        if (connUserId === userId) {
+          this.sendToConnection(connectionId, notification);
+        }
+      }
+    } catch (e) {
+      console.error('emitToUser failed', e);
+    }
   }
 }
 

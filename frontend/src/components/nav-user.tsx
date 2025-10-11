@@ -12,6 +12,7 @@ import {
   Sun,
   Wrench,
   Bot,
+  Coins,
 } from "lucide-react"
 
 import {
@@ -37,6 +38,7 @@ import {
 import { useTheme } from "next-themes"
 import Link from "next/link"
 import { signIn, signOut, useSession } from "next-auth/react"
+import { useEffect, useState } from "react"
 
 export function NavUser({
   user,
@@ -50,6 +52,50 @@ export function NavUser({
   const { data: session, status } = useSession()
   const { isMobile, state } = useSidebar()
   const { theme, setTheme } = useTheme()
+  const [balance, setBalance] = useState<number | null>(null)
+
+  // Fetch wallet balance when authenticated
+  useEffect(() => {
+    if (status === 'authenticated') {
+      const fetchBalance = async () => {
+        try {
+          const uid = (session as unknown as { userId?: string })?.userId
+          const res = await fetch('/api/wallet', { 
+            headers: uid ? { 'x-user-id': uid } : {} 
+          })
+          if (res.ok) {
+            const data = await res.json()
+            setBalance(data.balance)
+          }
+        } catch (error) {
+          console.error('Failed to fetch wallet balance:', error)
+        }
+      }
+      // Fetch initial balance
+      fetchBalance()
+      
+      // Subscribe to real-time balance updates via WebSocket
+      const ws = (window as any).__wsClient
+      if (ws) {
+        const handleMessage = (msg: any) => {
+          if (msg.method === 'wallet.balance' && msg.params?.balance !== undefined) {
+            setBalance(msg.params.balance)
+          }
+        }
+        ws.on('message', handleMessage)
+        return () => {
+          ws.off('message', handleMessage)
+        }
+      }
+    } else {
+      setBalance(null)
+    }
+  }, [status, session])
+
+  const formatBalance = (amount: number | null) => {
+    if (amount === null) return ''
+    return amount.toLocaleString('en-US', { maximumFractionDigits: 2 })
+  }
 
   return (
     <SidebarMenu>
@@ -66,7 +112,18 @@ export function NavUser({
               </Avatar>
               <div className="grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden">
                 <span className="truncate font-medium">{status === 'authenticated' ? user.name : 'Not signed in'}</span>
-                <span className="truncate text-xs">{status === 'authenticated' ? user.email : ''}</span>
+                <span className="truncate text-xs flex items-center gap-1">
+                  {status === 'authenticated' && balance !== null ? (
+                    <>
+                      <Coins className="h-3 w-3 inline" />
+                      {formatBalance(balance)} credits
+                    </>
+                  ) : status === 'authenticated' ? (
+                    user.email
+                  ) : (
+                    ''
+                  )}
+                </span>
               </div>
               <ChevronsUpDown className="ml-auto size-4 group-data-[collapsible=icon]:hidden" />
             </SidebarMenuButton>

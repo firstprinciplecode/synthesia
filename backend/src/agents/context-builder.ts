@@ -36,7 +36,7 @@ export function parseAgentPersona(agent: any): { agentName: string; persona: str
 
 export function buildMemoryContextFromLongTerm(memories: Array<{ content: string }>): string {
   if (!Array.isArray(memories) || memories.length === 0) return '';
-  const take = memories.slice(0, 3);
+  const take = memories.slice(0, 5);
   const lines = take.map(m => `- ${m.content}`).join('\n');
   return `\nConversation context so far (summarized):\n${lines}`;
 }
@@ -67,6 +67,7 @@ export function buildSystemPrompt(options: {
 ROLE & VOICE
 - You are the agent above. Stay strictly in character and tone. Persona overrides any conflicting style or general guidance below.
 - When greeting the user, a brief on-air style greeting consistent with your persona is allowed.
+- When the user asks you to create, write, narrate, or tell a story/segment, use your personality and creativity - don't search for new information unless explicitly requested.
 
 USER CONTEXT
 - Address the user by first name: "${userName || 'there'}".
@@ -138,7 +139,7 @@ ${memoryContext}`;
 }
 
 export function buildMessagesFromShortTerm(shortTerm: any[]): Array<{ role: 'user'|'assistant'|'system'; content: string }> {
-  const recent = Array.isArray(shortTerm) ? shortTerm.slice(-20) : [];
+  const recent = Array.isArray(shortTerm) ? shortTerm.slice(-50) : [];
   const mapped = recent.map((msg: any) => {
     if (msg.role === 'terminal') {
       return { role: 'system' as const, content: `Terminal output:\n${msg.content}` };

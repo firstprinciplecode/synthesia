@@ -37,6 +37,7 @@ import { buildUserProfileContext } from '../agents/context-builder.js';
 import { setLastLinks, getLastLinks } from './link-cache.js';
 import { createResults, getResults, getLatestResultId } from './results-registry.js';
 import { codeSearch } from '../tools/code-search.js';
+import { creditService } from '../services/credit-service.js';
 
 export class WebSocketServer {
   private llmRouter: LLMRouter;
@@ -83,7 +84,7 @@ export class WebSocketServer {
 
   constructor() {
     this.llmRouter = new LLMRouter();
-    this.bus = new WebSocketBus(this.connections, this.rooms);
+    this.bus = new WebSocketBus(this.connections, this.rooms, this.connectionUserId);
     this.roomsRegistry = new RoomRegistry(this.rooms, this.connectionUserId, this.roomAgents);
     this.orchestrator = new AgentOrchestrator({ llmRouter: this.llmRouter });
     // Register tools
@@ -1378,9 +1379,10 @@ ${personaBlock}${memoryContext}`,
       console.log(`[debug] AGENT_LOOP env var: "${process.env.AGENT_LOOP}", useLoop: ${useLoop}`);
       this.roomSpeaking.add(roomId);
       let responseText = '';
+      let tokenUsage: { inputTokens: number; outputTokens: number } | undefined;
       if (useLoop) {
         const agentRecord = isAgentRoom && primaryAgentId ? (await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any)))[0] : null;
-        const { finalText, pendingApproval } = await this.orchestrator.runTask({
+        const result = await this.orchestrator.runTask({
           roomId,
           activeUserId,
           connectionId,
@@ -1518,6 +1520,8 @@ ${personaBlock}${memoryContext}`,
           getCatalog: () => this.toolRegistry.catalog(),
           getLatestResultId: (ridRoomId: string) => getLatestResultId(ridRoomId),
         });
+        const { finalText, pendingApproval } = result;
+        tokenUsage = result.tokenUsage;
         responseText = finalText;
         
         // If we have pending approval and user said yes, continue the loop
@@ -1627,6 +1631,125 @@ ${personaBlock}${memoryContext}`,
           } catch {}
           this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'message.complete', params: { runId, messageId: agentRunMessageId, finalMessage: { role: 'assistant', content: [{ type: 'text', text: this.normalizeFinalText(fullResponse) }] }, authorId: aid, authorType: 'agent', ...(authorName ? { authorName } : {}), ...(authorAvatar ? { authorAvatar } : {}) } });
         }
+      }
+
+      // === CREDIT CHARGING ===
+      // Charge user if they're using another user's agent
+      console.log('[credit] 🔍 Checking if credit charge needed...');
+      console.log('[credit]    primaryAgentId:', primaryAgentId);
+      console.log('[credit]    activeUserId:', activeUserId);
+      console.log('[credit]    responseText length:', responseText?.length);
+      try {
+        if (primaryAgentId && responseText) {
+          // Get agent owner
+          const agentRows = await db.select().from(agents).where(eq(agents.id as any, primaryAgentId as any));
+          console.log('[credit] 📋 Found agent rows:', agentRows.length);
+          if (agentRows.length > 0) {
+            const rawAgentOwnerId = (agentRows[0] as any).createdBy;
+            
+            // Normalize agent owner ID (convert email to UUID if needed)
+            let agentOwnerId = rawAgentOwnerId;
+            if (rawAgentOwnerId && rawAgentOwnerId.includes('@')) {
+              try {
+                const userRows = await db.select().from(users).where(eq((users as any).email, rawAgentOwnerId));
+                if (userRows && userRows.length > 0) {
+                  agentOwnerId = (userRows[0] as any).id;
+                  console.log('[credit] 🔄 Normalized agent owner from', rawAgentOwnerId, 'to', agentOwnerId);
+                }
+              } catch (e) {
+                console.error('[credit] ⚠️ Failed to normalize agent owner ID:', e);
+              }
+            }
+            
+            console.log('[credit] 👤 Agent owner:', agentOwnerId);
+            console.log('[credit] 👤 Active user:', activeUserId);
+            console.log('[credit] 🤔 Owner check:', agentOwnerId !== activeUserId);
+            
+            // Only charge if user is not the agent owner
+            if (agentOwnerId && agentOwnerId !== activeUserId) {
+              // Use actual token usage from orchestrator if available, otherwise estimate
+              const actualInputTokens = tokenUsage?.inputTokens || Math.ceil(userMessage.length / 4);
+              const actualOutputTokens = tokenUsage?.outputTokens || Math.ceil(responseText.length / 4);
+              
+              const cost = creditService.calculateMessageCost({
+                inputTokens: actualInputTokens,
+                outputTokens: actualOutputTokens,
+                model: String(model),
+              });
+
+              // Charge the user
+              const chargeResult = await creditService.chargeForMessage(
+                activeUserId,
+                agentOwnerId,
+                cost,
+                {
+                  messageId: agentRunMessageId,
+                  agentId: primaryAgentId,
+                  tokenUsage: {
+                    inputTokens: actualInputTokens,
+                    outputTokens: actualOutputTokens,
+                    model: String(model),
+                  },
+                }
+              );
+
+              if (!chargeResult.success) {
+                console.error(`[credit] ❌ Failed to charge user ${activeUserId}:`, chargeResult.error);
+                
+                // If insufficient balance, notify the user
+                if (chargeResult.error?.includes('Insufficient')) {
+                  this.bus.broadcastToRoom(roomId, {
+                    jsonrpc: '2.0',
+                    method: 'message.received',
+                    params: {
+                      roomId,
+                      messageId: randomUUID(),
+                      authorType: 'system',
+                      authorId: 'system',
+                      message: {
+                        content: [{
+                          type: 'text',
+                          text: `⚠️ Insufficient credits. This message cost ${cost.toFixed(2)} credits. Please add more credits to continue using this agent.`
+                        }]
+                      },
+                    },
+                  });
+                }
+              } else {
+                console.log(`[credit] ✅ SUCCESS! Charged ${cost.toFixed(2)} credits`);
+                console.log(`[credit]    From: ${activeUserId} (payer)`);
+                console.log(`[credit]    To: ${agentOwnerId} (agent owner)`);
+                console.log(`[credit]    Agent: ${primaryAgentId}`);
+                console.log(`[credit]    Tokens: ${actualInputTokens} in + ${actualOutputTokens} out = ${actualInputTokens + actualOutputTokens} total ${tokenUsage ? '(actual)' : '(estimated)'}`);
+                console.log(`[credit]    Transaction ID: ${chargeResult.transactionId}`);
+                
+                // Emit real-time balance updates to both users via WebSocket
+                try {
+                  const payerWallet = await creditService.getOrCreateWallet(activeUserId, 'USER');
+                  const recipientWallet = await creditService.getOrCreateWallet(agentOwnerId, 'USER');
+                  
+                  this.bus.emitToUser(activeUserId, {
+                    jsonrpc: '2.0',
+                    method: 'wallet.balance',
+                    params: { balance: parseFloat(payerWallet.balance) }
+                  });
+                  
+                  this.bus.emitToUser(agentOwnerId, {
+                    jsonrpc: '2.0',
+                    method: 'wallet.balance',
+                    params: { balance: parseFloat(recipientWallet.balance) }
+                  });
+                  
+                  console.log(`[credit] 📡 Emitted balance updates`);
+                } catch (balanceErr) {
+                  console.error('[credit] Failed to emit balance updates:', balanceErr);
+                }
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('[credit] Error processing payment:', error);
       }
 
       // Persist assistant final message for primary agent responses (single-agent rooms)

@@ -29,7 +29,7 @@ export class AgentOrchestrator {
     const { roomId, activeUserId, connectionId, agentRecord, userProfile, userMessage, runOptions, onDelta } = options;
     // Scope memories per agent (room) to avoid cross-agent leakage
     const shortTerm = memoryService.getShortTerm(roomId);
-    const longTerm = await memoryService.searchLongTerm(roomId, userMessage, 3, 'conversation');
+    const longTerm = await memoryService.searchLongTerm(roomId, userMessage, 5, 'conversation');
     const memoryContext = buildMemoryContextFromLongTerm(longTerm);
     const { agentName, persona, autoExecuteTools } = agentRecord ? parseAgentPersona(agentRecord) : { agentName: '', persona: '', autoExecuteTools: false };
     const systemContent = buildSystemPrompt({
@@ -73,13 +73,13 @@ export class AgentOrchestrator {
     getCatalog?: () => Array<{ tool: string; func: string; description?: string; tags?: string[]; synonyms?: string[]; sideEffects?: boolean; approval?: 'auto'|'ask' }>;
     getLatestResultId?: (roomId: string) => string | null;
     pendingApproval?: { tool: string; func: string; args: any; hint: string };
-  }): Promise<{ finalText: string; steps: Array<{ decision: any; observation?: any }>; model: SupportedModel; pendingApproval?: { tool: string; func: string; args: any; hint: string } }>{
+  }): Promise<{ finalText: string; steps: Array<{ decision: any; observation?: any }>; model: SupportedModel; tokenUsage?: { inputTokens: number; outputTokens: number }; pendingApproval?: { tool: string; func: string; args: any; hint: string } }>{
     const { roomId, activeUserId, connectionId, agentRecord, userProfile, userMessage, runOptions, executeTool, onAnalysis, onDelta, getCatalog, getLatestResultId, pendingApproval } = options;
     const runId = options.runId || randomUUID();
 
     // Scope memories per agent (room) to avoid cross-agent leakage
     const shortTerm = memoryService.getShortTerm(roomId);
-    const longTerm = await memoryService.searchLongTerm(roomId, userMessage, 3, 'conversation');
+    const longTerm = await memoryService.searchLongTerm(roomId, userMessage, 5, 'conversation');
     const memoryContext = buildMemoryContextFromLongTerm(longTerm);
     const { persona, autoExecuteTools, toolPreferences } = agentRecord ? parseAgentPersona(agentRecord) : { agentName: '', persona: '', autoExecuteTools: false } as any;
 
@@ -92,7 +92,7 @@ export class AgentOrchestrator {
       toolPreferences,
     });
     // Selection memory instructions for pronoun resolution
-    systemContent += `\nCONVERSATION AWARENESS\n- The room maintains a selected article URL when the user says \"read 2\" or similar.\n- If the user references \"this\", \"that\", \"it\", or \"the article\" without a URL, assume they mean the most recently selected article for this room.\n- If no article has been selected in this room yet, ask a single clarifying question: \"Which result number should I open (1-10)?\".\n- After fetching content, use the agent persona to write a brief on-air segment before proposing narration via @elevenlabs.\nTOOL CONTEXT\n- When you say \"Should I run serpapi...\", the UI interprets this as asking approval to run the tool. After approval you will receive either Markdown with [View](url) links or a structured resultId and links list.\n- After results are shown, ask the user to pick a number if they don’t specify which item to read.\n`;
+    systemContent += `\nCONVERSATION AWARENESS\n- The room maintains a selected article URL when the user says \"read 2\" or similar.\n- If the user references \"this\", \"that\", \"it\", or \"the article\" without a URL, assume they mean the most recently selected article for this room.\n- If no article has been selected in this room yet, ask a single clarifying question: \"Which result number should I open (1-10)?\".\n- After fetching content, use the agent persona to write a brief on-air segment before proposing narration via @elevenlabs.\n\nCREATIVE vs TOOL USE\n- When the user asks you to "create", "write", "tell", "narrate", or "describe" something, use your personality and recent conversation context to respond creatively. Do NOT search for new information.\n- Only use tools when the user explicitly needs NEW information (search, fetch, scrape) or wants to perform an action (post, send, etc.).\n- If you recently fetched content and the user asks you to work with it, reference what you already have - don't fetch again.\n\nTOOL CONTEXT\n- When you say \"Should I run serpapi...\", the UI interprets this as asking approval to run the tool. After approval you will receive either Markdown with [View](url) links or a structured resultId and links list.\n- After results are shown, ask the user to pick a number if they don't specify which item to read.\n`;
     const shortTermMsgs = buildMessagesFromShortTerm(shortTerm);
 
     const maxSteps = Math.max(1, Math.min(20, runOptions?.maxSteps ?? 6));
@@ -105,6 +105,10 @@ export class AgentOrchestrator {
     const steps: Array<{ decision: any; observation?: any }> = [];
     const scratchpad: string[] = [];
     const observedMarkdowns: string[] = [];
+    
+    // Track token usage across all LLM calls
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
 
     const log = (msg: string, extra?: any) => {
       try {
@@ -130,7 +134,7 @@ export class AgentOrchestrator {
             observedMarkdowns.push(String(obs.markdown));
             finalText = String(obs.markdown);
             onDelta?.(finalText);
-            return { finalText, steps, model };
+            return { finalText, steps, model, tokenUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens } };
           }
         } catch {}
       } catch (e: any) {
@@ -178,28 +182,50 @@ export class AgentOrchestrator {
     // Heuristic: if user asks for latest news and auto-exec is off, ask approval up-front
     if (!autoExecuteTools && !pendingApproval) {
       const text = (userMessage || '').toLowerCase();
+      // Only trigger if it's an information-seeking query, not a creative/narrative request
+      const isCreativeRequest = /(create|make|write|tell|narrate|segment|story about|describe)/.test(text);
       const wantsNews = /(latest|today|headlines|news|what's happening|whats happening)/.test(text);
-      if (wantsNews) {
+      if (wantsNews && !isCreativeRequest) {
         // If we already have recent Google News results observed in this run or scratchpad, don't refetch
         const haveRecentNews = observedMarkdowns.some(m => /Google News for/i.test(m)) || scratchpad.some(s => /Google News for/i.test(s));
         if (haveRecentNews) {
           const prompt = 'I already fetched Google News just now. Which result number should I open (e.g., 1-10)?';
           onDelta?.(prompt);
-          return { finalText: prompt, steps, model };
+          return { finalText: prompt, steps, model, tokenUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens } };
         }
-        // Extract topic, strip suffixes like "from google news"
+        // Extract topic intelligently, removing conversational filler
         const quoted = (userMessage.match(/"([^"]+)"/) || [])[1];
         const about = (text.match(/about\s+([\w\s\-\_\.\#\@]+)\??$/) || [])[1];
-        let fallback = text.replace(/\b(can you|get|show|fetch|latest|today|headlines|news|on|about|please)\b/gi, '').trim();
-        fallback = fallback.replace(/\bfrom\s+google\s+news\b/gi, '').trim();
+        
+        // Strip conversational filler and focus on the noun phrase
+        let fallback = text
+          .replace(/\b(alright|ok|okay|well|so|now|hey|hi|hello)\b/gi, '') // conversational starters
+          .replace(/\b(let's|lets|can you|could you|please|would you)\b/gi, '') // politeness
+          .replace(/\b(see|check|look at|find|get|show|fetch|tell me|give me|show me|get me)\b/gi, '') // action verbs
+          .replace(/\b(what's|whats|what is)\b/gi, '') // question words
+          .replace(/\b(going on|happening|new|up)\b/gi, '') // status words
+          .replace(/\b(with the|in the world of|in|on|at|regarding)\b/gi, '') // prepositions
+          .replace(/\b(latest|today|recent|current|headlines|news|now)\b/gi, '') // time/type words
+          .replace(/\bfrom\s+google\s+news\b/gi, '')
+          .replace(/\s+me\s+/gi, ' ') // "tell me", "show me" remnants
+          .trim();
+        
         let hintRaw = String(quoted || about || fallback || userMessage).trim();
-        hintRaw = hintRaw.replace(/\bfrom\s+google\s+news\b/gi, ' ').replace(/[\)\(\:"\]]+$/g, ' ').replace(/^\s*(the|a|an)\s+/i,'').trim();
+        hintRaw = hintRaw
+          .replace(/\bfrom\s+google\s+news\b/gi, ' ')
+          .replace(/[\)\(\:"\]]+$/g, ' ')
+          .replace(/^\s*(the|a|an)\s+/i, '')
+          .replace(/\s{2,}/g, ' ')
+          .trim();
+        
+        // Special cases for common phrases
         if (/favorite\s+space\s+company/i.test(hintRaw)) hintRaw = 'SpaceX';
-        const hint = hintRaw.replace(/\s{2,}/g, ' ').trim();
+        
+        const hint = hintRaw || 'news';
         const question = `Should I run serpapi.google_news "${hint}" now?`;
         const delta = question; // emit verbatim
         if (delta) onDelta?.(delta);
-        return { finalText: delta, steps, model, pendingApproval: { tool: 'serpapi', func: 'google_news', args: { q: hint }, hint } };
+        return { finalText: delta, steps, model, tokenUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens }, pendingApproval: { tool: 'serpapi', func: 'google_news', args: { q: hint }, hint } };
       }
     }
 
@@ -216,11 +242,24 @@ Rules when type=write:
 - Do not repeat previous text.
 - Keep it concise by default (<= 2 sentences). Do NOT enumerate capabilities unless the user explicitly asks for a list.
 - If the user asks what you can do, respond with a brief one-liner and a single clarifying question.
+
+WHEN TO USE TOOLS vs CREATIVE WRITING:
+- Use type="write" for creative requests: create/write/tell/narrate/describe/segment/story
+- Use type="tool" ONLY when the user needs NEW information (search/fetch/scrape) or wants to perform an action (post/send)
+- If you recently fetched content and the user asks you to work with it, use type="write" with your persona
+
 Tool approval policy: ${autoExecuteTools ? 'auto' : 'ask'}
 - When policy is "ask": do NOT return type="tool". Instead, return type="write" asking a single, concrete yes/no question specifying the exact tool and arguments you intend to run (e.g., "Fetch Google News for \"SpaceX\" now?"). Wait for user approval in the next turn.
 
 Preferred tool hints:
-- For news/web discovery use capabilityTags ["news","search"] and hint with the topic (e.g., "spacex").
+- For news/web discovery use capabilityTags ["news","search"] and hint with ONLY the core topic/subject.
+  * Extract the noun phrase that represents what the user wants information about
+  * Remove conversational filler: "alright", "let's see", "what's going on", "can you", etc.
+  * Remove time indicators already implied by "news": "today", "latest", "recent"
+  * Examples:
+    - "what's happening with space exploration today" → hint: "space exploration"
+    - "can you get me news about Tesla" → hint: "Tesla"
+    - "latest on the election" → hint: "election"
 - For code lookups use capabilityTags ["code","search","grep"]. Ask first and propose exactly one line: Should I run: $ tool.code.search { pattern: "<text>", path: "<dir>" }?
 
 After a tool success, your next step should normally be type="write" that summarizes the result for the user unless another tool is strictly required.`;
@@ -250,11 +289,11 @@ After a tool success, your next step should normally be type="write" that summar
         seen.add(n);
       }
       let cleaned = kept.join(' ').trim();
-      // For initial reply (no previous assistant text), keep it concise: max 3 sentences or 400 chars
+      // For initial reply (no previous assistant text), keep it concise: max 4 sentences or 600 chars
       // Allow more space for agents with personality
       if (!existing.trim()) {
-        const initial = sentenceSplit(cleaned).slice(0, 3).join(' ');
-        cleaned = initial.slice(0, 400).trim();
+        const initial = sentenceSplit(cleaned).slice(0, 4).join(' ');
+        cleaned = initial.slice(0, 600).trim();
       }
       return cleaned;
     };
@@ -271,7 +310,7 @@ After a tool success, your next step should normally be type="write" that summar
         try {
           const obsText = typeof (obs?.markdown) === 'string' ? obs.markdown
             : (typeof obs === 'string' ? obs : JSON.stringify(obs));
-          const brief = String(obsText || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+          const brief = String(obsText || '').replace(/\s+/g, ' ').trim().slice(0, 4000);
           if (brief) scratchpad.push(`Observation snippet:\n${brief}`);
           if (typeof (obs?.markdown) === 'string' && obs.markdown.trim()) {
             observedMarkdowns.push(String(obs.markdown));
@@ -309,6 +348,12 @@ After a tool success, your next step should normally be type="write" that summar
         temperature: runOptions?.temperature ?? 0.7,
         stream: false,
       });
+
+      // Track token usage from this LLM call
+      if (resp.usage) {
+        totalInputTokens += resp.usage.promptTokens || 0;
+        totalOutputTokens += resp.usage.completionTokens || 0;
+      }
 
       const raw = String(resp.content || '').trim();
       log(`step ${step} llm response`, { raw: raw.slice(0, 200) });
@@ -373,7 +418,7 @@ After a tool success, your next step should normally be type="write" that summar
           }
           scratchpad.push(`Tool ${name}.${func} deferred pending user approval.`);
           // Return the pending approval info instead of breaking
-          return { finalText, steps, model, pendingApproval: { tool: name, func: func!, args: decision.args || decision.tool?.args, hint: String(decision.hint || '') } };
+          return { finalText, steps, model, tokenUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens }, pendingApproval: { tool: name, func: func!, args: decision.args || decision.tool?.args, hint: String(decision.hint || '') } };
         }
         try {
           const tags: string[] = Array.isArray(decision.capabilityTags) ? decision.capabilityTags : [];
@@ -394,7 +439,7 @@ After a tool success, your next step should normally be type="write" that summar
           try {
             const obsText = typeof (obs?.markdown) === 'string' ? obs.markdown
               : (typeof obs === 'string' ? obs : JSON.stringify(obs));
-            const brief = String(obsText || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+            const brief = String(obsText || '').replace(/\s+/g, ' ').trim().slice(0, 4000);
             if (brief) scratchpad.push(`Observation snippet:\n${brief}`);
             if (typeof (obs?.markdown) === 'string' && obs.markdown.trim()) {
               observedMarkdowns.push(String(obs.markdown));
@@ -427,7 +472,7 @@ After a tool success, your next step should normally be type="write" that summar
       finalText = observedMarkdowns.join('\n\n');
     }
     log('complete', { textLen: finalText.length, steps: steps.length });
-    return { finalText, steps, model };
+    return { finalText, steps, model, tokenUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens } };
   }
 }
 

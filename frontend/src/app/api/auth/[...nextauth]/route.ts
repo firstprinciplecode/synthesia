@@ -44,7 +44,28 @@ export const authOptions = {
     async jwt({ token, account, profile, user }: any) {
       if (user?.id) token.userId = user.id
       if (account && profile) {
-        token.userId = (profile as any).email || token.email || token.sub || token.userId
+        // For OAuth providers, fetch the UUID from backend using email
+        const email = (profile as any).email || token.email
+        if (email) {
+          try {
+            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_HTTP || 'http://localhost:3001'
+            const res = await fetch(`${backendUrl}/api/profile`, {
+              headers: { 'x-user-id': email }
+            })
+            if (res.ok) {
+              const userData = await res.json()
+              if (userData?.id) {
+                token.userId = userData.id  // Use UUID, not email
+              }
+            }
+          } catch (e) {
+            console.error('Failed to fetch user UUID:', e)
+          }
+        }
+        // Fallback to email only if UUID fetch failed
+        if (!token.userId) {
+          token.userId = email || token.sub || token.userId
+        }
       }
       return token
     },

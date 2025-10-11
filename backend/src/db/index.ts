@@ -1,6 +1,6 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
 import pkg from 'pg';
-import { users, agents, conversations, actors, rooms, roomMembers, relationships, policies, messages, roomReads } from './schema.js';
+import { users, agents, conversations, actors, rooms, roomMembers, relationships, policies, messages, roomReads, wallets } from './schema.js';
 
 const { Pool } = pkg as any;
 
@@ -43,7 +43,7 @@ export const db = new Proxy({}, {
     return dbInstance[prop];
   }
 }) as any;
-export { users, agents, conversations, actors, rooms, roomMembers, relationships, policies, messages, roomReads };
+export { users, agents, conversations, actors, rooms, roomMembers, relationships, policies, messages, roomReads, wallets };
 
 
 // Graceful shutdown helper to close the underlying PG pool

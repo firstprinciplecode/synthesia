@@ -10,7 +10,7 @@ import websocket from '@fastify/websocket';
 import cors from '@fastify/cors';
 import { WebSocketServer } from './websocket/server.js';
 import { randomUUID } from 'crypto';
-import { db, agents, users, conversations, actors, rooms, roomMembers, relationships, policies, messages, closeDbPool } from './db/index.js';
+import { db, agents, users, conversations, actors, rooms, roomMembers, relationships, policies, messages, closeDbPool, wallets } from './db/index.js';
 import { publicFeedPosts, publicFeedReplies } from './db/schema.js';
 import bcrypt from 'bcryptjs';
 import { LLMRouter, ModelConfigs } from './llm/providers.js';
@@ -23,6 +23,7 @@ import { promisify } from 'util';
 import { xService } from './tools/x-service.js';
 import { memoryService } from './memory/memory-service.js';
 import { webScraperService, type ScrapeResult } from './tools/web-scraper-service.js';
+import { creditService } from './services/credit-service.js';
 
 // Helper to extract and scrape URLs from text (with optional @ prefix)
 async function extractAndScrapeUrl(text: string, log?: any): Promise<{ url: string; content: string } | null> {
@@ -2234,6 +2235,14 @@ fastify.post('/api/local-auth/register', async (request, reply) => {
       createdAt: now,
       updatedAt: now,
     } as any);
+    
+    // Initialize wallet with 10,000 credits
+    try {
+      await creditService.initializeWallet(id, 'USER');
+    } catch (e) {
+      request.server.log.error({ err: e, userId: id }, 'Failed to initialize wallet for new user');
+    }
+    
     return { ok: true };
   } catch (e: any) {
     request.server.log.error(e);
@@ -2272,6 +2281,334 @@ fastify.get('/api/llm/models', async (request, reply) => {
     .map(([name, cfg]) => ({ name, provider: cfg.provider, maxTokens: cfg.maxTokens }));
   const providers = wsServer.getAvailableProviders();
   return { providers, models };
+});
+
+// === WALLET / CREDIT SYSTEM ===
+
+// Get wallet balance for current user or agent
+fastify.get('/api/wallet', async (request, reply) => {
+  try {
+    const userId = (request.headers['x-user-id'] as string) || '';
+    console.log('[/api/wallet] 📞 Request from user:', userId);
+    if (!userId) {
+      reply.code(401);
+      return { error: 'Unauthorized' };
+    }
+
+    const wallet = await creditService.getOrCreateWallet(userId, 'USER');
+    const balance = parseFloat(wallet.balance);
+    console.log('[/api/wallet] 💰 Returning balance:', balance, 'for user:', userId);
+    console.log('[/api/wallet] 📊 Full wallet:', {
+      balance: wallet.balance,
+      lifetimeEarned: wallet.lifetimeEarned,
+      lifetimeSpent: wallet.lifetimeSpent,
+      ownerId: wallet.ownerId
+    });
+    return {
+      balance: balance,
+      lifetimeEarned: parseFloat(wallet.lifetimeEarned),
+      lifetimeSpent: parseFloat(wallet.lifetimeSpent),
+      status: wallet.status,
+    };
+  } catch (error: any) {
+    console.error('[/api/wallet] ❌ Error:', error);
+    reply.code(500);
+    return { error: error.message || 'Failed to get wallet' };
+  }
+});
+
+// Get wallet balance for a specific agent
+fastify.get('/api/wallet/agent/:agentId', async (request, reply) => {
+  try {
+    const userId = (request.headers['x-user-id'] as string) || '';
+    const { agentId } = request.params as { agentId: string };
+
+    if (!userId) {
+      reply.code(401);
+      return { error: 'Unauthorized' };
+    }
+
+    // Verify user owns this agent
+    const agent = await db.select().from(agents).where(eq(agents.id, agentId)).limit(1);
+    if (agent.length === 0 || agent[0].createdBy !== userId) {
+      reply.code(403);
+      return { error: 'Forbidden' };
+    }
+
+    const wallet = await creditService.getOrCreateWallet(agentId, 'AGENT');
+    return {
+      balance: parseFloat(wallet.balance),
+      lifetimeEarned: parseFloat(wallet.lifetimeEarned),
+      lifetimeSpent: parseFloat(wallet.lifetimeSpent),
+      status: wallet.status,
+    };
+  } catch (error: any) {
+    reply.code(500);
+    return { error: error.message || 'Failed to get agent wallet' };
+  }
+});
+
+// Allocate credits to an agent
+fastify.post('/api/wallet/allocate', async (request, reply) => {
+  try {
+    const userId = (request.headers['x-user-id'] as string) || '';
+    const { agentId, amount } = request.body as { agentId: string; amount: number };
+
+    if (!userId) {
+      reply.code(401);
+      return { error: 'Unauthorized' };
+    }
+
+    if (!agentId || !amount || amount <= 0) {
+      reply.code(400);
+      return { error: 'Invalid agentId or amount' };
+    }
+
+    // Verify user owns this agent
+    const agent = await db.select().from(agents).where(eq(agents.id, agentId)).limit(1);
+    if (agent.length === 0 || agent[0].createdBy !== userId) {
+      reply.code(403);
+      return { error: 'Forbidden' };
+    }
+
+    const result = await creditService.allocateToAgent(userId, agentId, amount);
+    
+    if (!result.success) {
+      reply.code(400);
+      return { error: result.error };
+    }
+
+    // Get updated balances
+    const userWallet = await creditService.getOrCreateWallet(userId, 'USER');
+    const agentWallet = await creditService.getOrCreateWallet(agentId, 'AGENT');
+
+    // TODO: Emit balance updates via WebSocket when user is online
+    // For now, balance will update on next page load/API call
+
+    return {
+      success: true,
+      transactionId: result.transactionId,
+      userBalance: parseFloat(userWallet.balance),
+      agentBalance: parseFloat(agentWallet.balance),
+    };
+  } catch (error: any) {
+    reply.code(500);
+    return { error: error.message || 'Failed to allocate credits' };
+  }
+});
+
+// Get transaction history
+fastify.get('/api/wallet/transactions', async (request, reply) => {
+  try {
+    const userId = (request.headers['x-user-id'] as string) || '';
+    const { limit = 50 } = request.query as { limit?: number };
+
+    if (!userId) {
+      reply.code(401);
+      return { error: 'Unauthorized' };
+    }
+
+    const transactions = await creditService.getTransactions(userId, 'USER', Number(limit));
+    return { transactions };
+  } catch (error: any) {
+    reply.code(500);
+    return { error: error.message || 'Failed to get transactions' };
+  }
+});
+
+// Get pending credit requests
+fastify.get('/api/wallet/requests', async (request, reply) => {
+  try {
+    const userId = (request.headers['x-user-id'] as string) || '';
+
+    if (!userId) {
+      reply.code(401);
+      return { error: 'Unauthorized' };
+    }
+
+    const requests = await creditService.getPendingRequests(userId);
+    
+    // Fetch agent details for each request
+    const requestsWithAgents = await Promise.all(
+      requests.map(async (req) => {
+        const agent = await db.select().from(agents).where(eq(agents.id, req.agentId)).limit(1);
+        return {
+          ...req,
+          agent: agent[0] || null,
+        };
+      })
+    );
+
+    return { requests: requestsWithAgents };
+  } catch (error: any) {
+    reply.code(500);
+    return { error: error.message || 'Failed to get credit requests' };
+  }
+});
+
+// Approve a credit request
+fastify.post('/api/wallet/approve-request/:id', async (request, reply) => {
+  try {
+    const userId = (request.headers['x-user-id'] as string) || '';
+    const { id } = request.params as { id: string };
+
+    if (!userId) {
+      reply.code(401);
+      return { error: 'Unauthorized' };
+    }
+
+    const result = await creditService.approveRequest(id, userId);
+    
+    if (!result.success) {
+      reply.code(400);
+      return { error: result.error };
+    }
+
+    // Get updated balance
+    const userWallet = await creditService.getOrCreateWallet(userId, 'USER');
+
+    // TODO: Emit balance update via WebSocket when user is online
+    // For now, balance will update on next page load/API call
+
+    return { success: true };
+  } catch (error: any) {
+    reply.code(500);
+    return { error: error.message || 'Failed to approve request' };
+  }
+});
+
+// Reject a credit request
+fastify.post('/api/wallet/reject-request/:id', async (request, reply) => {
+  try {
+    const userId = (request.headers['x-user-id'] as string) || '';
+    const { id } = request.params as { id: string };
+
+    if (!userId) {
+      reply.code(401);
+      return { error: 'Unauthorized' };
+    }
+
+    const result = await creditService.rejectRequest(id, userId);
+    
+    if (!result.success) {
+      reply.code(400);
+      return { error: result.error };
+    }
+
+    return { success: true };
+  } catch (error: any) {
+    reply.code(500);
+    return { error: error.message || 'Failed to reject request' };
+  }
+});
+
+// === ADMIN ENDPOINTS ===
+
+// GET /api/admin/users - List all users with wallet info
+fastify.get('/api/admin/users', async (request, reply) => {
+  try {
+    const userId = getUserIdFromRequest(request);
+    if (!isAdmin(userId)) {
+      reply.code(403);
+      return { error: 'Forbidden' };
+    }
+    
+    const usersList = await db.select().from(users);
+    const walletsMap: Record<string, any> = {};
+    const walletsData = await db.select().from(wallets).where(eq(wallets.ownerType, 'USER'));
+    walletsData.forEach((w: any) => {
+      walletsMap[w.ownerId] = w;
+    });
+    
+    return usersList.map((u: any) => ({
+      id: u.id,
+      email: u.email,
+      name: u.name,
+      balance: parseFloat(walletsMap[u.id]?.balance || '0'),
+      createdAt: u.createdAt
+    }));
+  } catch (error: any) {
+    reply.code(500);
+    return { error: error.message || 'Failed to fetch users' };
+  }
+});
+
+// GET /api/admin/agents - List all agents with owner info
+fastify.get('/api/admin/agents', async (request, reply) => {
+  try {
+    const userId = getUserIdFromRequest(request);
+    if (!isAdmin(userId)) {
+      reply.code(403);
+      return { error: 'Forbidden' };
+    }
+    
+    const agentsList = await db.select().from(agents);
+    const usersMap: Record<string, any> = {};
+    const usersList = await db.select().from(users);
+    usersList.forEach((u: any) => {
+      usersMap[u.id] = u;
+    });
+    
+    return agentsList.map((a: any) => ({
+      id: a.id,
+      name: a.name,
+      owner: {
+        id: a.createdBy,
+        name: usersMap[a.createdBy]?.name,
+        email: usersMap[a.createdBy]?.email
+      },
+      isPublic: a.isPublic,
+      createdAt: a.createdAt
+    }));
+  } catch (error: any) {
+    reply.code(500);
+    return { error: error.message || 'Failed to fetch agents' };
+  }
+});
+
+// GET /api/admin/follows - List active follows with prompts
+fastify.get('/api/admin/follows', async (request, reply) => {
+  try {
+    const userId = getUserIdFromRequest(request);
+    if (!isAdmin(userId)) {
+      reply.code(403);
+      return { error: 'Forbidden' };
+    }
+    
+    // Query relationships table for follow relationships
+    const follows = await db.select().from(relationships)
+      .where(eq(relationships.kind, 'follow'));
+    
+    const usersMap: Record<string, any> = {};
+    const actorsMap: Record<string, any> = {};
+    const usersData = await db.select().from(users);
+    const actorsData = await db.select().from(actors);
+    usersData.forEach((u: any) => {
+      usersMap[u.id] = u;
+    });
+    actorsData.forEach((a: any) => {
+      actorsMap[a.id] = a;
+    });
+    
+    return follows.map((f: any) => ({
+      id: f.id,
+      follower: {
+        id: f.fromActorId,
+        name: actorsMap[f.fromActorId]?.displayName,
+        type: actorsMap[f.fromActorId]?.type
+      },
+      following: {
+        id: f.toActorId,
+        name: actorsMap[f.toActorId]?.displayName,
+        type: actorsMap[f.toActorId]?.type
+      },
+      metadata: f.metadata,
+      createdAt: f.createdAt
+    }));
+  } catch (error: any) {
+    reply.code(500);
+    return { error: error.message || 'Failed to fetch follows' };
+  }
 });
 
 // === SOCIAL CORE (feature-flagged) ===
@@ -2401,6 +2738,11 @@ fastify.get('/api/unfurl', async (request, reply) => {
     reply.code(500); return { error: 'unfurl failed' };
   }
 });
+
+// Check if user is admin (thomas@firstprinciple.co)
+function isAdmin(userId: string): boolean {
+  return userId === 'b7c026f5-44b4-4033-bb75-f46af54db3d0'; // thomas@firstprinciple.co UUID
+}
 
 function getUserIdFromRequest(request: any): string {
   try {
@@ -2681,6 +3023,27 @@ if (SOCIAL_CORE) {
         for (let i = 1; i < list.length; i++) toDrop.add(list[i].id);
       }
 
+      // Collapse duplicate agent-actors by agentId (keep the one with displayName and ownerUserId, or the oldest)
+      const agentGroups: Record<string, any[]> = {};
+      for (const a of rows as any[]) {
+        if (a.type === 'agent' && a?.settings?.agentId) {
+          const agentId = String(a.settings.agentId);
+          if (!agentGroups[agentId]) agentGroups[agentId] = [];
+          agentGroups[agentId].push(a);
+        }
+      }
+      for (const agentId of Object.keys(agentGroups)) {
+        const list = agentGroups[agentId];
+        if (list.length > 1) {
+          // Keep the one with displayName and ownerUserId (canonical), or the oldest one
+          const canonical = list.find(a => a.displayName && a.ownerUserId) || list.sort((x, y) => new Date(x.createdAt || 0).getTime() - new Date(y.createdAt || 0).getTime())[0];
+          // Drop all others from response
+          for (const a of list) {
+            if (a.id !== canonical.id) toDrop.add(a.id);
+          }
+        }
+      }
+
       const enriched = (Object.values(userGroups).flat().concat((rows as any[]).filter(a => !(a.type === 'user' && a.ownerUserId))))
         .filter(a => !toDrop.has(a.id))
         .map((a) => {
@@ -2827,30 +3190,11 @@ if (SOCIAL_CORE) {
         updatedAt: new Date(),
       } as any);
       const members = new Set<string>(participantActorIds.concat([createdBy]));
-      // Map each agentId to an actor; if none exists, create one
+      // Map each agentId to an actor using canonical function
       for (const aid of agentIds) {
         try {
-          // Lookup an actor that represents this agent (type=agent, settings.agentId)
-          let actorId: string | null = null;
-          try {
-            const rows = await db.select().from(actors).where(eq(actors.type as any, 'agent')).where(eq((actors.settings as any), (actors.settings as any)));
-          } catch {}
-          // Fallback: create a lightweight agent actor record
-          const newId = randomUUID();
-          await db.insert(actors as any).values({
-            id: newId,
-            type: 'agent',
-            handle: null,
-            displayName: null,
-            avatarUrl: null,
-            ownerUserId: null,
-            orgId: null,
-            capabilityTags: null,
-            settings: { agentId: aid } as any,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          } as any);
-          members.add(newId);
+          const actorId = await getOrCreateAgentActor(aid);
+          members.add(actorId);
         } catch {}
       }
       for (const actorId of members) {
@@ -2963,22 +3307,8 @@ if (SOCIAL_CORE) {
       const role = String(body.role || 'member');
       if (!actorId && !agentId) { reply.code(400); return { error: 'actorId or agentId is required' }; }
       if (!actorId && agentId) {
-        // Create a minimal agent actor for this agentId
-        const newId = randomUUID();
-        await db.insert(actors as any).values({
-          id: newId,
-          type: 'agent',
-          handle: null,
-          displayName: null,
-          avatarUrl: null,
-          ownerUserId: null,
-          orgId: null,
-          capabilityTags: null,
-          settings: { agentId } as any,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        } as any);
-        actorId = newId;
+        // Use canonical function to get or create agent actor
+        actorId = await getOrCreateAgentActor(agentId);
       }
       try {
         await db.insert(roomMembers as any).values({

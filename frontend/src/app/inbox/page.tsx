@@ -5,6 +5,7 @@ import { useSession } from 'next-auth/react';
 import { SidebarInset, SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar';
 import { AppSidebar } from '@/components/app-sidebar';
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from '@/components/ui/breadcrumb';
+import { CreditRequestItem } from '@/components/credit-request-item';
 
 type Actor = {
   id: string;
@@ -24,6 +25,7 @@ export default function InboxPage() {
   const [actorMap, setActorMap] = useState<Record<string, Actor>>({});
   const [incomingPending, setIncomingPending] = useState<any[]>([]);
   const [incomingAgentAccess, setIncomingAgentAccess] = useState<any[]>([]);
+  const [creditRequests, setCreditRequests] = useState<any[]>([]);
   const [history, setHistory] = useState<any[]>([]);
 
   const load = useCallback(async function load() {
@@ -32,10 +34,11 @@ export default function InboxPage() {
     setError(null);
     try {
       const headers = { 'x-user-id': uid } as any;
-      const [actorsRes, incomingRes, incomingAgentAccessRes, histInFollow, histOutFollow, histInAgent, histOutAgent] = await Promise.all([
+      const [actorsRes, incomingRes, incomingAgentAccessRes, creditRequestsRes, histInFollow, histOutFollow, histInAgent, histOutAgent] = await Promise.all([
         fetch('/api/actors', { cache: 'no-store', headers }),
         fetch('/api/relationships?direction=incoming&status=pending', { cache: 'no-store', headers }),
         fetch('/api/relationships?direction=incoming&kind=agent_access&status=pending', { cache: 'no-store', headers }),
+        fetch('/api/wallet/requests', { cache: 'no-store', headers }),
         // History (all statuses)
         fetch('/api/relationships?direction=incoming&kind=follow', { cache: 'no-store', headers }),
         fetch('/api/relationships?direction=outgoing&kind=follow', { cache: 'no-store', headers }),
@@ -63,6 +66,13 @@ export default function InboxPage() {
         const incomingAgentJson = await incomingAgentAccessRes.json();
         incAg = Array.isArray(incomingAgentJson?.relationships) ? incomingAgentJson.relationships : [];
         setIncomingAgentAccess(incAg);
+      } catch {}
+
+      // Load credit requests
+      try {
+        const creditRequestsJson = await creditRequestsRes.json();
+        const requests = Array.isArray(creditRequestsJson?.requests) ? creditRequestsJson.requests : [];
+        setCreditRequests(requests);
       } catch {}
 
       // Build history list
@@ -291,6 +301,21 @@ export default function InboxPage() {
                       </div>
                     );
                   })}
+                </div>
+              )}
+
+              {/* Credit Requests */}
+              {creditRequests.length > 0 && (
+                <div className="space-y-2 mt-4">
+                  <div className="text-xs text-muted-foreground">Credit requests from your agents</div>
+                  {creditRequests.map((request) => (
+                    <CreditRequestItem
+                      key={request.id}
+                      request={request}
+                      onApprove={load}
+                      onReject={load}
+                    />
+                  ))}
                 </div>
               )}
 
