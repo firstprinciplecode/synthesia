@@ -243,6 +243,16 @@ export class WebSocketServer {
       functions: {
         getQuote: {
           name: 'getQuote',
+          description: 'Get real-time price quote for stocks, crypto, or financial instruments via Google Finance',
+          tags: ['finance', 'price', 'quote', 'stock', 'crypto', 'market', 'bitcoin', 'ethereum'],
+          synonyms: ['price.get', 'quote.get', 'stock.quote', 'crypto.price', 'market.price'],
+          inputSchema: {
+            type: 'object',
+            properties: {
+              symbol: { type: 'string', description: 'Stock ticker or crypto name (e.g., AAPL, BTC, bitcoin)' }
+            },
+            required: ['symbol']
+          },
           execute: async (args, ctx) => {
             const symbol = String(args.symbol || '').trim();
             if (!symbol) throw new Error('symbol is required');
@@ -251,6 +261,17 @@ export class WebSocketServer {
         },
         getNews: {
           name: 'getNews',
+          description: 'Get financial news for a stock or crypto symbol',
+          tags: ['finance', 'news', 'stock', 'crypto', 'market'],
+          synonyms: ['finance.news', 'stock.news', 'market.news'],
+          inputSchema: {
+            type: 'object',
+            properties: {
+              symbol: { type: 'string', description: 'Stock ticker or crypto name' },
+              max: { type: 'number', description: 'Maximum number of news items to return (default: 5)' }
+            },
+            required: ['symbol']
+          },
           execute: async (args, ctx) => {
             const symbol = String(args.symbol || '').trim();
             if (!symbol) throw new Error('symbol is required');
