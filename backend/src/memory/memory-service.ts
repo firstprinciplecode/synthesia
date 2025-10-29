@@ -98,6 +98,20 @@ export class MemoryService {
     if (memory.messages.length > memory.maxSize) {
       memory.messages = memory.messages.slice(-memory.maxSize);
     }
+
+    // If memory is at capacity, asynchronously create/update a summary for the current conversation
+    try {
+      if (memory.messages.length >= memory.maxSize) {
+        const convoId = safeMsg.conversationId;
+        if (convoId) {
+          const take = memory.messages.slice(-memory.maxSize);
+          // Fire-and-forget summarization at level 1
+          (async () => {
+            try { await this.createConversationSummary(agentId, convoId, take, 1); } catch {}
+          })();
+        }
+      }
+    } catch {}
   }
 
   getShortTerm(agentId: string): MemoryMessage[] {

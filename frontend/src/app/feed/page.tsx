@@ -210,12 +210,20 @@ function FeedContent() {
   const abortRef = useRef<AbortController | null>(null);
   const [meName, setMeName] = useState<string>("");
   const [meAvatar, setMeAvatar] = useState<string>("");
+  const [meId, setMeId] = useState<string>("");
   const [diagnostics, setDiagnostics] = useState<Array<Record<string, unknown>> | null>(null);
   const diagEnabled = (search?.get('diag') === '1' || search?.get('diagnostics') === '1');
   const [typingByPost, setTypingByPost] = useState<Record<string, { name: string }>>({});
   const [stopLoading, setStopLoading] = useState<Record<string, boolean>>({});
   const [followableByKey, setFollowableByKey] = useState<Record<string, boolean>>({}); // key: `${postId}:${agentId}`
+  const [followByAgentId, setFollowByAgentId] = useState<Record<string, boolean>>({});
+  const [agentActorByAgentId, setAgentActorByAgentId] = useState<Record<string, string>>({});
+  const [followBusy, setFollowBusy] = useState<Record<string, boolean>>({});
   const [feedMode, setFeedMode] = useState<'all' | 'following'>('all');
+  // Relationship state
+  const [ownedAgentIds, setOwnedAgentIds] = useState<Set<string>>(new Set());
+  const [agentAccessByAgentId, setAgentAccessByAgentId] = useState<Record<string, 'none' | 'pending' | 'accepted'>>({});
+  const [relBusy, setRelBusy] = useState<Record<string, boolean>>({});
   // const [selectedFile, setSelectedFile] = useState<File | null>(null);
 
   const fetchFeed = useCallback(async (pageNum: number = 0, append: boolean = false) => {
@@ -429,10 +437,145 @@ function FeedContent() {
         try { if (avatar && avatar.startsWith('http://localhost:3001')) avatar = avatar.replace('http://localhost:3001',''); } catch {}
         setMeName(name);
         setMeAvatar(avatar || '');
+        if (u?.id) setMeId(String(u.id));
       } catch {}
     }
     if (status === 'authenticated') loadProfile();
   }, [status, session]);
+
+  // Load owned agents and agent_access relationship states
+  useEffect(() => {
+    (async () => {
+      try {
+        const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+        if (!uid) return;
+        const headers: Record<string, string> = { 'x-user-id': uid };
+        // Owned and accessible agents
+        try {
+          const r = await fetch('/api/agents/accessible', { headers });
+          if (r.ok) {
+            const j = await r.json();
+            const list: any[] = Array.isArray(j?.agents) ? j.agents : [];
+            const owned = new Set<string>();
+            for (const a of list) {
+              const createdBy = String(a?.createdBy || '');
+              if (createdBy && (createdBy === uid || (meId && createdBy === meId))) owned.add(String(a.id));
+            }
+            setOwnedAgentIds(owned);
+          }
+        } catch {}
+        // Outgoing agent_access relationships (pending + accepted)
+        const rels = await fetch('/api/relationships?direction=outgoing&kind=agent_access', { headers });
+        if (rels.ok) {
+          const j = await rels.json();
+          const arr: any[] = Array.isArray(j?.relationships) ? j.relationships : [];
+          const byActor: Record<string, string> = {};
+          const uniqueToActorIds = Array.from(new Set(arr.map(r => String(r.toActorId))));
+          // Resolve each toActorId -> agentId via /api/actors/:id
+          await Promise.all(uniqueToActorIds.map(async (aid) => {
+            try {
+              const rr = await fetch(`/api/actors/${encodeURIComponent(aid)}`, { headers });
+              if (rr.ok) {
+                const a = await rr.json();
+                const agentId = a?.settings?.agentId ? String(a.settings.agentId) : '';
+                if (agentId) byActor[aid] = agentId;
+              }
+            } catch {}
+          }));
+          const map: Record<string, 'none' | 'pending' | 'accepted'> = {};
+          for (const r of arr) {
+            const agentId = byActor[String(r.toActorId)];
+            if (!agentId) continue;
+            const status = String(r?.metadata?.status || 'accepted') as 'pending' | 'accepted';
+            map[agentId] = status;
+          }
+          setAgentAccessByAgentId(map);
+        }
+
+        // Outgoing follow relationships (agent-level follow)
+        try {
+          const rf = await fetch('/api/relationships?direction=outgoing&kind=follow', { headers });
+          if (rf.ok) {
+            const jj = await rf.json();
+            const arr: any[] = Array.isArray(jj?.relationships) ? jj.relationships : [];
+            // Resolve toActorId -> agentId via /api/actors/:id only for agent actors
+            const agentActorIds = Array.from(new Set(arr.map(r => String(r.toActorId))));
+            const map: Record<string, boolean> = {};
+            await Promise.all(agentActorIds.map(async (aid) => {
+              try {
+                const rr = await fetch(`/api/actors/${encodeURIComponent(aid)}`, { headers });
+                if (rr.ok) {
+                  const a = await rr.json();
+                  const agentId = a?.settings?.agentId ? String(a.settings.agentId) : '';
+                  if (agentId) map[agentId] = true;
+                }
+              } catch {}
+            }));
+            setFollowByAgentId(map);
+          }
+        } catch {}
+      } catch {}
+    })();
+  }, [status, session, meId]);
+
+  function accessLabel(agentId: string, isOwner: boolean): 'connect'|'cancel'|'disconnect'|'none' {
+    if (isOwner) return 'none';
+    const st = agentAccessByAgentId[agentId] || 'none';
+    if (st === 'pending') return 'cancel';
+    if (st === 'accepted') return 'disconnect';
+    return 'connect';
+  }
+
+  async function handleAccess(agentId: string, action: 'connect'|'cancel'|'disconnect') {
+    const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (uid) headers['x-user-id'] = uid as string;
+    setRelBusy((s) => ({ ...s, [agentId]: true }));
+    try {
+      if (action === 'connect') {
+        await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId }) });
+        setAgentAccessByAgentId((m) => ({ ...m, [agentId]: 'pending' }));
+      } else if (action === 'cancel' || action === 'disconnect') {
+        await fetch(`/api/relationships?kind=agent_access&agentId=${encodeURIComponent(agentId)}`, { method: 'DELETE', headers });
+        setAgentAccessByAgentId((m) => { const x = { ...m }; delete x[agentId]; return x; });
+      }
+    } catch {}
+    setRelBusy((s) => ({ ...s, [agentId]: false }));
+  }
+
+  async function ensureAgentActorId(agentId: string, headers: Record<string, string>): Promise<string | null> {
+    const cached = agentActorByAgentId[agentId];
+    if (cached) return cached;
+    try {
+      const r = await fetch(`/api/actors?agentId=${encodeURIComponent(agentId)}`, { headers });
+      if (!r.ok) return null;
+      const a = await r.json();
+      if (a?.id) {
+        setAgentActorByAgentId((m) => ({ ...m, [agentId]: String(a.id) }));
+        return String(a.id);
+      }
+    } catch {}
+    return null;
+  }
+
+  async function handleFollowAgent(agentId: string, follow: boolean) {
+    const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (uid) headers['x-user-id'] = uid as string;
+    setFollowBusy((s) => ({ ...s, [agentId]: true }));
+    try {
+      const actorId = await ensureAgentActorId(agentId, headers);
+      if (!actorId) return;
+      if (follow) {
+        await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'follow', toActorId: actorId }) });
+        setFollowByAgentId((m) => ({ ...m, [agentId]: true }));
+      } else {
+        await fetch(`/api/relationships?kind=follow&toActorId=${encodeURIComponent(actorId)}`, { method: 'DELETE', headers });
+        setFollowByAgentId((m) => { const x = { ...m }; delete x[agentId]; return x; });
+      }
+    } catch {}
+    setFollowBusy((s) => ({ ...s, [agentId]: false }));
+  }
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -823,30 +966,38 @@ function FeedContent() {
                               >
                                 Reply
                               </button>
-                              <button
-                                className="text-muted-foreground hover:underline"
-                                onClick={async () => {
-                                  try {
-                                    const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
-                                    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-                                    if (uid) headers['x-user-id'] = uid as string;
-                                    await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: thread.agentId }) });
-                                  } catch {}
-                                }}
-                              >
-                                Connect
-                              </button>
-                              <button
-                                className="text-muted-foreground hover:underline"
-                                onClick={async () => {
-                                  try {
-                                    if (!searchPostId) return;
-                                    await fetch('/api/monitors/create-for-post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: searchPostId, agentId: thread.agentId }) });
-                                  } catch {}
-                                }}
-                              >
-                                Follow
-            </button>
+                              {(() => {
+                                const isOwner = ownedAgentIds.has(thread.agentId);
+                                const label = accessLabel(thread.agentId, isOwner);
+                                if (label === 'none') return null;
+                                const btnText = label === 'connect' ? 'Connect' : (label === 'cancel' ? 'Cancel' : 'Disconnect');
+                                return (
+                                  <button
+                                    className={`text-muted-foreground hover:underline ${relBusy[thread.agentId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                    disabled={!!relBusy[thread.agentId]}
+                                    onClick={() => handleAccess(thread.agentId, label)}
+                                  >
+                                    {btnText}
+                                  </button>
+                                );
+                              })()}
+                              {followByAgentId[thread.agentId] ? (
+                                <button
+                                  className={`text-muted-foreground hover:underline ${followBusy[thread.agentId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                  disabled={!!followBusy[thread.agentId]}
+                                  onClick={() => handleFollowAgent(thread.agentId, false)}
+                                >
+                                  Unfollow
+                                </button>
+                              ) : (
+                                <button
+                                  className={`text-muted-foreground hover:underline ${followBusy[thread.agentId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                  disabled={!!followBusy[thread.agentId]}
+                                  onClick={() => handleFollowAgent(thread.agentId, true)}
+                                >
+                                  Follow
+                                </button>
+                              )}
           </div>
                           </div>
                           
@@ -934,7 +1085,11 @@ function FeedContent() {
                                                 const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
                                                 const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                                                 if (uid) headers['x-user-id'] = uid as string;
-                                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: reply.authorId }) });
+                                                {
+                                                  const isOwner = ownedAgentIds.has(reply.authorId);
+                                                  const lbl = accessLabel(reply.authorId, isOwner);
+                                                  if (lbl !== 'none') await handleAccess(reply.authorId, lbl);
+                                                }
                                               } catch {}
                                             }}
                                           >
@@ -1175,42 +1330,36 @@ function FeedContent() {
                       <button className="text-muted-foreground hover:underline" onClick={() => setReplyComposerOpen((m) => ({ ...m, [p.id]: true }))}>Reply</button>
                       {p.authorType === 'agent' && p.authorId ? (
                         <>
-                          <button
-                            className="text-muted-foreground hover:underline"
-                            onClick={async () => {
-                              try {
-                                const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
-                                const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-                                if (uid) headers['x-user-id'] = uid as string;
-                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: p.authorId }) });
-                              } catch {}
-                            }}
-                          >
-                            Connect
-                          </button>
-                          {followableByKey[`${p.id}:${p.authorId}`] ? (
+                          {(() => {
+                            const isOwner = ownedAgentIds.has(p.authorId);
+                            const label = accessLabel(p.authorId, isOwner);
+                            if (label === 'none') return null;
+                            const btnText = label === 'connect' ? 'Connect' : (label === 'cancel' ? 'Cancel' : 'Disconnect');
+                            return (
+                              <button
+                                className={`text-muted-foreground hover:underline ${relBusy[p.authorId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                disabled={!!relBusy[p.authorId]}
+                                onClick={() => handleAccess(p.authorId, label)}
+                              >
+                                {btnText}
+                              </button>
+                            );
+                          })()}
+                          {followByAgentId[p.authorId] ? (
                             <button
-                              className="text-muted-foreground hover:underline"
-                              onClick={async () => {
-                                try {
-                                  await fetch('/api/monitors/create-for-post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: p.authorId }) });
-                                  setFollowableByKey((s) => ({ ...s, [`${p.id}:${p.authorId}`]: false }));
-                                } catch {}
-                              }}
+                              className={`text-muted-foreground hover:underline ${followBusy[p.authorId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                              disabled={!!followBusy[p.authorId]}
+                              onClick={() => handleFollowAgent(p.authorId, false)}
                             >
-                              Follow
+                              Unfollow
                             </button>
                           ) : (
                             <button
-                              className="text-muted-foreground hover:underline"
-                              onClick={async () => {
-                                try {
-                                  await fetch('/api/monitors/disable-by-post-and-agent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: p.authorId }) });
-                                  setFollowableByKey((s) => ({ ...s, [`${p.id}:${p.authorId}`]: true }));
-                                } catch {}
-                              }}
+                              className={`text-muted-foreground hover:underline ${followBusy[p.authorId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                              disabled={!!followBusy[p.authorId]}
+                              onClick={() => handleFollowAgent(p.authorId, true)}
                             >
-                              Stop
+                              Follow
                             </button>
                           )}
                         </>
@@ -1282,7 +1431,11 @@ function FeedContent() {
                                     const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
                                     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                                     if (uid) headers['x-user-id'] = uid as string;
-                                    await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: r.authorId }) });
+                                    {
+                                      const isOwner = ownedAgentIds.has(r.authorId);
+                                      const lbl = accessLabel(r.authorId, isOwner);
+                                      if (lbl !== 'none') await handleAccess(r.authorId, lbl);
+                                    }
                                   } catch {}
                                 }}
                               >
@@ -1290,29 +1443,21 @@ function FeedContent() {
                               </button>
                             ) : null}
                             {r.authorType === 'agent' && r.authorId ? (
-                              followableByKey[`${p.id}:${r.authorId}`] ? (
+                              followByAgentId[r.authorId] ? (
                                 <button
-                                  className="text-muted-foreground hover:underline"
-                                  onClick={async () => {
-                                    try {
-                                      await fetch('/api/monitors/create-for-post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: r.authorId }) });
-                                      setFollowableByKey((s) => ({ ...s, [`${p.id}:${r.authorId}`]: false }));
-                                    } catch {}
-                                  }}
+                                  className={`text-muted-foreground hover:underline ${followBusy[r.authorId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                  disabled={!!followBusy[r.authorId]}
+                                  onClick={() => handleFollowAgent(r.authorId, false)}
                                 >
-                                  Follow
+                                  Unfollow
                                 </button>
                               ) : (
                                 <button
-                                  className="text-muted-foreground hover:underline"
-                                  onClick={async () => {
-                                    try {
-                                      await fetch('/api/monitors/disable-by-post-and-agent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: r.authorId }) });
-                                      setFollowableByKey((s) => ({ ...s, [`${p.id}:${r.authorId}`]: true }));
-                                    } catch {}
-                                  }}
+                                  className={`text-muted-foreground hover:underline ${followBusy[r.authorId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                  disabled={!!followBusy[r.authorId]}
+                                  onClick={() => handleFollowAgent(r.authorId, true)}
                                 >
-                                  Stop
+                                  Follow
                                 </button>
                               )
                             ) : null}
@@ -1386,7 +1531,11 @@ function FeedContent() {
                                 const uid = (session as unknown as { userId?: string; user?: { email?: string } })?.userId || (session as unknown as { user?: { email?: string } })?.user?.email;
                                 const headers: Record<string, string> = { 'Content-Type': 'application/json' };
                                 if (uid) headers['x-user-id'] = uid as string;
-                                await fetch('/api/relationships', { method: 'POST', headers, body: JSON.stringify({ kind: 'agent_access', agentId: p.authorId }) });
+                                {
+                                  const isOwner = ownedAgentIds.has(p.authorId);
+                                  const lbl = accessLabel(p.authorId, isOwner);
+                                  if (lbl !== 'none') await handleAccess(p.authorId, lbl);
+                                }
                               } catch {}
                             }}
                           >
@@ -1394,29 +1543,21 @@ function FeedContent() {
                           </button>
                         ) : null}
                         {p.authorType === 'agent' && p.authorId ? (
-                          followableByKey[`${p.id}:${p.authorId}`] ? (
+                          followByAgentId[p.authorId] ? (
                             <button
-                              className="text-muted-foreground hover:underline"
-                              onClick={async () => {
-                                try {
-                                  await fetch('/api/monitors/create-for-post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: p.authorId }) });
-                                  setFollowableByKey((s) => ({ ...s, [`${p.id}:${p.authorId}`]: false }));
-                                } catch {}
-                              }}
+                              className={`text-muted-foreground hover:underline ${followBusy[p.authorId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                              disabled={!!followBusy[p.authorId]}
+                              onClick={() => handleFollowAgent(p.authorId, false)}
                             >
-                              Follow
+                              Unfollow
                             </button>
                           ) : (
                             <button
-                              className="text-muted-foreground hover:underline"
-                              onClick={async () => {
-                                try {
-                                  await fetch('/api/monitors/disable-by-post-and-agent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postId: p.id, agentId: p.authorId }) });
-                                  setFollowableByKey((s) => ({ ...s, [`${p.id}:${p.authorId}`]: true }));
-                                } catch {}
-                              }}
+                              className={`text-muted-foreground hover:underline ${followBusy[p.authorId] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                              disabled={!!followBusy[p.authorId]}
+                              onClick={() => handleFollowAgent(p.authorId, true)}
                             >
-                              Stop
+                              Follow
                             </button>
                           )
                         ) : null}
@@ -1460,4 +1601,3 @@ export default function FeedPage() {
     </Suspense>
   );
 }
-

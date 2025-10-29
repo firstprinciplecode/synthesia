@@ -265,8 +265,13 @@ const fastify = Fastify({
 });
 
 // Register plugins
+// Allow configurable CORS origins via CORS_ORIGIN (comma-separated). Defaults to permissive in dev.
+const corsOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 await fastify.register(cors, {
-  origin: true,
+  origin: corsOrigins.length ? corsOrigins : true,
   credentials: true,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','x-user-id'],
@@ -274,7 +279,8 @@ await fastify.register(cors, {
 });
 
 await fastify.register(websocket);
-await fastify.register(multipart);
+// Restrict upload sizes (override with UPLOAD_MAX_BYTES)
+await fastify.register(multipart, { limits: { fileSize: Number(process.env.UPLOAD_MAX_BYTES || 5_000_000) } });
 
 // Static file serving for uploads
 const uploadsDir = join(process.cwd(), 'uploads');
@@ -419,6 +425,29 @@ async function ensureInboxTables() {
 }
 await ensureInboxTables();
 
+// Ensure key uniqueness constraints exist to prevent duplicate edges and memberships
+async function ensureUniqueConstraints() {
+  try {
+    // Relationships: unique per (from, to, kind)
+    await db.execute(sql`create unique index if not exists relationships_unique_edge_unique on relationships (from_actor_id, to_actor_id, kind)` as any);
+  } catch (e) {
+    fastify.log.warn({ err: (e as any)?.message }, 'ensure-unique-relationships failed');
+  }
+  try {
+    // Room members: unique per (room, actor)
+    await db.execute(sql`create unique index if not exists room_members_room_actor_unique on room_members (room_id, actor_id)` as any);
+  } catch (e) {
+    fastify.log.warn({ err: (e as any)?.message }, 'ensure-unique-room_members failed');
+  }
+  try {
+    // Wallets: unique per (owner_id, owner_type)
+    await db.execute(sql`create unique index if not exists wallets_owner_unique on wallets (owner_id, owner_type)` as any);
+  } catch (e) {
+    fastify.log.warn({ err: (e as any)?.message }, 'ensure-unique-wallets failed');
+  }
+}
+await ensureUniqueConstraints();
+
 // Ensure DB pool is closed when Fastify shuts down
 fastify.addHook('onClose', async () => {
   try { await closeDbPool(); } catch {}
@@ -494,10 +523,21 @@ if (MONITORING_ENABLED && MONITORING_LEADER) {
       const rows: any[] = await db.execute(sql`select * from agent_monitors where enabled = true and (next_run_at is null or next_run_at <= ${nowIso}) limit 5` as any);
       const list: any[] = Array.isArray((rows as any)?.rows) ? (rows as any).rows : (rows as any[]);
       fastify.log.info({ count: list.length }, 'monitoring:due-monitors');
+      // Ensure we process at most one monitor per agent per loop
+      const processedAgents = new Set<string>();
       for (const m of list) {
         try {
           const mid = String(m.id);
           const aid = String(m.agent_id);
+          if (processedAgents.has(aid)) {
+            try {
+              const jitterMin = Math.floor(Math.random() * 10);
+              const cadenceMin = Math.max(360, Number(m.cadence_minutes || 60));
+              const next = new Date(Date.now() + (cadenceMin + jitterMin) * 60000);
+              await db.execute(sql`update agent_monitors set next_run_at = ${next.toISOString()}, updated_at = ${new Date().toISOString()} where id = ${mid}` as any);
+            } catch {}
+            continue;
+          }
           const engine = String(m.engine);
           const query = String(m.query);
           const params = (m.params && typeof m.params === 'object') ? m.params : {};
@@ -660,6 +700,22 @@ if (MONITORING_ENABLED && MONITORING_LEADER) {
             }
           }
           if (!isFirstRun && fresh.length) {
+            // Global per-agent cooldown: skip if agent posted within last 6 hours
+            try {
+              const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+              const recent = await db.execute(sql`select id from public_feed_posts where author_type = 'agent' and author_id = ${aid} and created_at > ${sixHoursAgo} limit 1` as any);
+              const hasRecent = Array.isArray((recent as any)?.rows) ? ((recent as any).rows?.length > 0) : ((recent as any[])?.length > 0);
+              if (hasRecent) {
+                fastify.log.info({ aid, mid }, 'monitor:cooldown-skip');
+                // Schedule next run with minimum 6h cadence
+                const jitterMin = Math.floor(Math.random() * 10);
+                const cadenceMin = Math.max(360, Number(m.cadence_minutes || 60));
+                const next = new Date(Date.now() + (cadenceMin + jitterMin) * 60000);
+                await db.execute(sql`update agent_monitors set last_run_at = ${new Date().toISOString()}, next_run_at = ${next.toISOString()}, updated_at = ${new Date().toISOString()} where id = ${mid}` as any);
+                processedAgents.add(aid);
+                continue;
+              }
+            } catch {}
             // Compose persona intro and post to feed
             const arows = await db.select({ id: agents.id, name: agents.name, instructions: agents.instructions, avatar: agents.avatar, toolPreferences: (agents as any)["toolPreferences"] as any }).from(agents);
             const agentRow = (arows as any[]).find(a => String(a.id) === aid);
@@ -708,10 +764,12 @@ if (MONITORING_ENABLED && MONITORING_LEADER) {
               }
             } catch {}
           }
-          // Schedule next run
+          // Schedule next run with a minimum cadence of 6 hours
           const jitterMin = Math.floor(Math.random() * 10);
-          const next = new Date(Date.now() + (Number(m.cadence_minutes || 60) + jitterMin) * 60000);
+          const cadenceMin = Math.max(360, Number(m.cadence_minutes || 60));
+          const next = new Date(Date.now() + (cadenceMin + jitterMin) * 60000);
           await db.execute(sql`update agent_monitors set last_run_at = ${new Date().toISOString()}, next_run_at = ${next.toISOString()}, updated_at = ${new Date().toISOString()} where id = ${mid}` as any);
+          processedAgents.add(aid);
         } catch (err) {
           fastify.log.error({ err: (err as any)?.message }, 'monitor:run-failed');
         }
@@ -1004,16 +1062,18 @@ fastify.post('/api/monitors/create-for-post', async (request, reply) => {
         );
         
         if (existingFollow.length === 0) {
-          // Create follow relationship
+          // Create follow relationship (conflict-safe)
           const relationshipId = randomUUID();
-          await db.insert(relationships).values({
-            id: relationshipId,
-            fromActorId: userActorId,
-            toActorId: agentActorId,
-            kind: 'follow',
-            metadata: { status: 'accepted' },
-            createdAt: new Date(),
-          });
+          await (db.insert(relationships) as any)
+            .values({
+              id: relationshipId,
+              fromActorId: userActorId,
+              toActorId: agentActorId,
+              kind: 'follow',
+              metadata: { status: 'accepted' },
+              createdAt: new Date(),
+            } as any)
+            .onConflictDoNothing({ target: [relationships.fromActorId, relationships.toActorId, relationships.kind] } as any);
           followRelationshipCreated = true;
           request.server.log.info({ userActorId, agentActorId, relationshipId }, 'follow-relationship-created');
         } else {
@@ -2224,17 +2284,19 @@ fastify.post('/api/local-auth/register', async (request, reply) => {
     const hash = await bcrypt.hash(password, 12);
     const now = new Date();
     const id = randomUUID();
-    await db.insert(users as any).values({
-      id,
-      email,
-      name,
-      avatar: '',
-      phone: '', bio: '', location: '', company: '', website: '',
-      requireApproval: true,
-      xAuth: { local: { passwordHash: hash } } as any,
-      createdAt: now,
-      updatedAt: now,
-    } as any);
+    await (db.insert(users as any) as any)
+      .values({
+        id,
+        email,
+        name,
+        avatar: '',
+        phone: '', bio: '', location: '', company: '', website: '',
+        requireApproval: true,
+        xAuth: { local: { passwordHash: hash } } as any,
+        createdAt: now,
+        updatedAt: now,
+      } as any)
+      .onConflictDoNothing({ target: [users.email as any] } as any);
     
     // Initialize wallet with 10,000 credits
     try {
@@ -3080,7 +3142,6 @@ if (SOCIAL_CORE) {
   // Create/update actor (minimal; owner-only in future auth)
   fastify.post('/api/actors', async (request, reply) => {
     const body = (request.body || {}) as any;
-    const id = randomUUID();
     const type = String(body.type || 'user');
     const handlePattern = /^[a-z0-9_]{2,32}$/;
     let handle: string | null = body.handle ? String(body.handle).trim().toLowerCase() : null;
@@ -3098,6 +3159,13 @@ if (SOCIAL_CORE) {
       : null;
     const settings = body.settings && typeof body.settings === 'object' ? body.settings : null;
     try {
+      // For agent actors with a provided agentId in settings, canonicalize via getOrCreateAgentActor
+      if (type === 'agent' && settings && (settings as any).agentId) {
+        const aid = await getOrCreateAgentActor(String((settings as any).agentId));
+        reply.code(200);
+        return { id: aid };
+      }
+      const id = randomUUID();
       await db.insert(actors as any).values({
         id,
         type,
@@ -3198,15 +3266,17 @@ if (SOCIAL_CORE) {
         } catch {}
       }
       for (const actorId of members) {
-        await db.insert(roomMembers as any).values({
-          id: randomUUID(),
-          roomId: id,
-          actorId,
-          role: actorId === createdBy ? 'owner' : 'member',
-          joinsAt: new Date(),
-          leavesAt: null,
-          settings: null,
-        } as any);
+        await (db.insert(roomMembers as any) as any)
+          .values({
+            id: randomUUID(),
+            roomId: id,
+            actorId,
+            role: actorId === createdBy ? 'owner' : 'member',
+            joinsAt: new Date(),
+            leavesAt: null,
+            settings: null,
+          } as any)
+          .onConflictDoNothing({ target: [roomMembers.roomId as any, roomMembers.actorId as any] } as any);
       }
       reply.code(201);
       return { id, kind, title, participants: Array.from(members) };
@@ -3279,15 +3349,17 @@ if (SOCIAL_CORE) {
       const actorId = await getOrCreateUserActor(getUserIdFromRequest(request));
       // Upsert-like: try insert, ignore if exists
       try {
-        await db.insert(roomMembers as any).values({
-          id: randomUUID(),
-          roomId: id,
-          actorId,
-          role: 'member',
-          joinsAt: new Date(),
-          leavesAt: null,
-          settings: null,
-        } as any);
+        await (db.insert(roomMembers as any) as any)
+          .values({
+            id: randomUUID(),
+            roomId: id,
+            actorId,
+            role: 'member',
+            joinsAt: new Date(),
+            leavesAt: null,
+            settings: null,
+          } as any)
+          .onConflictDoNothing({ target: [roomMembers.roomId as any, roomMembers.actorId as any] } as any);
       } catch {}
       return { ok: true };
     } catch (e: any) {
@@ -3311,15 +3383,17 @@ if (SOCIAL_CORE) {
         actorId = await getOrCreateAgentActor(agentId);
       }
       try {
-        await db.insert(roomMembers as any).values({
-          id: randomUUID(),
-          roomId: id,
-          actorId,
-          role,
-          joinsAt: new Date(),
-          leavesAt: null,
-          settings: null,
-        } as any);
+        await (db.insert(roomMembers as any) as any)
+          .values({
+            id: randomUUID(),
+            roomId: id,
+            actorId,
+            role,
+            joinsAt: new Date(),
+            leavesAt: null,
+            settings: null,
+          } as any)
+          .onConflictDoNothing({ target: [roomMembers.roomId as any, roomMembers.actorId as any] } as any);
       } catch {}
       return { ok: true };
     } catch (e: any) {
@@ -3463,10 +3537,14 @@ if (SOCIAL_CORE) {
         } as any;
         try { await db.insert(rooms as any).values(created); } catch {}
         try {
-          await db.insert(roomMembers as any).values({ id: randomUUID(), roomId, actorId: myActorId, role: 'member', joinsAt: new Date(), leavesAt: null, settings: null } as any);
+          await (db.insert(roomMembers as any) as any)
+            .values({ id: randomUUID(), roomId, actorId: myActorId, role: 'member', joinsAt: new Date(), leavesAt: null, settings: null } as any)
+            .onConflictDoNothing({ target: [roomMembers.roomId as any, roomMembers.actorId as any] } as any);
         } catch {}
         try {
-          await db.insert(roomMembers as any).values({ id: randomUUID(), roomId, actorId: agentActorId, role: 'member', joinsAt: new Date(), leavesAt: null, settings: null } as any);
+          await (db.insert(roomMembers as any) as any)
+            .values({ id: randomUUID(), roomId, actorId: agentActorId, role: 'member', joinsAt: new Date(), leavesAt: null, settings: null } as any)
+            .onConflictDoNothing({ target: [roomMembers.roomId as any, roomMembers.actorId as any] } as any);
         } catch {}
         room = created;
       }
@@ -3670,14 +3748,16 @@ if (SOCIAL_CORE) {
       );
       request.server.log.info({ existingCount: existing.length, targetType: target?.type, metadata }, 'relationships.create: dedupe check');
       if (!existing.length) {
-        await db.insert(relationships as any).values({
-          id: randomUUID(),
-          fromActorId: meId,
-          toActorId,
-          kind,
-          metadata,
-          createdAt: new Date(),
-        } as any);
+        await (db.insert(relationships as any) as any)
+          .values({
+            id: randomUUID(),
+            fromActorId: meId,
+            toActorId,
+            kind,
+            metadata,
+            createdAt: new Date(),
+          } as any)
+          .onConflictDoNothing({ target: [relationships.fromActorId as any, relationships.toActorId as any, relationships.kind as any] } as any);
         request.server.log.info({ meId, toActorId, kind, metadata }, 'relationships.create: inserted');
       }
       reply.code(201);
@@ -3898,14 +3978,16 @@ if (SOCIAL_CORE) {
         const myPrimary = Array.from(myActorIds)[0];
         const reciprocal = (all as any[]).find(r => r.kind === kind && myActorIds.has(r.fromActorId) && r.toActorId === fromId);
         if (!reciprocal) {
-          await db.insert(relationships as any).values({
-            id: randomUUID(),
-            fromActorId: myPrimary,
-            toActorId: fromId,
-            kind,
-            metadata: { status: 'accepted' } as any,
-            createdAt: new Date(),
-          } as any);
+          await (db.insert(relationships as any) as any)
+            .values({
+              id: randomUUID(),
+              fromActorId: myPrimary,
+              toActorId: fromId,
+              kind,
+              metadata: { status: 'accepted' } as any,
+              createdAt: new Date(),
+            } as any)
+            .onConflictDoNothing({ target: [relationships.fromActorId as any, relationships.toActorId as any, relationships.kind as any] } as any);
           request.server.log.info({ myPrimary, toActorId: fromId }, 'relationships.approve: reciprocal created');
         }
         return { ok: true };
@@ -4258,10 +4340,12 @@ if (SOCIAL_CORE) {
           createdAt: new Date(),
           updatedAt: new Date(),
         } as any);
-        await db.insert(roomMembers as any).values([
-          { id: randomUUID(), roomId, actorId: myPrimary, role: 'member', joinsAt: new Date(), leavesAt: null, settings: null } as any,
-          { id: randomUUID(), roomId, actorId: theirPrimary, role: 'member', joinsAt: new Date(), leavesAt: null, settings: null } as any,
-        ] as any);
+        await (db.insert(roomMembers as any) as any)
+          .values([
+            { id: randomUUID(), roomId, actorId: myPrimary, role: 'member', joinsAt: new Date(), leavesAt: null, settings: null } as any,
+            { id: randomUUID(), roomId, actorId: theirPrimary, role: 'member', joinsAt: new Date(), leavesAt: null, settings: null } as any,
+          ] as any)
+          .onConflictDoNothing({ target: [roomMembers.roomId as any, roomMembers.actorId as any] } as any);
         request.server.log.info({ roomId, myPrimary, theirPrimary }, 'rooms.dm.created');
         return { roomId };
       } else {
@@ -4430,7 +4514,7 @@ fastify.post('/api/uploads/avatar', async (request, reply) => {
       reply.code(400);
       return { error: 'No file uploaded' };
     }
-    const allowed = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml']);
+    const allowed = new Set(['image/png', 'image/jpeg', 'image/webp']);
     if (file.mimetype && !allowed.has(file.mimetype)) {
       reply.code(400);
       return { error: 'Unsupported file type' };
@@ -4458,7 +4542,7 @@ fastify.post('/api/agents/:id/avatar', async (request, reply) => {
       reply.code(400);
       return { error: 'No file uploaded' };
     }
-    const allowed = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml']);
+    const allowed = new Set(['image/png', 'image/jpeg', 'image/webp']);
     if (file.mimetype && !allowed.has(file.mimetype)) {
       reply.code(400);
       return { error: 'Unsupported file type' };
@@ -4998,19 +5082,21 @@ fastify.get('/api/profile', async (request, reply) => {
       if (isEmail(rawUid)) {
         const now = new Date();
         const id = randomUUID();
-        await db.insert(users).values({
-          id,
-          email: rawUid,
-          name: '',
-          avatar: '',
-          phone: '',
-          bio: '',
-          location: '',
-          company: '',
-          website: '',
-          createdAt: now,
-          updatedAt: now,
-        } as any);
+        await (db.insert(users) as any)
+          .values({
+            id,
+            email: rawUid,
+            name: '',
+            avatar: '',
+            phone: '',
+            bio: '',
+            location: '',
+            company: '',
+            website: '',
+            createdAt: now,
+            updatedAt: now,
+          } as any)
+          .onConflictDoNothing({ target: [users.email as any] } as any);
         userRows = await db.select().from(users).where(eq(users.id as any, id as any));
       } else {
         reply.code(404);
@@ -5054,19 +5140,21 @@ fastify.put('/api/profile', async (request, reply) => {
     const now = new Date();
     const email = typeof body?.email === 'string' && body.email ? body.email : (rawUid && rawUid.includes('@') ? rawUid : '');
     const newId = randomUUID();
-    await db.insert(users).values({
-      id: newId,
-      email,
-      name: body?.name || '',
-      avatar: body?.avatar || '',
-      phone: body?.phone || '',
-      bio: body?.bio || '',
-      location: body?.location || '',
-      company: body?.company || '',
-      website: body?.website || '',
-      createdAt: now,
-      updatedAt: now,
-    } as any);
+    await (db.insert(users) as any)
+      .values({
+        id: newId,
+        email,
+        name: body?.name || '',
+        avatar: body?.avatar || '',
+        phone: body?.phone || '',
+        bio: body?.bio || '',
+        location: body?.location || '',
+        company: body?.company || '',
+        website: body?.website || '',
+        createdAt: now,
+        updatedAt: now,
+      } as any)
+      .onConflictDoNothing({ target: [users.email as any] } as any);
   } else {
     const targetId = existing[0].id as string;
     await db.update(users).set(patch).where(eq(users.id as any, targetId as any));
@@ -5113,4 +5201,3 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 start();
-

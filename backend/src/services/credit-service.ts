@@ -36,15 +36,17 @@ export class CreditService {
     const walletId = randomUUID();
     const initialBalance = ownerType === 'USER' ? '10000.00' : '0.00';
 
-    await db.insert(wallets).values({
-      id: walletId,
-      ownerId,
-      ownerType,
-      balance: initialBalance,
-      lifetimeEarned: ownerType === 'USER' ? '10000.00' : '0.00',
-      lifetimeSpent: '0.00',
-      status: 'ACTIVE',
-    });
+    await (db.insert(wallets) as any)
+      .values({
+        id: walletId,
+        ownerId,
+        ownerType,
+        balance: initialBalance,
+        lifetimeEarned: ownerType === 'USER' ? '10000.00' : '0.00',
+        lifetimeSpent: '0.00',
+        status: 'ACTIVE',
+      } as any)
+      .onConflictDoNothing({ target: [wallets.ownerId as any, wallets.ownerType as any] } as any);
 
     // Log initial transaction for users
     if (ownerType === 'USER') {
@@ -161,15 +163,17 @@ export class CreditService {
         let agentWallet;
         if (agentWallets.length === 0) {
           const walletId = randomUUID();
-          await tx.insert(wallets).values({
-            id: walletId,
-            ownerId: agentId,
-            ownerType: 'AGENT',
-            balance: '0.00',
-            lifetimeEarned: '0.00',
-            lifetimeSpent: '0.00',
-            status: 'ACTIVE',
-          });
+          await (tx.insert(wallets) as any)
+            .values({
+              id: walletId,
+              ownerId: agentId,
+              ownerType: 'AGENT',
+              balance: '0.00',
+              lifetimeEarned: '0.00',
+              lifetimeSpent: '0.00',
+              status: 'ACTIVE',
+            } as any)
+            .onConflictDoNothing({ target: [wallets.ownerId as any, wallets.ownerType as any] } as any);
           const newWallets = await tx.select().from(wallets).where(eq(wallets.id, walletId)).limit(1);
           agentWallet = newWallets[0];
         } else {
@@ -483,4 +487,3 @@ export class CreditService {
 }
 
 export const creditService = new CreditService();
-

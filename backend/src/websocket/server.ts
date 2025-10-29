@@ -66,6 +66,71 @@ export class WebSocketServer {
   private roomsRegistry: RoomRegistry;
   private orchestrator: AgentOrchestrator;
 
+  // Heuristic query parser for SerpAPI engines (aligns with HTTP planner)
+  private parseQueryForEngine(text: string, engine: string): { parsedQuery: string; parsedParams: Record<string, any> } {
+    const cleanText = String(text || '').trim();
+    const params: Record<string, any> = {};
+    let query = cleanText;
+
+    if (engine === 'yelp') {
+      const locationMatch = cleanText.match(/\s(?:in|near|for|around)\s+([A-Za-z0-9 ,.'\-]+)$/i);
+      if (locationMatch) {
+        params.find_loc = locationMatch[1].trim();
+        query = cleanText.slice(0, locationMatch.index).trim();
+      } else {
+        const cityMatch = cleanText.match(/([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)$/);
+        if (cityMatch) {
+          params.find_loc = cityMatch[1];
+          query = cleanText.replace(cityMatch[1], '').trim();
+        }
+      }
+      const businessTypes: Record<string,string> = {
+        'restaurant': 'restaurants', 'dining': 'restaurants', 'food': 'restaurants', 'bistro': 'bistros',
+        'cafe': 'cafes', 'bar': 'bars', 'wine bar': 'wine bars', 'pub': 'pubs', 'eatery': 'restaurants', 'diner': 'diners'
+      };
+      for (const [term, category] of Object.entries(businessTypes)) {
+        if (query.toLowerCase().includes(term)) {
+          query = query.replace(new RegExp(`\\b${term}\\b`, 'gi'), category);
+          break;
+        }
+      }
+      if (/\b(good|great|best|excellent|amazing|fantastic|outstanding)\b/i.test(query)) params.sort_by = 'rating';
+      query = query.replace(/[?!.,]+\s*$/, '').trim();
+
+    } else if (engine === 'google_news') {
+      const lower = cleanText.toLowerCase();
+      if (/\b(last\s*hour|past\s*hour|1h|hour)\b/i.test(lower)) params.when = '1h';
+      else if (/\b(today|now|24h|past\s*24\s*hours)\b/i.test(lower)) params.when = '1d';
+      else if (/\b(this\s*week|past\s*week|7d)\b/i.test(lower)) params.when = '7d';
+      else params.when = '1d';
+      params.sort_by = 'date';
+      const fillers = [
+        'any news about','any news on','any updates on','can you check if there is','can you check','can you find','is there any','what is the latest','latest','interesting news','in this field','about this','please','could you','would you','anything'
+      ];
+      let q = ' ' + cleanText + ' ';
+      for (const f of fillers) q = q.replace(new RegExp(`\\b${f}\\b`, 'ig'), ' ');
+      q = q.replace(/[?]+/g, ' ').replace(/\s+/g, ' ').trim();
+      query = q || cleanText;
+
+    } else if (engine === 'google_finance') {
+      const financeMap: Record<string,string> = { 'bitcoin':'BTC','btc':'BTC','ethereum':'ETH','eth':'ETH','solana':'SOL','sol':'SOL','dogecoin':'DOGE','doge':'DOGE','nvidia':'NVDA','apple':'AAPL','microsoft':'MSFT','google':'GOOGL','amazon':'AMZN','tesla':'TSLA' };
+      const lowerQuery = query.toLowerCase();
+      for (const [name, ticker] of Object.entries(financeMap)) {
+        if (lowerQuery.includes(name)) { query = query.replace(new RegExp(`\\b${name}\\b`, 'gi'), ticker); break; }
+      }
+
+    } else if (engine === 'google_scholar') {
+      let q = cleanText
+        .replace(/@?serpapi/gi, '')
+        .replace(/google_?scholar/gi, '')
+        .replace(/^\s*(can you|could you|would you|please|pls|can u|could u)\s+/i, '')
+        .replace(/[?]+/g, ' ')
+        .trim();
+      query = q || cleanText;
+    }
+    return { parsedQuery: query, parsedParams: params };
+  }
+
   // Normalize assistant final text to avoid accidental duplication like "Hello!Hello!"
   private normalizeFinalText(text: string): string {
     try {
@@ -1451,10 +1516,53 @@ ${personaBlock}${memoryContext}`,
               } catch {}
               return { ok: true, result, pickedIndex: pickIndex };
             }
-            const { runId: trRunId, toolCallId, result } = await this.toolRunner.run(call.name, fn, call.args || {}, { roomId, userId: activeUserId } as any);
+            // Normalize SerpAPI queries to optimal form when used in chat
+            let argsToUse = call.args || {};
+            if (call.name === 'serpapi' && fn === 'run') {
+              const eng = String((argsToUse as any).engine || '').trim();
+              const q = String((argsToUse as any).query || '').trim();
+              if (eng && q) {
+                const { parsedQuery, parsedParams } = this.parseQueryForEngine(q, eng);
+                argsToUse = { ...argsToUse, query: parsedQuery, extra: { ...((argsToUse as any).extra || {}), ...parsedParams } };
+              }
+            }
+            const toolStartedAt = Date.now();
+            const { runId: trRunId, toolCallId, result } = await this.toolRunner.run(call.name, fn, argsToUse, { roomId, userId: activeUserId } as any);
             // Mirror via bus for UI
-            this.bus.broadcastToolCall(roomId, trRunId, toolCallId, call.name, fn, call.args || {});
+            this.bus.broadcastToolCall(roomId, trRunId, toolCallId, call.name, fn, argsToUse || {});
             this.bus.broadcastToolResult(roomId, trRunId, toolCallId, result);
+            // Persist tool call summary and store in memory
+            try {
+              const { toolCalls } = await import('../db/schema.js');
+              const { db } = await import('../db/index.js');
+              const duration = Date.now() - toolStartedAt;
+              await (db.insert(toolCalls as any) as any).values({
+                id: toolCallId,
+                runId,
+                toolName: call.name,
+                functionName: fn,
+                arguments: argsToUse as any,
+                result: (result && typeof (result as any).markdown === 'string') ? { markdown: (result as any).markdown } : (result as any),
+                error: null,
+                startedAt: new Date(toolStartedAt),
+                completedAt: new Date(),
+                durationMs: duration,
+                status: 'completed',
+                createdAt: new Date(),
+              } as any).onConflictDoNothing?.();
+              // Add compact tool observation to memory (short + long term)
+              const preview = (() => {
+                try {
+                  if (typeof (result as any)?.markdown === 'string') return (result as any).markdown.slice(0, 500);
+                  const str = JSON.stringify(result);
+                  return str.slice(0, 500);
+                } catch { return ''; }
+              })();
+              const toolNote = `[TOOL] ${call.name}.${fn} args=${JSON.stringify(argsToUse)}\n${preview}`;
+              const memId = randomUUID();
+              memoryService.addToShortTerm(roomId, { id: memId, role: 'terminal', content: toolNote, timestamp: new Date(), conversationId: roomId, agentId: (primaryAgentId || roomId) as any } as any);
+              await memoryService.addToLongTerm(toolNote, { agentId: (primaryAgentId || roomId) as any, conversationId: roomId, messageId: memId, role: 'assistant', timestamp: new Date().toISOString(), messageType: 'conversation', userId: activeUserId });
+            } catch {}
             try {
               if (call.name === 'serpapi' && fn === 'run' && result) {
                 const raw = (result as any).raw || {};
@@ -1581,10 +1689,45 @@ ${personaBlock}${memoryContext}`,
                 this.bus.broadcastToolResult(roomId, trRunId, toolCallId, { ok: true });
                 return { ok: true, result, pickedIndex: pickIndex };
               }
-              const { runId: trRunId, toolCallId, result } = await this.toolRunner.run(call.name, fn, call.args || {}, { roomId, userId: activeUserId } as any);
+              // Normalize SerpAPI queries again for approved flow
+              let argsToUse2 = call.args || {};
+              if (call.name === 'serpapi' && fn === 'run') {
+                const eng = String((argsToUse2 as any).engine || '').trim();
+                const q = String((argsToUse2 as any).query || '').trim();
+                if (eng && q) {
+                  const { parsedQuery, parsedParams } = this.parseQueryForEngine(q, eng);
+                  argsToUse2 = { ...argsToUse2, query: parsedQuery, extra: { ...((argsToUse2 as any).extra || {}), ...parsedParams } };
+                }
+              }
+              const toolStartedAt2 = Date.now();
+              const { runId: trRunId, toolCallId, result } = await this.toolRunner.run(call.name, fn, argsToUse2, { roomId, userId: activeUserId } as any);
               // Mirror via bus for UI
-              this.bus.broadcastToolCall(roomId, trRunId, toolCallId, call.name, fn, call.args || {});
+              this.bus.broadcastToolCall(roomId, trRunId, toolCallId, call.name, fn, argsToUse2 || {});
               this.bus.broadcastToolResult(roomId, trRunId, toolCallId, result);
+              try {
+                const { toolCalls } = await import('../db/schema.js');
+                const { db } = await import('../db/index.js');
+                const duration = Date.now() - toolStartedAt2;
+                await (db.insert(toolCalls as any) as any).values({
+                  id: toolCallId,
+                  runId,
+                  toolName: call.name,
+                  functionName: fn,
+                  arguments: argsToUse2 as any,
+                  result: (result && typeof (result as any).markdown === 'string') ? { markdown: (result as any).markdown } : (result as any),
+                  error: null,
+                  startedAt: new Date(toolStartedAt2),
+                  completedAt: new Date(),
+                  durationMs: duration,
+                  status: 'completed',
+                  createdAt: new Date(),
+                } as any).onConflictDoNothing?.();
+                const preview = (() => { try { if (typeof (result as any)?.markdown === 'string') return (result as any).markdown.slice(0, 500); const str = JSON.stringify(result); return str.slice(0, 500); } catch { return ''; } })();
+                const toolNote = `[TOOL] ${call.name}.${fn} args=${JSON.stringify(argsToUse2)}\n${preview}`;
+                const memId = randomUUID();
+                memoryService.addToShortTerm(roomId, { id: memId, role: 'terminal', content: toolNote, timestamp: new Date(), conversationId: roomId, agentId: (primaryAgentId || roomId) as any } as any);
+                await memoryService.addToLongTerm(toolNote, { agentId: (primaryAgentId || roomId) as any, conversationId: roomId, messageId: memId, role: 'assistant', timestamp: new Date().toISOString(), messageType: 'conversation', userId: activeUserId });
+              } catch {}
               return result;
             },
             onAnalysis: (note) => this.bus.broadcastToRoom(roomId, { jsonrpc: '2.0', method: 'agent.analysis', params: { content: note, authorId: (primaryAgentId || roomId), authorType: 'agent' } }),

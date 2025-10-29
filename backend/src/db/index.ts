@@ -11,8 +11,7 @@ let _pool: any = null;
 function createConnection() {
   if (!_pool) {
     console.log('🔗 Creating database connection...');
-    console.log('DATABASE_URL exists:', !!process.env.DATABASE_URL);
-    console.log('DATABASE_URL starts with:', process.env.DATABASE_URL?.substring(0, 20) + '...');
+    console.log('DATABASE_URL configured:', !!process.env.DATABASE_URL);
     
     const connectionString = process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/postgres';
     const isNeon = connectionString.includes('neon.tech');
@@ -28,7 +27,7 @@ function createConnection() {
     });
 
     _pool.on('error', (err) => {
-      console.error('Unexpected error on idle PostgreSQL client', err);
+      console.error('Unexpected error on idle PostgreSQL client');
     });
     
     _db = drizzle(_pool);
@@ -72,5 +71,4 @@ export async function testConnection(): Promise<boolean> {
     return false;
   }
 }
-
 

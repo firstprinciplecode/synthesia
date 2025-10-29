@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
+import { motion } from 'framer-motion';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -12,6 +13,7 @@ import { TerminalOutput } from '@/components/chat/TerminalOutput';
 import { TypingDots } from './TypingDots';
 import { JsonMarkdownRenderer } from './JsonMarkdownRenderer';
 import { LinkPreview } from './LinkPreview';
+import { slideInUp, messageItem } from '@/lib/motion';
 
 interface ChatMessageProps {
   message: ChatMessageType;
@@ -163,27 +165,39 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
   const [selected, setSelected] = React.useState<null | ImgItem>(null);
 
   return (
-    <div className="flex gap-3 p-3 hover:bg-muted/50 group">
-      <Avatar
-        className={`h-10 w-10 flex-shrink-0 ${animateHeader ? 'sa-fade-in-up' : ''}`}
+    <motion.div
+      className="flex gap-3 p-3 hover:bg-muted/50 group"
+      variants={messageItem}
+      initial="hidden"
+      animate="visible"
+    >
+      <motion.div
+        initial={{ opacity: 0, scale: 0.9 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{ delay: 0.05, duration: 0.3 }}
       >
-        {isUser && userAvatar ? (
-          <AvatarImage src={userAvatar} alt={userName || 'User'} />
-        ) : !isUser && !isTerminal && agentAvatar ? (
-          <AvatarImage src={agentAvatar} alt={agentName || 'Agent'} />
-        ) : null}
-        <AvatarFallback className={`${
-          isUser ? 'bg-blue-500' : 
-          isTerminal ? 'bg-purple-500' : 
-          'bg-green-500'
-        } text-white font-semibold`}>
-          {isUser ? (userName ? userName.charAt(0).toUpperCase() : 'U') : isTerminal ? 'T' : (agentName ? agentName.charAt(0).toUpperCase() : 'A')}
-        </AvatarFallback>
-      </Avatar>
+        <Avatar className="h-10 w-10 flex-shrink-0">
+          {isUser && userAvatar ? (
+            <AvatarImage src={userAvatar} alt={userName || 'User'} />
+          ) : !isUser && !isTerminal && agentAvatar ? (
+            <AvatarImage src={agentAvatar} alt={agentName || 'Agent'} />
+          ) : null}
+          <AvatarFallback className={`${
+            isUser ? 'bg-blue-500' : 
+            isTerminal ? 'bg-purple-500' : 
+            'bg-green-500'
+          } text-white font-semibold`}>
+            {isUser ? (userName ? userName.charAt(0).toUpperCase() : 'U') : isTerminal ? 'T' : (agentName ? agentName.charAt(0).toUpperCase() : 'A')}
+          </AvatarFallback>
+        </Avatar>
+      </motion.div>
       
       <div className="flex flex-col gap-0 flex-1 min-w-0">
-        <div
-          className={`flex items-baseline gap-1 ${animateHeader ? 'sa-fade-in-up' : ''}`}
+        <motion.div
+          className="flex items-baseline gap-1"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: 0.1, duration: 0.3 }}
         >
           <span 
             className="text-sm text-foreground"
@@ -197,9 +211,14 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
           {isStreaming && (!displayContent || displayContent.trim().length === 0) && (
             <TypingDots width={24} height={8} />
           )}
-        </div>
+        </motion.div>
         
-        <div className="text-sm leading-relaxed text-foreground">
+        <motion.div
+          className="text-sm leading-relaxed text-foreground"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: 0.15, duration: 0.4 }}
+        >
           {isUser ? (
             <div>
               <p className="whitespace-pre-wrap m-0">{renderWithMentions(displayContent)}</p>
@@ -231,7 +250,14 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
                 imgs.length > 0 && (
                 <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2">
                   {imgs.map((it, i) => (
-                    <div key={i} className="group cursor-zoom-in" onClick={() => setSelected(it)}>
+                    <motion.div
+                      key={i}
+                      className="group cursor-zoom-in"
+                      onClick={() => setSelected(it)}
+                      whileHover={{ scale: 1.05, boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)' }}
+                      whileTap={{ scale: 0.98 }}
+                      transition={{ type: 'spring', stiffness: 300, damping: 20 }}
+                    >
                       <div className="w-full h-36 sm:h-40 md:h-48 bg-muted rounded overflow-hidden">
                         <img src={it.src} alt={it.alt} className="w-full h-full object-cover" />
                       </div>
@@ -240,7 +266,7 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
                           {it.caption || it.alt}
                         </div>
                       )}
-                    </div>
+                    </motion.div>
                   ))}
                 </div>
                 )
@@ -254,14 +280,25 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
                 <LinkPreview url={firstUrlForPreview} />
               )}
               {selected && (
-                <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={() => setSelected(null)}>
-                  <div className="max-w-screen-md w-full">
+                <motion.div
+                  className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
+                  onClick={() => setSelected(null)}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                >
+                  <motion.div
+                    className="max-w-screen-md w-full"
+                    initial={{ scale: 0.9, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+                  >
                     <img src={selected.src} alt={selected.alt} className="w-full h-auto rounded shadow" />
                     {(selected.caption || selected.alt) && (
                       <div className="mt-2 text-sm text-white/90">{selected.caption || selected.alt}</div>
                     )}
-                  </div>
-                </div>
+                  </motion.div>
+                </motion.div>
               )}
               {isStreaming && (!displayContent || displayContent.trim().length === 0) && (
                 <span className="inline-block w-1 h-4 bg-current animate-pulse ml-1" />
@@ -269,8 +306,8 @@ export function ChatMessage({ message, isStreaming, animateHeader, agentNameOver
             </div>
           )}
           {/* Read receipts removed */}
-        </div>
+        </motion.div>
       </div>
-    </div>
+    </motion.div>
   );
 }

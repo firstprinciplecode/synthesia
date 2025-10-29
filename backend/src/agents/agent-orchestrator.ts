@@ -30,7 +30,8 @@ export class AgentOrchestrator {
     // Scope memories per agent (room) to avoid cross-agent leakage
     const shortTerm = memoryService.getShortTerm(roomId);
     const longTerm = await memoryService.searchLongTerm(roomId, userMessage, 5, 'conversation');
-    const memoryContext = buildMemoryContextFromLongTerm(longTerm);
+    const longTermByUser = await memoryService.searchLongTermByUser(activeUserId, userMessage, 3, { agentId: agentRecord?.id || undefined, roomId, messageType: 'conversation' } as any);
+    const memoryContext = buildMemoryContextFromLongTerm([ ...(longTerm || []), ...(longTermByUser || []) ]);
     const { agentName, persona, autoExecuteTools } = agentRecord ? parseAgentPersona(agentRecord) : { agentName: '', persona: '', autoExecuteTools: false };
     const systemContent = buildSystemPrompt({
       userName: userProfile?.name || 'there',
@@ -80,7 +81,8 @@ export class AgentOrchestrator {
     // Scope memories per agent (room) to avoid cross-agent leakage
     const shortTerm = memoryService.getShortTerm(roomId);
     const longTerm = await memoryService.searchLongTerm(roomId, userMessage, 5, 'conversation');
-    const memoryContext = buildMemoryContextFromLongTerm(longTerm);
+    const longTermByUser = await memoryService.searchLongTermByUser(activeUserId, userMessage, 3, { agentId: agentRecord?.id || undefined, roomId, messageType: 'conversation' } as any);
+    const memoryContext = buildMemoryContextFromLongTerm([ ...(longTerm || []), ...(longTermByUser || []) ]);
     const { persona, autoExecuteTools, toolPreferences } = agentRecord ? parseAgentPersona(agentRecord) : { agentName: '', persona: '', autoExecuteTools: false } as any;
 
     let systemContent = buildSystemPrompt({
@@ -146,123 +148,58 @@ export class AgentOrchestrator {
       }
     }
 
-    // Heuristic: numeric selection like "link 4", "read 4", "open #4", ordinals (3rd/third), or number before noun ("3rd link") → scrape.pick (ask-first if needed)
-    if (!autoExecuteTools && !pendingApproval) {
-      const msg = String(userMessage || '');
-      let pickIndex: number | null = null;
-      let mPick = msg.match(/(?:link|article|story|result|read|open|pick)\s*(?:number\s*)?#?\s*(\d{1,2})(?:st|nd|rd|th)?\b/i);
-      if (mPick) pickIndex = Number(mPick[1]);
-      if (pickIndex == null) {
-        const mNumBefore = msg.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:link|article|story|result)\b/i);
-        if (mNumBefore) pickIndex = Number(mNumBefore[1]);
-      }
-      if (pickIndex == null) {
-        const mOrd = msg.match(/\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:link|article|story|result)?\b/i);
-        if (mOrd) {
-          const map: Record<string, number> = { first:1, second:2, third:3, fourth:4, fifth:5, sixth:6, seventh:7, eighth:8, ninth:9, tenth:10 };
-          pickIndex = map[mOrd[1].toLowerCase()] || null;
-        }
-      }
-      if (pickIndex != null) {
-        const index = Math.max(1, Math.min(50, Number(pickIndex)));
-        const rid = getLatestResultId ? getLatestResultId(roomId) : null;
-        const question = rid
-          ? `Should I run: $ tool.web.scrape.pick { index: ${index}, resultId: "${rid}" }?`
-          : `Should I run: $ tool.web.scrape.pick ${index}?`;
-        onDelta?.(question);
-        return {
-          finalText: question,
-          steps,
-          model,
-          pendingApproval: { tool: 'web', func: 'scrape.pick', args: rid ? { index, resultId: rid } : { index }, hint: String(index) },
-        };
-      }
-    }
+    // Format tool catalog for visibility
+    const formatToolCatalog = (): string => {
+      const catalog = typeof getCatalog === 'function' ? (getCatalog() || []) : [];
+      if (catalog.length === 0) return '';
+      const tools = catalog.map(t => `- ${t.tool}.${t.func}: ${t.description || 'No description'}${t.tags ? ' [' + t.tags.join(', ') + ']' : ''}`).join('\n');
+      return `\nAVAILABLE TOOLS:\n${tools}\n`;
+    };
 
-    // Heuristic: if user asks for latest news and auto-exec is off, ask approval up-front
-    if (!autoExecuteTools && !pendingApproval) {
-      const text = (userMessage || '').toLowerCase();
-      // Only trigger if it's an information-seeking query, not a creative/narrative request
-      const isCreativeRequest = /(create|make|write|tell|narrate|segment|story about|describe)/.test(text);
-      const wantsNews = /(latest|today|headlines|news|what's happening|whats happening)/.test(text);
-      if (wantsNews && !isCreativeRequest) {
-        // If we already have recent Google News results observed in this run or scratchpad, don't refetch
-        const haveRecentNews = observedMarkdowns.some(m => /Google News for/i.test(m)) || scratchpad.some(s => /Google News for/i.test(s));
-        if (haveRecentNews) {
-          const prompt = 'I already fetched Google News just now. Which result number should I open (e.g., 1-10)?';
-          onDelta?.(prompt);
-          return { finalText: prompt, steps, model, tokenUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens } };
-        }
-        // Extract topic intelligently, removing conversational filler
-        const quoted = (userMessage.match(/"([^"]+)"/) || [])[1];
-        const about = (text.match(/about\s+([\w\s\-\_\.\#\@]+)\??$/) || [])[1];
-        
-        // Strip conversational filler and focus on the noun phrase
-        let fallback = text
-          .replace(/\b(alright|ok|okay|well|so|now|hey|hi|hello)\b/gi, '') // conversational starters
-          .replace(/\b(let's|lets|can you|could you|please|would you)\b/gi, '') // politeness
-          .replace(/\b(see|check|look at|find|get|show|fetch|tell me|give me|show me|get me)\b/gi, '') // action verbs
-          .replace(/\b(what's|whats|what is)\b/gi, '') // question words
-          .replace(/\b(going on|happening|new|up)\b/gi, '') // status words
-          .replace(/\b(with the|in the world of|in|on|at|regarding)\b/gi, '') // prepositions
-          .replace(/\b(latest|today|recent|current|headlines|news|now)\b/gi, '') // time/type words
-          .replace(/\bfrom\s+google\s+news\b/gi, '')
-          .replace(/\s+me\s+/gi, ' ') // "tell me", "show me" remnants
-          .trim();
-        
-        let hintRaw = String(quoted || about || fallback || userMessage).trim();
-        hintRaw = hintRaw
-          .replace(/\bfrom\s+google\s+news\b/gi, ' ')
-          .replace(/[\)\(\:"\]]+$/g, ' ')
-          .replace(/^\s*(the|a|an)\s+/i, '')
-          .replace(/\s{2,}/g, ' ')
-          .trim();
-        
-        // Special cases for common phrases
-        if (/favorite\s+space\s+company/i.test(hintRaw)) hintRaw = 'SpaceX';
-        
-        const hint = hintRaw || 'news';
-        const question = `Should I run serpapi.google_news "${hint}" now?`;
-        const delta = question; // emit verbatim
-        if (delta) onDelta?.(delta);
-        return { finalText: delta, steps, model, tokenUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens }, pendingApproval: { tool: 'serpapi', func: 'google_news', args: { q: hint }, hint } };
-      }
-    }
+    const decisionPrompt = `${systemContent}${formatToolCatalog()}
 
-    const decisionPrompt = `${systemContent}
+AUTONOMOUS REASONING MODE - Use structured decision-making phases:
 
-You are now in autonomous planning mode. Return ONLY JSON without code fences:
-{"type":"tool|think|write|stop","reason":"string","capabilityTags?":string[],"hint?":"string","args?":{},"content?":"string"}
+Return ONLY JSON without code fences:
+{"type":"understand|plan|tool|write|stop","reason":"string","capabilityTags?":string[],"hint?":"string","args?":{},"content?":"string"}
 
-Rules when type=write:
-- Content must be the exact user-facing sentence(s) only, following your personality.
-- For your first reply in a conversation (no prior assistant text), you may include a brief greeting in your persona. Avoid sign-offs.
-- No emojis unless the user used them first.
-- Do not include step labels, thoughts, analysis, the words Step/Think/Reflect/Observation, or instructions about writing.
-- Do not repeat previous text.
-- Keep it concise by default (<= 2 sentences). Do NOT enumerate capabilities unless the user explicitly asks for a list.
-- If the user asks what you can do, respond with a brief one-liner and a single clarifying question.
+DECISION PHASES (follow in order):
+1. type="understand": Analyze what the user wants. Extract the core intent, any specific requirements, and context from conversation history.
+   - reason: State your understanding of the user's request
+   - Example: {"type":"understand","reason":"User wants news about SpaceX. No article selected yet. Need to fetch fresh news results."}
 
-WHEN TO USE TOOLS vs CREATIVE WRITING:
-- Use type="write" for creative requests: create/write/tell/narrate/describe/segment/story
-- Use type="tool" ONLY when the user needs NEW information (search/fetch/scrape) or wants to perform an action (post/send)
-- If you recently fetched content and the user asks you to work with it, use type="write" with your persona
+2. type="plan": Decide which action to take based on your understanding and available tools.
+   - reason: Explain your chosen approach and why
+   - If planning to use a tool, specify which one and why
+   - If planning to write creatively, explain why no tool is needed
+   - Example: {"type":"plan","reason":"Will use serpapi.google_news to fetch SpaceX news, then ask user which result to read."}
 
-Tool approval policy: ${autoExecuteTools ? 'auto' : 'ask'}
-- When policy is "ask": do NOT return type="tool". Instead, return type="write" asking a single, concrete yes/no question specifying the exact tool and arguments you intend to run (e.g., "Fetch Google News for \"SpaceX\" now?"). Wait for user approval in the next turn.
+3. type="tool": Execute the planned tool (only after plan phase)
+   - capabilityTags: Tags matching tool categories from the available tools list
+   - hint: The core topic/query term (clean noun phrase)
+   - Tool approval policy: ${autoExecuteTools ? 'auto' : 'ask'}
+   - When policy is "ask": Use type="write" to ask approval with exact tool and args
 
-Preferred tool hints:
-- For news/web discovery use capabilityTags ["news","search"] and hint with ONLY the core topic/subject.
-  * Extract the noun phrase that represents what the user wants information about
-  * Remove conversational filler: "alright", "let's see", "what's going on", "can you", etc.
-  * Remove time indicators already implied by "news": "today", "latest", "recent"
-  * Examples:
-    - "what's happening with space exploration today" → hint: "space exploration"
-    - "can you get me news about Tesla" → hint: "Tesla"
-    - "latest on the election" → hint: "election"
-- For code lookups use capabilityTags ["code","search","grep"]. Ask first and propose exactly one line: Should I run: $ tool.code.search { pattern: "<text>", path: "<dir>" }?
+4. type="write": Respond to user with your personality
+   - Content must be user-facing sentence(s) only, following your persona
+   - Keep concise (<= 2 sentences by default)
+   - No meta-commentary, step labels, or repeated text
+   - After tool results, summarize findings naturally
 
-After a tool success, your next step should normally be type="write" that summarizes the result for the user unless another tool is strictly required.`;
+5. type="stop": Task complete
+
+TOOL USAGE RULES:
+- Use tools ONLY for: NEW information (search/fetch/scrape) or actions (post/send)
+- Use type="write" for: creative requests (write/tell/narrate/describe/create)
+- If you recently fetched content, reference it in type="write" - don't refetch
+
+Tool approval policy (when "ask"):
+- Return type="write" asking a single yes/no question with exact tool and args
+- Example: "Should I run serpapi.google_news for SpaceX now?"
+- Wait for user approval before executing
+
+After tool success:
+- Next step should be type="write" to summarize results for the user`;
 
     // log already defined above
 
@@ -378,6 +315,18 @@ After a tool success, your next step should normally be type="write" that summar
 
       if (decision.type === 'stop') break;
 
+      if (decision.type === 'understand') {
+        scratchpad.push(`Step ${step} understand: ${decision.reason || ''}`);
+        onAnalysis?.(`Understanding: ${decision.reason || ''}`);
+        continue;
+      }
+
+      if (decision.type === 'plan') {
+        scratchpad.push(`Step ${step} plan: ${decision.reason || ''}`);
+        onAnalysis?.(`Plan: ${decision.reason || ''}`);
+        continue;
+      }
+
       if (decision.type === 'think') {
         scratchpad.push(`Step ${step} think: ${decision.reason || ''}`);
         continue;
@@ -475,5 +424,4 @@ After a tool success, your next step should normally be type="write" that summar
     return { finalText, steps, model, tokenUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens } };
   }
 }
-
 
